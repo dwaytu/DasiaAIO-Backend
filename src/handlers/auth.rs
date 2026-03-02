@@ -83,8 +83,8 @@ pub async fn register(
 
     // Create user
     sqlx::query(
-        r#"INSERT INTO users (id, email, username, password, role, full_name, phone_number, license_number, license_expiry_date, verified)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#
+        r#"INSERT INTO users (id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, verified)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"#
     )
     .bind(&user_id)
     .bind(&payload.email)
@@ -94,11 +94,13 @@ pub async fn register(
     .bind(&payload.full_name)
     .bind(&payload.phone_number)
     .bind(&payload.license_number)
+    .bind(&payload.license_issued_date)
     .bind(&payload.license_expiry_date)
+    .bind(&payload.address)
     .bind(initial_verified)
     .execute(db.as_ref())
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create user: {}", e)))?;
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create user: {}", e)))?;;
 
     // Only create verification record + send email when SMTP is configured
     if smtp_configured {
@@ -287,7 +289,7 @@ pub async fn login(
 
     // Find user by email, username, or phone
     let user = sqlx::query(
-        r#"SELECT id, email, username, password, role, full_name, phone_number, license_number, license_expiry_date, profile_photo, verified, created_at, updated_at FROM users 
+        r#"SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, created_at, updated_at FROM users 
            WHERE email = $1 OR username = $1 OR phone_number = $1"#
     )
     .bind(&payload.identifier)
@@ -323,6 +325,9 @@ pub async fn login(
     let full_name: Option<String> = user.try_get("full_name").ok();
     let phone_number: Option<String> = user.try_get("phone_number").ok();
     let license_number: Option<String> = user.try_get("license_number").ok();
+    let license_issued_date: Option<chrono::DateTime<chrono::Utc>> = user.try_get("license_issued_date").ok();
+    let license_expiry_date: Option<chrono::DateTime<chrono::Utc>> = user.try_get("license_expiry_date").ok();
+    let address: Option<String> = user.try_get("address").ok();
     let profile_photo: Option<String> = user.try_get("profile_photo").ok();
 
     Ok(Json(json!({
@@ -335,6 +340,9 @@ pub async fn login(
             "fullName": full_name,
             "phoneNumber": phone_number,
             "licenseNumber": license_number,
+            "licenseIssuedDate": license_issued_date,
+            "licenseExpiryDate": license_expiry_date,
+            "address": address,
             "profilePhoto": profile_photo,
         }
     })))

@@ -67,6 +67,22 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to add profile_photo column: {}", e)))?;
 
+    // Add license_issued_date column
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS license_issued_date TIMESTAMP WITH TIME ZONE"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to add license_issued_date column: {}", e)))?;
+
+    // Add address column
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to add address column: {}", e)))?;
+
     // Create verifications table
     sqlx::query(
         r#"

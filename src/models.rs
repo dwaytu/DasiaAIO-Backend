@@ -49,7 +49,9 @@ pub struct User {
     pub full_name: String,
     pub phone_number: String,
     pub license_number: Option<String>,
+    pub license_issued_date: Option<DateTime<Utc>>,
     pub license_expiry_date: Option<DateTime<Utc>>,
+    pub address: Option<String>,
     pub profile_photo: Option<String>,
     pub verified: bool,
     pub created_at: DateTime<Utc>,
@@ -67,7 +69,9 @@ pub struct CreateUserRequest {
     pub full_name: String,
     pub phone_number: String,
     pub license_number: Option<String>,
+    pub license_issued_date: Option<DateTime<Utc>>,
     pub license_expiry_date: Option<DateTime<Utc>>,
+    pub address: Option<String>,
     pub admin_code: Option<String>,
 }
 

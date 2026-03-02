@@ -16,7 +16,7 @@ pub async fn get_all_users(
     State(db): State<Arc<PgPool>>,
 ) -> AppResult<Json<serde_json::Value>> {
     let users = sqlx::query_as::<_, User>(
-        "SELECT id, email, username, password, role, full_name, phone_number, license_number, license_expiry_date, profile_photo, verified, created_at, updated_at FROM users"
+        "SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, created_at, updated_at FROM users"
     )
     .fetch_all(db.as_ref())
     .await
@@ -35,7 +35,7 @@ pub async fn get_user_by_id(
     Path(id): Path<String>,
 ) -> AppResult<Json<UserResponse>> {
     let user = sqlx::query_as::<_, User>(
-        "SELECT id, email, username, password, role, full_name, phone_number, license_number, license_expiry_date, profile_photo, verified, created_at, updated_at FROM users WHERE id = $1"
+        "SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, created_at, updated_at FROM users WHERE id = $1"
     )
     .bind(&id)
     .fetch_optional(db.as_ref())
@@ -63,7 +63,9 @@ pub async fn update_user(
     let phone_number = payload.get("phoneNumber").and_then(|v| v.as_str());
     let email = payload.get("email").and_then(|v| v.as_str());
     let license_number = payload.get("licenseNumber").and_then(|v| v.as_str());
+    let license_issued_date = payload.get("licenseIssuedDate").and_then(|v| v.as_str());
     let license_expiry_date = payload.get("licenseExpiryDate").and_then(|v| v.as_str());
+    let address = payload.get("address").and_then(|v| v.as_str());
 
     // Build query based on provided fields
     if let Some(full_name) = full_name {
@@ -125,6 +127,34 @@ pub async fn update_user(
             .await
             .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
         }
+    }
+
+    if let Some(license_issued_date) = license_issued_date {
+        let issued_date = chrono::DateTime::parse_from_rfc3339(license_issued_date)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        
+        if let Some(issued_date) = issued_date {
+            sqlx::query(
+                "UPDATE users SET license_issued_date = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+            )
+            .bind(issued_date)
+            .bind(&id)
+            .execute(db.as_ref())
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+        }
+    }
+
+    if let Some(address) = address {
+        sqlx::query(
+            "UPDATE users SET address = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+        )
+        .bind(address)
+        .bind(&id)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
     }
 
     Ok(Json(json!({
