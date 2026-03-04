@@ -69,7 +69,9 @@ pub struct CreateUserRequest {
     pub full_name: String,
     pub phone_number: String,
     pub license_number: Option<String>,
+    #[serde(with = "option_date_format")]
     pub license_issued_date: Option<DateTime<Utc>>,
+    #[serde(with = "option_date_format")]
     pub license_expiry_date: Option<DateTime<Utc>>,
     pub address: Option<String>,
     pub admin_code: Option<String>,
@@ -724,6 +726,34 @@ pub struct CreateTrainingRecordRequest {
     pub expiry_date: Option<DateTime<Utc>>,
     pub certificate_number: Option<String>,
     pub notes: Option<String>,
+}
+
+// Custom serde module for parsing date strings (YYYY-MM-DD) into DateTime<Utc>
+mod option_date_format {
+    use chrono::{DateTime, Utc, NaiveDate};
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt = Option::<String>::deserialize(deserializer)?;
+        match opt {
+            None => Ok(None),
+            Some(date_str) => {
+                // Parse YYYY-MM-DD format
+                let naive_date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
+                    .map_err(serde::de::Error::custom)?;
+                
+                // Convert to NaiveDateTime with time 00:00:00
+                let naive_datetime = naive_date.and_hms_opt(0, 0, 0)
+                    .ok_or_else(|| serde::de::Error::custom("Invalid datetime"))?;
+                
+                // Convert to DateTime<Utc>
+                Ok(Some(DateTime::<Utc>::from_naive_utc_and_offset(naive_datetime, Utc)))
+            }
+        }
+    }
 }
 
 
