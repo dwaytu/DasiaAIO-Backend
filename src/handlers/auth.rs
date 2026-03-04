@@ -31,7 +31,8 @@ pub async fn register(
     } else {
         if payload.email.is_empty() || payload.password.is_empty() || payload.username.is_empty() 
             || payload.full_name.is_empty() || payload.phone_number.is_empty() 
-            || payload.license_number.is_none() || payload.license_expiry_date.is_none() {
+            || payload.license_number.is_none() || payload.license_issued_date.is_none() 
+            || payload.license_expiry_date.is_none() {
             return Err(AppError::BadRequest(
                 "All fields are required for regular user accounts".to_string()
             ));

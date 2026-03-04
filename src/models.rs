@@ -741,6 +741,11 @@ mod option_date_format {
         match opt {
             None => Ok(None),
             Some(date_str) => {
+                // Handle empty strings as None
+                if date_str.trim().is_empty() {
+                    return Ok(None);
+                }
+                
                 // Parse YYYY-MM-DD format
                 let naive_date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
                     .map_err(serde::de::Error::custom)?;
