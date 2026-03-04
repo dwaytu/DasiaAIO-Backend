@@ -78,19 +78,26 @@ pub async fn assign_mission(
     State(db): State<Arc<PgPool>>,
     Json(payload): Json<MissionAssignmentRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
-    // Parse datetime
-    let start_datetime = format!("{}T{}", payload.date, payload.start_time);
-    let end_datetime = format!("{}T{}", payload.date, payload.end_time);
+    use chrono::{NaiveDate, NaiveTime, NaiveDateTime};
     
-    let start_time = chrono::DateTime::parse_from_rfc3339(&format!("{}:00Z", start_datetime))
-        .ok()
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .ok_or_else(|| AppError::BadRequest("Invalid start time format".to_string()))?;
+    // Parse date (YYYY-MM-DD format from HTML date input)
+    let date = NaiveDate::parse_from_str(&payload.date, "%Y-%m-%d")
+        .map_err(|_| AppError::BadRequest("Invalid date format. Expected YYYY-MM-DD".to_string()))?;
     
-    let end_time = chrono::DateTime::parse_from_rfc3339(&format!("{}:00Z", end_datetime))
-        .ok()
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .ok_or_else(|| AppError::BadRequest("Invalid end time format".to_string()))?;
+    // Parse times (HH:MM format from HTML time input)
+    let start_time_naive = NaiveTime::parse_from_str(&payload.start_time, "%H:%M")
+        .map_err(|_| AppError::BadRequest("Invalid start time format. Expected HH:MM".to_string()))?;
+    
+    let end_time_naive = NaiveTime::parse_from_str(&payload.end_time, "%H:%M")
+        .map_err(|_| AppError::BadRequest("Invalid end time format. Expected HH:MM".to_string()))?;
+    
+    // Combine date and time
+    let start_datetime = NaiveDateTime::new(date, start_time_naive);
+    let end_datetime = NaiveDateTime::new(date, end_time_naive);
+    
+    // Convert to UTC DateTime
+    let start_time = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(start_datetime, chrono::Utc);
+    let end_time = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(end_datetime, chrono::Utc);
 
     let duration = (end_time - start_time).num_hours() as f64;
 
