@@ -1,6 +1,5 @@
 use axum::{
     extract::{State, Path},
-    http::StatusCode,
     Json,
 };
 use sqlx::PgPool;
@@ -10,7 +9,6 @@ use serde_json::json;
 
 use crate::{
     error::{AppError, AppResult},
-    utils,
 };
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -142,6 +140,10 @@ pub async fn assign_driver_to_trip(
     State(db): State<Arc<PgPool>>,
     Json(payload): Json<AssignDriverRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    if payload.trip_id.trim().is_empty() || payload.driver_id.trim().is_empty() {
+        return Err(AppError::BadRequest("Trip ID and driver ID are required".to_string()));
+    }
+
     // Verify driver exists and is verified
     let driver_exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND verified = true)"
@@ -156,7 +158,7 @@ pub async fn assign_driver_to_trip(
     }
 
     // Update trip with driver
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE trips SET driver_id = $1 WHERE id = $2"
     )
     .bind(&payload.driver_id)
@@ -164,6 +166,10 @@ pub async fn assign_driver_to_trip(
     .execute(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to assign driver: {}", e)))?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound("Trip not found".to_string()));
+    }
 
     Ok(Json(json!({
         "success": true,
@@ -177,17 +183,31 @@ pub async fn update_trip_status(
     Path(trip_id): Path<String>,
     Json(payload): Json<UpdateTripStatusRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    sqlx::query(
+    let status = payload.status.trim();
+    if status.is_empty() {
+        return Err(AppError::BadRequest("Status is required".to_string()));
+    }
+
+    let allowed_statuses = ["scheduled", "in_progress", "completed", "cancelled"];
+    if !allowed_statuses.contains(&status) {
+        return Err(AppError::BadRequest("Invalid trip status".to_string()));
+    }
+
+    let result = sqlx::query(
         "UPDATE trips SET status = $1 WHERE id = $2"
     )
-    .bind(&payload.status)
+    .bind(status)
     .bind(&trip_id)
     .execute(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to update trip: {}", e)))?;
 
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound("Trip not found".to_string()));
+    }
+
     // If completed, update vehicle status
-    if payload.status == "completed" {
+    if status == "completed" {
         sqlx::query(
             "UPDATE armored_cars SET status = 'operational' 
              WHERE id IN (SELECT car_id FROM trips WHERE id = $1)"
@@ -196,7 +216,7 @@ pub async fn update_trip_status(
         .execute(db.as_ref())
         .await
         .ok();
-    } else if payload.status == "in_progress" {
+    } else if status == "in_progress" {
         sqlx::query(
             "UPDATE armored_cars SET status = 'deployed' 
              WHERE id IN (SELECT car_id FROM trips WHERE id = $1)"

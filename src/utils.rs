@@ -1,5 +1,52 @@
 use crate::error::{AppError, AppResult};
 use regex::Regex;
+use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey};
+use serde::{Deserialize, Serialize};
+use chrono::{Utc, Duration};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TokenClaims {
+    pub sub: String,  // user_id
+    pub email: String,
+    pub role: String,
+    pub exp: i64,     // expiration time
+    pub iat: i64,     // issued at time
+}
+
+pub fn generate_token(user_id: &str, email: &str, role: &str) -> AppResult<String> {
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "your-secret-key-change-in-production".to_string());
+    
+    let claims = TokenClaims {
+        sub: user_id.to_string(),
+        email: email.to_string(),
+        role: role.to_string(),
+        exp: (Utc::now() + Duration::days(7)).timestamp(),
+        iat: Utc::now().timestamp(),
+    };
+
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_ref()),
+    )
+    .map_err(|e| AppError::InternalServerError(format!("Failed to generate token: {}", e)))
+}
+
+pub fn verify_token(token: &str) -> AppResult<TokenClaims> {
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "your-secret-key-change-in-production".to_string());
+    
+    decode::<TokenClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_ref()),
+        &Validation::default(),
+    )
+    .map(|data| data.claims)
+    .map_err(|e| AppError::BadRequest(format!("Invalid or expired token: {}", e)))
+}
+
+pub fn generate_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
 
 pub fn generate_confirmation_code() -> String {
     use rand::Rng;
@@ -98,6 +145,3 @@ pub async fn send_confirmation_email(
     }
 }
 
-pub fn generate_id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}

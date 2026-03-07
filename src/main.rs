@@ -60,11 +60,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/login", post(handlers::auth::login))
         .route("/api/verify", post(handlers::auth::verify_email))
         .route("/api/resend-code", post(handlers::auth::resend_verification_code))
+        .route("/api/forgot-password", post(handlers::auth::forgot_password))
+        .route("/api/verify-reset-code", post(handlers::auth::verify_reset_code))
+        .route("/api/reset-password", post(handlers::auth::reset_password))
         // Auth routes with /auth prefix (alternative URIs)
         .route("/api/auth/register", post(handlers::auth::register))
         .route("/api/auth/login", post(handlers::auth::login))
         .route("/api/auth/verify", post(handlers::auth::verify_email))
         .route("/api/auth/resend-code", post(handlers::auth::resend_verification_code))
+        .route("/api/auth/forgot-password", post(handlers::auth::forgot_password))
+        .route("/api/auth/verify-reset-code", post(handlers::auth::verify_reset_code))
+        .route("/api/auth/reset-password", post(handlers::auth::reset_password))
         
         // User routes
         .route("/api/users", get(handlers::users::get_all_users))

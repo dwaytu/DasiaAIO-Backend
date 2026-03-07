@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::{
     error::{AppError, AppResult},
-    models::{CreateNotificationRequest, Notification, MarkNotificationReadRequest},
+    models::{CreateNotificationRequest, Notification},
     utils,
 };
 

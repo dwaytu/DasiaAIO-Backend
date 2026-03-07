@@ -162,7 +162,7 @@ pub async fn assign_mission(
     
     let vehicles = sqlx::query_as::<_, VehicleRow>(
         "SELECT id, model, passenger_capacity FROM armored_cars 
-         WHERE status = 'operational' 
+         WHERE status IN ('operational', 'available') 
          LIMIT $1"
     )
     .bind(payload.vehicles_required as i64)

@@ -32,7 +32,7 @@ pub async fn add_armored_car(
     let id = utils::generate_id();
 
     sqlx::query(
-        "INSERT INTO armored_cars (id, license_plate, vin, model, manufacturer, capacity_kg, registration_expiry, insurance_expiry, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+        "INSERT INTO armored_cars (id, license_plate, vin, model, manufacturer, capacity_kg, passenger_capacity, registration_expiry, insurance_expiry, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
     )
     .bind(&id)
     .bind(&payload.license_plate)
@@ -40,6 +40,7 @@ pub async fn add_armored_car(
     .bind(&payload.model)
     .bind(&payload.manufacturer)
     .bind(payload.capacity_kg)
+    .bind(payload.passenger_capacity.unwrap_or(4))
     .bind(&payload.registration_expiry)
     .bind(&payload.insurance_expiry)
     .bind("available")
@@ -60,7 +61,7 @@ pub async fn get_all_armored_cars(
     State(db): State<Arc<PgPool>>,
 ) -> AppResult<Json<Vec<ArmoredCar>>> {
     let cars = sqlx::query_as::<_, ArmoredCar>(
-        "SELECT id, license_plate, vin, model, manufacturer, capacity_kg, status, registration_expiry, insurance_expiry, last_maintenance_date, mileage, created_at, updated_at FROM armored_cars"
+        "SELECT id, license_plate, vin, model, manufacturer, capacity_kg, passenger_capacity, status, registration_expiry, insurance_expiry, last_maintenance_date, mileage, created_at, updated_at FROM armored_cars"
     )
     .fetch_all(db.as_ref())
     .await
@@ -74,7 +75,7 @@ pub async fn get_armored_car_by_id(
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     let car = sqlx::query_as::<_, ArmoredCar>(
-        "SELECT id, license_plate, vin, model, manufacturer, capacity_kg, status, registration_expiry, insurance_expiry, last_maintenance_date, mileage, created_at, updated_at FROM armored_cars WHERE id = $1"
+        "SELECT id, license_plate, vin, model, manufacturer, capacity_kg, passenger_capacity, status, registration_expiry, insurance_expiry, last_maintenance_date, mileage, created_at, updated_at FROM armored_cars WHERE id = $1"
     )
     .bind(&id)
     .fetch_optional(db.as_ref())
@@ -102,7 +103,7 @@ pub async fn update_armored_car(
     Json(payload): Json<UpdateArmoredCarRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     let car = sqlx::query_as::<_, ArmoredCar>(
-        "SELECT id, license_plate, vin, model, manufacturer, capacity_kg, status, registration_expiry, insurance_expiry, last_maintenance_date, mileage, created_at, updated_at FROM armored_cars WHERE id = $1"
+        "SELECT id, license_plate, vin, model, manufacturer, capacity_kg, passenger_capacity, status, registration_expiry, insurance_expiry, last_maintenance_date, mileage, created_at, updated_at FROM armored_cars WHERE id = $1"
     )
     .bind(&id)
     .fetch_optional(db.as_ref())

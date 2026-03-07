@@ -511,5 +511,35 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create firearm_maintenance table: {}", e)))?;
 
+    // Create password_reset_tokens table for forgot password feature
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id VARCHAR(36) NOT NULL,
+            token VARCHAR(6) NOT NULL UNIQUE,
+            expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+            is_used BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create password_reset_tokens table: {}", e)))?;
+
+    // Create indexes for password_reset_tokens table
+    for index in &[
+        "CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_token ON password_reset_tokens(token)",
+        "CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_id ON password_reset_tokens(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)",
+    ] {
+        sqlx::query(index)
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Failed to create index: {}", e)))?;
+    }
+
     Ok(())
 }

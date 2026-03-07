@@ -4,6 +4,10 @@
     "builder": "DOCKERFILE"
   },
   "deploy": {
-    "startCommand": "/app/server"
+    "startCommand": "/app/server",
+    "healthcheckPath": "/api/health",
+    "healthcheckTimeout": 180,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
   }
 }

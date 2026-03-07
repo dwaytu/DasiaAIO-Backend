@@ -7,8 +7,11 @@ WORKDIR /app
 COPY Cargo.toml .
 COPY src ./src
 
-# Disable SQLx compile-time checking (no database available during build)
-ENV SQLX_OFFLINE=true
+# Build resilience for flaky networks (common in remote CI/deploy builds)
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
+    CARGO_NET_RETRY=10 \
+    CARGO_HTTP_TIMEOUT=120 \
+    SQLX_OFFLINE=true
 
 # Build the application
 RUN cargo build --release

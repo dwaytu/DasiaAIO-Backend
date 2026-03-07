@@ -10,7 +10,7 @@ use serde_json::json;
 
 use crate::{
     error::{AppError, AppResult},
-    models::{CreateUserRequest, LoginRequest, VerifyEmailRequest, ResendCodeRequest, UserResponse},
+    models::{CreateUserRequest, LoginRequest, VerifyEmailRequest, ResendCodeRequest, ForgotPasswordRequest, VerifyResetCodeRequest, ResetPasswordRequest},
     utils::{self, verify_password},
 };
 
@@ -101,7 +101,7 @@ pub async fn register(
     .bind(initial_verified)
     .execute(db.as_ref())
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create user: {}", e)))?;;
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create user: {}", e)))?;
 
     // Only create verification record + send email when SMTP is configured
     if smtp_configured {
@@ -331,8 +331,12 @@ pub async fn login(
     let address: Option<String> = user.try_get("address").ok();
     let profile_photo: Option<String> = user.try_get("profile_photo").ok();
 
+    // Generate JWT token
+    let token = utils::generate_token(&id, &email, &role)?;
+
     Ok(Json(json!({
         "message": "Login successful",
+        "token": token,
         "user": {
             "id": id,
             "email": email,
@@ -346,6 +350,216 @@ pub async fn login(
             "address": address,
             "profilePhoto": profile_photo,
         }
+    })))
+}
+
+pub async fn forgot_password(
+    State(db): State<Arc<PgPool>>,
+    Json(payload): Json<ForgotPasswordRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    if payload.email.is_empty() {
+        return Err(AppError::BadRequest("Email is required".to_string()));
+    }
+
+    // Find user by email
+    let user = sqlx::query("SELECT id FROM users WHERE email = $1")
+        .bind(&payload.email)
+        .fetch_optional(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    let user_id: String = user.try_get("id")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse user id: {}", e)))?;
+
+    // Generate reset code (6 digits)
+    let reset_code = utils::generate_confirmation_code();
+    let expires_at = chrono::Utc::now() + Duration::minutes(10);
+
+    // Delete any existing unused reset codes for this user
+    sqlx::query("DELETE FROM password_reset_tokens WHERE user_id = $1 AND is_used = FALSE")
+        .bind(&user_id)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to delete old tokens: {}", e)))?;
+
+    // Create new password reset token
+    sqlx::query(
+        "INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)"
+    )
+    .bind(&user_id)
+    .bind(&reset_code)
+    .bind(expires_at)
+    .execute(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create reset token: {}", e)))?;
+
+    // Send email with reset code
+    let resend_api_key = std::env::var("RESEND_API_KEY").unwrap_or_default();
+    if !resend_api_key.is_empty() {
+        let html_body = format!(
+            r#"
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px; text-align: center; border-radius: 8px 8px 0 0;">
+                    <h1 style="color: white; margin: 0;">Davao Security & Investigation Agency</h1>
+                    <p style="color: rgba(255,255,255,0.9); margin: 10px 0 0 0;">Password Reset</p>
+                </div>
+                <div style="background: #f9f9f9; padding: 40px; border-radius: 0 0 8px 8px;">
+                    <h2 style="color: #333; margin-top: 0;">Reset Your Password</h2>
+                    <p style="color: #666; font-size: 16px; line-height: 1.6;">
+                        We received a request to reset your password. Use the following code to proceed:
+                    </p>
+                    <div style="background: white; border: 2px solid #667eea; border-radius: 8px; padding: 20px; text-align: center; margin: 30px 0;">
+                        <code style="font-size: 32px; font-weight: bold; color: #667eea; letter-spacing: 2px;">{}</code>
+                    </div>
+                    <p style="color: #666; font-size: 14px;">
+                        This code will expire in 10 minutes. If you did not request a password reset, please ignore this email.
+                    </p>
+                    <hr style="border: none; border-top: 1px solid #ddd; margin: 30px 0;">
+                    <p style="color: #999; font-size: 12px; margin: 0;">
+                        © 2024 Davao Security & Investigation Agency. All rights reserved.
+                    </p>
+                </div>
+            </div>
+            "#,
+            reset_code
+        );
+
+        let client = reqwest::Client::new();
+        let _ = client
+            .post("https://api.resend.com/emails")
+            .header("Authorization", format!("Bearer {}", resend_api_key))
+            .json(&serde_json::json!({
+                "from": "Sentinel DASIA <noreply@dasiasentinel.xyz>",
+                "to": [&payload.email],
+                "subject": "Davao Security - Password Reset Code",
+                "html": html_body
+            }))
+            .send()
+            .await;
+    }
+
+    Ok(Json(json!({
+        "message": "Password reset code sent to your email"
+    })))
+}
+
+pub async fn verify_reset_code(
+    State(db): State<Arc<PgPool>>,
+    Json(payload): Json<VerifyResetCodeRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    if payload.email.is_empty() || payload.code.is_empty() {
+        return Err(AppError::BadRequest("Email and code are required".to_string()));
+    }
+
+    // Find user
+    let user = sqlx::query("SELECT id FROM users WHERE email = $1")
+        .bind(&payload.email)
+        .fetch_optional(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    let user_id: String = user.try_get("id")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse user id: {}", e)))?;
+
+    // Find reset token
+    let token_record = sqlx::query(
+        "SELECT id, expires_at, is_used FROM password_reset_tokens WHERE user_id = $1 AND token = $2"
+    )
+    .bind(&user_id)
+    .bind(&payload.code)
+    .fetch_optional(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+    .ok_or_else(|| AppError::BadRequest("Invalid reset code".to_string()))?;
+
+    let is_used: bool = token_record.try_get("is_used")
+        .unwrap_or(false);
+    if is_used {
+        return Err(AppError::BadRequest("Reset code has already been used".to_string()));
+    }
+
+    // Check if code expired
+    let expires_at: chrono::DateTime<chrono::Utc> = token_record.try_get("expires_at")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse expiry: {}", e)))?;
+    if chrono::Utc::now() > expires_at {
+        return Err(AppError::BadRequest("Reset code expired".to_string()));
+    }
+
+    Ok(Json(json!({
+        "message": "Reset code verified"
+    })))
+}
+
+pub async fn reset_password(
+    State(db): State<Arc<PgPool>>,
+    Json(payload): Json<ResetPasswordRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    if payload.email.is_empty() || payload.code.is_empty() || payload.new_password.is_empty() {
+        return Err(AppError::BadRequest("Email, code, and new password are required".to_string()));
+    }
+
+    if payload.new_password.len() < 6 {
+        return Err(AppError::BadRequest("Password must be at least 6 characters".to_string()));
+    }
+
+    // Find user
+    let user = sqlx::query("SELECT id FROM users WHERE email = $1")
+        .bind(&payload.email)
+        .fetch_optional(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    let user_id: String = user.try_get("id")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse user id: {}", e)))?;
+
+    // Find and validate reset token
+    let token_record = sqlx::query(
+        "SELECT id, expires_at, is_used FROM password_reset_tokens WHERE user_id = $1 AND token = $2"
+    )
+    .bind(&user_id)
+    .bind(&payload.code)
+    .fetch_optional(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+    .ok_or_else(|| AppError::BadRequest("Invalid reset code".to_string()))?;
+
+    let is_used: bool = token_record.try_get("is_used")
+        .unwrap_or(false);
+    if is_used {
+        return Err(AppError::BadRequest("Reset code has already been used".to_string()));
+    }
+
+    let expires_at: chrono::DateTime<chrono::Utc> = token_record.try_get("expires_at")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse expiry: {}", e)))?;
+    if chrono::Utc::now() > expires_at {
+        return Err(AppError::BadRequest("Reset code expired".to_string()));
+    }
+
+    let token_id: String = token_record.try_get("id")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse token id: {}", e)))?;
+
+    // Hash new password
+    let hashed_password = utils::hash_password(&payload.new_password).await?;
+
+    // Update user password and mark token as used
+    sqlx::query("UPDATE users SET password = $1 WHERE id = $2")
+        .bind(&hashed_password)
+        .bind(&user_id)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to update password: {}", e)))?;
+
+    sqlx::query("UPDATE password_reset_tokens SET is_used = TRUE WHERE id = $1")
+        .bind(&token_id)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to mark token as used: {}", e)))?;
+
+    Ok(Json(json!({
+        "message": "Password reset successful. You can now login with your new password."
     })))
 }
 

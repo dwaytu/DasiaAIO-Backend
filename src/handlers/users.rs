@@ -1,6 +1,5 @@
 use axum::{
     extract::{State, Path},
-    http::StatusCode,
     Json,
 };
 use sqlx::PgPool;

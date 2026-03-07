@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 // User role enum
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, sqlx::Type)]
@@ -69,9 +68,9 @@ pub struct CreateUserRequest {
     pub full_name: String,
     pub phone_number: String,
     pub license_number: Option<String>,
-    #[serde(with = "option_date_format")]
+    #[serde(default, with = "option_date_format")]
     pub license_issued_date: Option<DateTime<Utc>>,
-    #[serde(with = "option_date_format")]
+    #[serde(default, with = "option_date_format")]
     pub license_expiry_date: Option<DateTime<Utc>>,
     pub address: Option<String>,
     pub admin_code: Option<String>,
@@ -224,6 +223,24 @@ pub struct ResendCodeRequest {
     pub email: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ForgotPasswordRequest {
+    pub email: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyResetCodeRequest {
+    pub email: String,
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResetPasswordRequest {
+    pub email: String,
+    pub code: String,
+    pub new_password: String,
+}
+
 // Guard Replacement related models
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Shift {
@@ -285,6 +302,7 @@ pub struct ArmoredCar {
     pub model: String,
     pub manufacturer: String,
     pub capacity_kg: i32,
+    pub passenger_capacity: Option<i32>,
     pub status: String,
     pub registration_expiry: Option<DateTime<Utc>>,
     pub insurance_expiry: Option<DateTime<Utc>>,
@@ -302,6 +320,7 @@ pub struct CreateArmoredCarRequest {
     pub model: String,
     pub manufacturer: String,
     pub capacity_kg: i32,
+    pub passenger_capacity: Option<i32>,
     pub registration_expiry: Option<DateTime<Utc>>,
     pub insurance_expiry: Option<DateTime<Utc>>,
 }

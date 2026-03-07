@@ -410,7 +410,7 @@ pub async fn accept_replacement(
         .ok_or_else(|| AppError::NotFound("Guard not found".to_string()))?;
 
     // Verify shift exists and needs replacement
-    let shift = sqlx::query(
+    let _shift = sqlx::query(
         "SELECT id, replacement_status FROM shifts WHERE id = $1"
     )
     .bind(shift_id)
