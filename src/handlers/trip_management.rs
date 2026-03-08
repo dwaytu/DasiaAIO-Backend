@@ -1,5 +1,6 @@
 use axum::{
     extract::{State, Path},
+    http::HeaderMap,
     Json,
 };
 use sqlx::PgPool;
@@ -9,6 +10,7 @@ use serde_json::json;
 
 use crate::{
     error::{AppError, AppResult},
+    utils,
 };
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -47,7 +49,10 @@ pub struct GuardInfo {
 // Get all active trips with details
 pub async fn get_active_trips(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let trips = sqlx::query_as::<_, TripDetails>(
         "SELECT t.id, t.car_id, t.driver_id, t.start_time, t.end_time, 
                 t.destination, t.status,
@@ -72,8 +77,11 @@ pub async fn get_active_trips(
 // Get trip details by ID with assigned guards
 pub async fn get_trip_details(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(trip_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     // Get trip details
     let trip = sqlx::query_as::<_, TripDetails>(
         "SELECT t.id, t.car_id, t.driver_id, t.start_time, t.end_time, 
@@ -138,8 +146,11 @@ pub async fn get_trip_details(
 // Assign driver to trip
 pub async fn assign_driver_to_trip(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<AssignDriverRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     if payload.trip_id.trim().is_empty() || payload.driver_id.trim().is_empty() {
         return Err(AppError::BadRequest("Trip ID and driver ID are required".to_string()));
     }
@@ -180,9 +191,12 @@ pub async fn assign_driver_to_trip(
 // Update trip status
 pub async fn update_trip_status(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(trip_id): Path<String>,
     Json(payload): Json<UpdateTripStatusRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let status = payload.status.trim();
     if status.is_empty() {
         return Err(AppError::BadRequest("Status is required".to_string()));
@@ -236,7 +250,10 @@ pub async fn update_trip_status(
 // Get driver assignments
 pub async fn get_driver_assignments(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     #[derive(sqlx::FromRow, Serialize)]
     struct DriverAssignment {
         driver_id: String,
@@ -251,7 +268,7 @@ pub async fn get_driver_assignments(
                 COUNT(t.id) as total_trips
          FROM users u
          LEFT JOIN trips t ON u.id = t.driver_id
-         WHERE u.role = 'user' AND u.verified = true
+         WHERE u.role IN ('guard', 'user') AND u.verified = true
          GROUP BY u.id, u.full_name
          ORDER BY active_trips DESC"
     )

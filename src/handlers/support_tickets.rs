@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path, State},
+    http::HeaderMap,
     http::StatusCode,
     Json,
 };
@@ -15,8 +16,11 @@ use crate::{
 
 pub async fn get_guard_tickets(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(guard_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_self_or_min_role(&headers, &guard_id, "supervisor")?;
+
     let tickets = sqlx::query_as::<_, SupportTicket>(
         "SELECT id, guard_id, subject, message, status, created_at, updated_at FROM support_tickets WHERE guard_id = $1 ORDER BY created_at DESC",
     )
@@ -33,6 +37,7 @@ pub async fn get_guard_tickets(
 
 pub async fn create_ticket(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateSupportTicketRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     if payload.guard_id.is_empty() || payload.subject.is_empty() || payload.message.is_empty() {
@@ -40,6 +45,8 @@ pub async fn create_ticket(
             "Guard ID, subject, and message are required".to_string(),
         ));
     }
+
+    let _claims = utils::require_self_or_min_role(&headers, &payload.guard_id, "supervisor")?;
 
     let id = utils::generate_id();
 

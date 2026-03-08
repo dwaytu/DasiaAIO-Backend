@@ -1,5 +1,6 @@
 use axum::{
     extract::State,
+    http::HeaderMap,
     Json,
 };
 use sqlx::PgPool;
@@ -9,6 +10,7 @@ use serde_json::json;
 
 use crate::{
     error::{AppError, AppResult},
+    utils,
 };
 
 #[derive(Debug, Serialize)]
@@ -63,10 +65,13 @@ pub struct MissionStats {
 // Get comprehensive analytics
 pub async fn get_analytics(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<AnalyticsResponse>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     // Overview stats
     let total_guards = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM users WHERE role = 'user'"
+        "SELECT COUNT(*) FROM users WHERE role IN ('guard', 'user')"
     )
     .fetch_one(db.as_ref())
     .await
@@ -265,7 +270,10 @@ pub async fn get_analytics(
 // Get performance trends
 pub async fn get_performance_trends(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     #[derive(sqlx::FromRow, Serialize)]
     struct DailyStats {
         date: Option<chrono::NaiveDate>,
@@ -296,8 +304,11 @@ pub async fn get_performance_trends(
 // Update mission status
 pub async fn update_mission_status(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<UpdateMissionStatusRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     // Update trip status
     sqlx::query(
         "UPDATE trips SET status = $1 WHERE id = $2"

@@ -1,4 +1,5 @@
 use crate::error::{AppError, AppResult};
+use axum::http::HeaderMap;
 use regex::Regex;
 use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey};
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,169 @@ pub fn verify_token(token: &str) -> AppResult<TokenClaims> {
     )
     .map(|data| data.claims)
     .map_err(|e| AppError::BadRequest(format!("Invalid or expired token: {}", e)))
+}
+
+pub fn extract_bearer_token(headers: &HeaderMap) -> AppResult<String> {
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| AppError::Unauthorized("Missing Authorization header".to_string()))?;
+
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| AppError::Unauthorized("Invalid Authorization header format".to_string()))?;
+
+    if token.is_empty() {
+        return Err(AppError::Unauthorized("Missing bearer token".to_string()));
+    }
+
+    Ok(token.to_string())
+}
+
+pub fn normalize_role(role: &str) -> String {
+    let normalized = role.to_lowercase();
+    if normalized == "user" {
+        "guard".to_string()
+    } else {
+        normalized
+    }
+}
+
+pub fn role_rank(role: &str) -> Option<u8> {
+    match normalize_role(role).as_str() {
+        "guard" => Some(1),
+        "supervisor" => Some(2),
+        "admin" => Some(3),
+        "superadmin" => Some(4),
+        _ => None,
+    }
+}
+
+pub fn role_permissions(role: &str) -> &'static [&'static str] {
+    match normalize_role(role).as_str() {
+        "superadmin" => &[
+            "create_user",
+            "update_user",
+            "delete_user",
+            "approve_guard_registration",
+            "manage_firearms",
+            "allocate_firearm",
+            "manage_armored_cars",
+            "assign_vehicle_driver",
+            "manage_missions",
+            "manage_schedules",
+            "view_analytics",
+            "manage_trip_status",
+            "view_support_tickets",
+            "create_support_ticket",
+            "manage_notifications",
+            "view_merit",
+            "manage_merit",
+        ],
+        "admin" => &[
+            "create_user",
+            "update_user",
+            "delete_user",
+            "approve_guard_registration",
+            "manage_firearms",
+            "allocate_firearm",
+            "manage_armored_cars",
+            "assign_vehicle_driver",
+            "manage_missions",
+            "manage_schedules",
+            "view_analytics",
+            "manage_trip_status",
+            "view_support_tickets",
+            "create_support_ticket",
+            "manage_notifications",
+            "view_merit",
+            "manage_merit",
+        ],
+        "supervisor" => &[
+            "update_user",
+            "approve_guard_registration",
+            "manage_firearms",
+            "allocate_firearm",
+            "manage_armored_cars",
+            "assign_vehicle_driver",
+            "manage_missions",
+            "manage_schedules",
+            "view_analytics",
+            "manage_trip_status",
+            "view_support_tickets",
+            "create_support_ticket",
+            "manage_notifications",
+            "view_merit",
+            "manage_merit",
+        ],
+        "guard" => &[
+            "create_support_ticket",
+            "manage_notifications",
+            "view_merit",
+        ],
+        _ => &[],
+    }
+}
+
+pub fn has_permission(role: &str, permission: &str) -> bool {
+    role_permissions(role).contains(&permission)
+}
+
+pub fn can_create_role(actor_role: &str, target_role: &str) -> bool {
+    let actor = normalize_role(actor_role);
+    let target = normalize_role(target_role);
+
+    match actor.as_str() {
+        "superadmin" => matches!(target.as_str(), "admin" | "supervisor" | "guard"),
+        "admin" => matches!(target.as_str(), "supervisor" | "guard"),
+        _ => false,
+    }
+}
+
+pub fn require_min_role(headers: &HeaderMap, minimum_role: &str) -> AppResult<TokenClaims> {
+    let token = extract_bearer_token(headers)?;
+    let claims = verify_token(&token)?;
+
+    let actor_rank = role_rank(&claims.role)
+        .ok_or_else(|| AppError::Forbidden("Unknown account role".to_string()))?;
+    let required_rank = role_rank(minimum_role)
+        .ok_or_else(|| AppError::InternalServerError("Invalid RBAC policy role".to_string()))?;
+
+    if actor_rank < required_rank {
+        return Err(AppError::Forbidden(format!(
+            "This action requires '{}' or higher role",
+            minimum_role
+        )));
+    }
+
+    Ok(claims)
+}
+
+pub fn require_self_or_min_role(
+    headers: &HeaderMap,
+    target_user_id: &str,
+    minimum_role: &str,
+) -> AppResult<TokenClaims> {
+    let token = extract_bearer_token(headers)?;
+    let claims = verify_token(&token)?;
+
+    if claims.sub == target_user_id {
+        return Ok(claims);
+    }
+
+    let actor_rank = role_rank(&claims.role)
+        .ok_or_else(|| AppError::Forbidden("Unknown account role".to_string()))?;
+    let required_rank = role_rank(minimum_role)
+        .ok_or_else(|| AppError::InternalServerError("Invalid RBAC policy role".to_string()))?;
+
+    if actor_rank < required_rank {
+        return Err(AppError::Forbidden(format!(
+            "This action requires '{}' role unless accessing your own account",
+            minimum_role
+        )));
+    }
+
+    Ok(claims)
 }
 
 pub fn generate_id() -> String {

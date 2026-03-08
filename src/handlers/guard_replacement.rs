@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use sqlx::{PgPool, Row};
@@ -18,8 +18,11 @@ use crate::{
 
 pub async fn create_shift(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateShiftRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     if payload.guard_id.is_empty() || payload.start_time.is_empty() 
         || payload.end_time.is_empty() || payload.client_site.is_empty() {
         return Err(AppError::BadRequest(
@@ -162,7 +165,10 @@ pub async fn check_out(
 
 pub async fn detect_no_shows(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     // Enhanced no-show detection with grace period and automatic notifications
     
     // Step 1: Find shifts that have passed their grace period without check-in
@@ -217,7 +223,7 @@ pub async fn detect_no_shows(
              FROM users u
              LEFT JOIN guard_availability ga ON u.id = ga.guard_id
              WHERE u.id != $1 
-             AND u.role = 'user' 
+             AND u.role IN ('guard', 'user') 
              AND u.verified = true
              AND (ga.available IS NULL OR ga.available = true)
              AND NOT EXISTS (
@@ -281,6 +287,7 @@ pub async fn detect_no_shows(
 
 pub async fn request_replacement(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<RequestReplacementRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     if payload.original_guard_id.is_empty() || payload.replacement_guard_id.is_empty() 
@@ -289,6 +296,8 @@ pub async fn request_replacement(
             "Original Guard ID, Replacement Guard ID, and Shift ID are required".to_string()
         ));
     }
+
+    let _claims = utils::require_self_or_min_role(&headers, &payload.original_guard_id, "supervisor")?;
 
     // Verify all references exist
     sqlx::query("SELECT id FROM users WHERE id = $1")
@@ -540,7 +549,10 @@ pub async fn get_guard_attendance(
 // Get all shifts with guard information (admin view)
 pub async fn get_all_shifts(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     #[derive(sqlx::FromRow, serde::Serialize)]
     struct ShiftWithGuard {
         id: String,
@@ -575,9 +587,12 @@ pub async fn get_all_shifts(
 // Update existing shift
 pub async fn update_shift(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(shift_id): Path<String>,
     Json(payload): Json<CreateShiftRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     // Check if shift exists
     sqlx::query("SELECT id FROM shifts WHERE id = $1")
         .bind(&shift_id)
@@ -618,8 +633,11 @@ pub async fn update_shift(
 // Delete shift
 pub async fn delete_shift(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(shift_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     // Check if shift exists
     sqlx::query("SELECT id FROM shifts WHERE id = $1")
         .bind(&shift_id)

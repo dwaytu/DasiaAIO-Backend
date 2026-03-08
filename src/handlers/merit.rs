@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path, State},
+    http::HeaderMap,
     http::StatusCode,
     Json,
 };
@@ -19,8 +20,11 @@ use crate::{
 // Calculate merit score for a guard based on performance metrics
 pub async fn calculate_merit_score(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CalculateMeritScoreRequest>,
 ) -> AppResult<(StatusCode, Json<MeritScoreResponse>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let guard_id = &payload.guard_id;
 
     // 1. Calculate Attendance Score (% of shifts attended)
@@ -213,8 +217,11 @@ pub async fn calculate_merit_score(
 // Get merit score for a specific guard
 pub async fn get_guard_merit_score(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(guard_id): Path<String>,
 ) -> AppResult<Json<MeritScoreResponse>> {
+    let _claims = utils::require_self_or_min_role(&headers, &guard_id, "supervisor")?;
+
     let merit_score: GuardMeritScore = sqlx::query_as(
         "SELECT id, guard_id, CAST(attendance_score AS FLOAT8), CAST(punctuality_score AS FLOAT8), 
                 CAST(client_rating AS FLOAT8), CAST(overall_score AS FLOAT8), rank, 
@@ -260,7 +267,10 @@ pub async fn get_guard_merit_score(
 // Get all guards ranked by merit score
 pub async fn get_ranked_guards(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let guards = sqlx::query_as::<_, (String, String, f64, Option<String>, i32, i32, f64)>(
         "SELECT gms.guard_id, u.full_name, CAST(gms.overall_score AS FLOAT8), gms.rank, 
                 gms.on_time_count, 
@@ -268,7 +278,7 @@ pub async fn get_ranked_guards(
                 CAST(gms.average_client_rating AS FLOAT8)
          FROM guard_merit_scores gms
          JOIN users u ON gms.guard_id = u.id
-         WHERE u.role = 'user'
+         WHERE u.role IN ('guard', 'user')
          ORDER BY gms.overall_score DESC, u.full_name"
     )
     .fetch_all(db.as_ref())
@@ -306,8 +316,11 @@ pub async fn get_ranked_guards(
 // Submit client evaluation for a guard
 pub async fn submit_client_evaluation(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateClientEvaluationRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     if payload.rating < 0.0 || payload.rating > 5.0 {
         return Err(AppError::BadRequest(
             "Rating must be between 0 and 5".to_string(),
@@ -344,8 +357,11 @@ pub async fn submit_client_evaluation(
 // Get all evaluations for a guard
 pub async fn get_guard_evaluations(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(guard_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_self_or_min_role(&headers, &guard_id, "supervisor")?;
+
     let evaluations = sqlx::query_as::<_, ClientEvaluation>(
         "SELECT id, guard_id, shift_id, mission_id, evaluator_name, evaluator_role, 
                 CAST(rating AS FLOAT8) AS rating, comment, created_at 
@@ -371,13 +387,16 @@ pub async fn get_guard_evaluations(
 // Get top-performing guards for overtime assignment
 pub async fn get_overtime_candidates(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     // Filter for Gold and Silver rank guards (top performers)
     let candidates = sqlx::query_as::<_, (String, String, f64, Option<String>)>(
         "SELECT gms.guard_id, u.full_name, CAST(gms.overall_score AS FLOAT8), gms.rank
          FROM guard_merit_scores gms
          JOIN users u ON gms.guard_id = u.id
-         WHERE u.role = 'user' AND gms.rank IN ('Gold', 'Silver')
+         WHERE u.role IN ('guard', 'user') AND gms.rank IN ('Gold', 'Silver')
          ORDER BY gms.overall_score DESC
          LIMIT 20"
     )

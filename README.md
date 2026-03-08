@@ -70,6 +70,8 @@ GMAIL_PASSWORD=your_app_specific_password
 ADMIN_CODE=122601
 ```
 
+Note: `ADMIN_CODE` is retained for backward compatibility in configuration but public registration now only allows guard self-registration.
+
 ### Note on Gmail Password
 For Gmail, you need to generate an "App Password":
 1. Enable 2-Factor Authentication on your Google account
@@ -80,16 +82,23 @@ For Gmail, you need to generate an "App Password":
 ## API Endpoints
 
 ### Authentication
-- `POST /api/register` - Register a new user
+- `POST /api/register` - Public guard self-registration (starts as pending approval)
 - `POST /api/login` - Login user
 - `POST /api/verify` - Verify email with code
 - `POST /api/resend-code` - Resend verification code
 
 ### Users
 - `GET /api/users` - Get all users
+- `POST /api/users` - Create user via authenticated actor (hierarchical RBAC)
 - `GET /api/user/:id` - Get user by ID
 - `PUT /api/user/:id` - Update user
 - `DELETE /api/user/:id` - Delete user
+
+### RBAC Notes
+- Role hierarchy: `superadmin > admin > supervisor > guard`
+- `superadmin` can create `admin`, `supervisor`, `guard`
+- `admin` can create `supervisor`, `guard`
+- Guard self-registration is public, but requires admin/supervisor approval before login
 
 ### Firearms
 - `POST /api/firearms` - Add firearm

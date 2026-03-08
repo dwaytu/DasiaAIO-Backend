@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use chrono::Utc;
@@ -11,13 +11,17 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     models::{CompleteFirearmMaintenanceRequest, CreateFirearmMaintenanceRequest, FirearmMaintenance},
+    utils,
 };
 
 /// POST /api/firearm-maintenance/schedule
 pub async fn schedule_maintenance(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateFirearmMaintenanceRequest>,
 ) -> AppResult<(StatusCode, Json<FirearmMaintenance>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
@@ -56,7 +60,10 @@ pub async fn schedule_maintenance(
 /// GET /api/firearm-maintenance/pending
 pub async fn get_pending_maintenance(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<Vec<FirearmMaintenance>>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let recs = sqlx::query_as::<_, FirearmMaintenance>(
         "SELECT * FROM firearm_maintenance WHERE status = 'pending' ORDER BY scheduled_date ASC",
     )
@@ -70,8 +77,11 @@ pub async fn get_pending_maintenance(
 /// GET /api/firearm-maintenance/:firearm_id
 pub async fn get_firearm_maintenance(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(firearm_id): Path<String>,
 ) -> AppResult<Json<Vec<FirearmMaintenance>>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let recs = sqlx::query_as::<_, FirearmMaintenance>(
         "SELECT * FROM firearm_maintenance WHERE firearm_id = $1 ORDER BY scheduled_date DESC",
     )
@@ -86,9 +96,12 @@ pub async fn get_firearm_maintenance(
 /// POST /api/firearm-maintenance/:maintenance_id/complete
 pub async fn complete_maintenance(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(maintenance_id): Path<String>,
     Json(payload): Json<CompleteFirearmMaintenanceRequest>,
 ) -> AppResult<Json<FirearmMaintenance>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let now = Utc::now();
 
     // Get firearm_id so we can restore its status

@@ -1,6 +1,6 @@
 use axum::{
     extract::{State, Path},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use sqlx::{PgPool, Row};
@@ -15,8 +15,11 @@ use crate::{
 
 pub async fn issue_firearm(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<IssueFirearmRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     if payload.firearm_id.is_empty() || payload.guard_id.is_empty() {
         return Err(AppError::BadRequest(
             "Firearm ID and Guard ID are required".to_string()
@@ -131,8 +134,11 @@ pub async fn issue_firearm(
 
 pub async fn return_firearm(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<ReturnFirearmRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     if payload.allocation_id.is_empty() {
         return Err(AppError::BadRequest(
             "Allocation ID is required".to_string()

@@ -83,6 +83,225 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to add address column: {}", e)))?;
 
+    // Add RBAC and approval workflow columns
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS approval_status VARCHAR(20) NOT NULL DEFAULT 'approved'"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to add approval_status column: {}", e)))?;
+
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS approved_by VARCHAR(36)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to add approved_by column: {}", e)))?;
+
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS approval_date TIMESTAMP WITH TIME ZONE"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to add approval_date column: {}", e)))?;
+
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by VARCHAR(36)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to add created_by column: {}", e)))?;
+
+    // Create normalized RBAC tables for permission-based authorization.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS roles (
+            id VARCHAR(36) PRIMARY KEY,
+            role_key VARCHAR(50) NOT NULL UNIQUE,
+            role_name VARCHAR(100) NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create roles table: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS permissions (
+            id VARCHAR(36) PRIMARY KEY,
+            permission_key VARCHAR(100) NOT NULL UNIQUE,
+            description TEXT,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create permissions table: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS role_permissions (
+            id VARCHAR(36) PRIMARY KEY,
+            role_id VARCHAR(36) NOT NULL,
+            permission_id VARCHAR(36) NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(role_id, permission_id),
+            FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE,
+            FOREIGN KEY (permission_id) REFERENCES permissions(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create role_permissions table: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS user_roles (
+            id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            role_id VARCHAR(36) NOT NULL,
+            is_primary BOOLEAN NOT NULL DEFAULT true,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, role_id),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create user_roles table: {}", e)))?;
+
+    // Seed role catalog.
+    for (role_key, role_name) in [
+        ("superadmin", "Super Administrator"),
+        ("admin", "Administrator"),
+        ("supervisor", "Supervisor"),
+        ("guard", "Guard"),
+    ] {
+        sqlx::query(
+            "INSERT INTO roles (id, role_key, role_name) VALUES ($1, $2, $3) ON CONFLICT (role_key) DO NOTHING",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(role_key)
+        .bind(role_name)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to seed roles: {}", e)))?;
+    }
+
+    // Seed permission catalog.
+    for (permission_key, description) in [
+        ("create_user", "Create user accounts"),
+        ("update_user", "Update user accounts"),
+        ("delete_user", "Delete user accounts"),
+        ("approve_guard_registration", "Approve or reject pending guard registrations"),
+        ("manage_firearms", "Manage firearm inventory"),
+        ("allocate_firearm", "Issue and return firearm allocations"),
+        ("manage_armored_cars", "Manage armored car fleet records"),
+        ("assign_vehicle_driver", "Assign drivers to vehicles and trips"),
+        ("manage_missions", "Create and manage mission assignments"),
+        ("manage_schedules", "Create and manage guard schedules"),
+        ("view_analytics", "View analytics dashboards and trends"),
+        ("manage_trip_status", "Update trip lifecycle status"),
+        ("view_support_tickets", "View support tickets"),
+        ("create_support_ticket", "Create support tickets"),
+        ("manage_notifications", "Read/update notifications"),
+        ("view_merit", "View merit scoring data"),
+        ("manage_merit", "Calculate or update merit scoring data"),
+    ] {
+        sqlx::query(
+            "INSERT INTO permissions (id, permission_key, description) VALUES ($1, $2, $3) ON CONFLICT (permission_key) DO NOTHING",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(permission_key)
+        .bind(description)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to seed permissions: {}", e)))?;
+    }
+
+    // Seed role -> permission relationships.
+    for (role_key, permission_key) in [
+        // superadmin
+        ("superadmin", "create_user"),
+        ("superadmin", "update_user"),
+        ("superadmin", "delete_user"),
+        ("superadmin", "approve_guard_registration"),
+        ("superadmin", "manage_firearms"),
+        ("superadmin", "allocate_firearm"),
+        ("superadmin", "manage_armored_cars"),
+        ("superadmin", "assign_vehicle_driver"),
+        ("superadmin", "manage_missions"),
+        ("superadmin", "manage_schedules"),
+        ("superadmin", "view_analytics"),
+        ("superadmin", "manage_trip_status"),
+        ("superadmin", "view_support_tickets"),
+        ("superadmin", "create_support_ticket"),
+        ("superadmin", "manage_notifications"),
+        ("superadmin", "view_merit"),
+        ("superadmin", "manage_merit"),
+        // admin
+        ("admin", "create_user"),
+        ("admin", "update_user"),
+        ("admin", "delete_user"),
+        ("admin", "approve_guard_registration"),
+        ("admin", "manage_firearms"),
+        ("admin", "allocate_firearm"),
+        ("admin", "manage_armored_cars"),
+        ("admin", "assign_vehicle_driver"),
+        ("admin", "manage_missions"),
+        ("admin", "manage_schedules"),
+        ("admin", "view_analytics"),
+        ("admin", "manage_trip_status"),
+        ("admin", "view_support_tickets"),
+        ("admin", "create_support_ticket"),
+        ("admin", "manage_notifications"),
+        ("admin", "view_merit"),
+        ("admin", "manage_merit"),
+        // supervisor
+        ("supervisor", "update_user"),
+        ("supervisor", "approve_guard_registration"),
+        ("supervisor", "manage_firearms"),
+        ("supervisor", "allocate_firearm"),
+        ("supervisor", "manage_armored_cars"),
+        ("supervisor", "assign_vehicle_driver"),
+        ("supervisor", "manage_missions"),
+        ("supervisor", "manage_schedules"),
+        ("supervisor", "view_analytics"),
+        ("supervisor", "manage_trip_status"),
+        ("supervisor", "view_support_tickets"),
+        ("supervisor", "create_support_ticket"),
+        ("supervisor", "manage_notifications"),
+        ("supervisor", "view_merit"),
+        ("supervisor", "manage_merit"),
+        // guard
+        ("guard", "create_support_ticket"),
+        ("guard", "manage_notifications"),
+        ("guard", "view_merit"),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO role_permissions (id, role_id, permission_id)
+               SELECT $1, r.id, p.id
+               FROM roles r, permissions p
+               WHERE r.role_key = $2 AND p.permission_key = $3
+               ON CONFLICT (role_id, permission_id) DO NOTHING"#,
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(role_key)
+        .bind(permission_key)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to seed role permissions: {}", e)))?;
+    }
+
     // Create verifications table
     sqlx::query(
         r#"
@@ -528,6 +747,38 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .execute(pool)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create password_reset_tokens table: {}", e)))?;
+
+    // Create audit logs table for centralized write-traceability.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id VARCHAR(36) PRIMARY KEY,
+            actor_user_id VARCHAR(36),
+            action_key VARCHAR(255) NOT NULL,
+            entity_type VARCHAR(100) NOT NULL,
+            entity_id VARCHAR(255),
+            result VARCHAR(50) NOT NULL,
+            reason TEXT,
+            metadata JSONB,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (actor_user_id) REFERENCES users(id) ON DELETE SET NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create audit_logs table: {}", e)))?;
+
+    for index in &[
+        "CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_created ON audit_logs(actor_user_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id, created_at DESC)",
+    ] {
+        sqlx::query(index)
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Failed to create audit index: {}", e)))?;
+    }
 
     // Create indexes for password_reset_tokens table
     for index in &[

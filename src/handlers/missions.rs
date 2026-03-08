@@ -1,6 +1,6 @@
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use sqlx::PgPool;
@@ -76,8 +76,11 @@ pub struct MissionDetails {
 // Integrated mission assignment endpoint
 pub async fn assign_mission(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<MissionAssignmentRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     use chrono::{NaiveDate, NaiveTime, NaiveDateTime};
     
     // Parse date (YYYY-MM-DD format from HTML date input)
@@ -111,7 +114,7 @@ pub async fn assign_mission(
     
     let guards = sqlx::query_as::<_, GuardRow>(
         "SELECT id, full_name, username FROM users 
-         WHERE role = 'user' 
+         WHERE role IN ('guard', 'user') 
          AND verified = true 
          LIMIT $1"
     )
@@ -287,7 +290,10 @@ pub async fn assign_mission(
 // Get mission details
 pub async fn get_missions(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     // Get recent trips with associated details
     #[derive(sqlx::FromRow, Serialize)]
     struct MissionRow {

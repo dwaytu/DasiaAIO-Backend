@@ -1,6 +1,6 @@
 use axum::{
     extract::{State, Path},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use sqlx::PgPool;
@@ -15,8 +15,11 @@ use crate::{
 
 pub async fn add_firearm(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateFirearmRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     if payload.serial_number.is_empty() || payload.model.is_empty() || payload.caliber.is_empty() {
         return Err(AppError::BadRequest(
             "Serial number, model, and caliber are required".to_string()
@@ -87,9 +90,12 @@ pub async fn get_firearm_by_id(
 
 pub async fn update_firearm(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(payload): Json<UpdateFirearmRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     // Check if firearm exists
     sqlx::query("SELECT id FROM firearms WHERE id = $1")
         .bind(&id)
@@ -127,8 +133,11 @@ pub async fn update_firearm(
 
 pub async fn delete_firearm(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     // Check if firearm exists
     sqlx::query("SELECT id FROM firearms WHERE id = $1")
         .bind(&id)
@@ -150,7 +159,10 @@ pub async fn delete_firearm(
 
 pub async fn get_firearm_maintenance(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     // For now, return firearms that need maintenance (status = 'maintenance')
     let maintenance_firearms = sqlx::query_as::<_, Firearm>(
         "SELECT id, name, serial_number, model, caliber, status, created_at, updated_at FROM firearms WHERE status = 'maintenance' ORDER BY updated_at DESC"

@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path, State},
+    http::HeaderMap,
     http::StatusCode,
     Json,
 };
@@ -16,8 +17,11 @@ use crate::{
 // Get all notifications for a user
 pub async fn get_user_notifications(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(user_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_self_or_min_role(&headers, &user_id, "supervisor")?;
+
     let notifications = sqlx::query_as::<_, Notification>(
         "SELECT id, user_id, title, message, type as notification_type, related_shift_id, read, created_at, updated_at 
          FROM notifications 
@@ -42,8 +46,11 @@ pub async fn get_user_notifications(
 // Get unread notifications count for a user
 pub async fn get_unread_count(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(user_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_self_or_min_role(&headers, &user_id, "supervisor")?;
+
     let count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND read = false",
     )
@@ -60,6 +67,7 @@ pub async fn get_unread_count(
 // Create a notification
 pub async fn create_notification(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateNotificationRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     if payload.user_id.is_empty() || payload.title.is_empty() || payload.message.is_empty() {
@@ -67,6 +75,8 @@ pub async fn create_notification(
             "User ID, title, and message are required".to_string(),
         ));
     }
+
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
 
     // Verify user exists
     sqlx::query("SELECT id FROM users WHERE id = $1")
@@ -104,15 +114,18 @@ pub async fn create_notification(
 // Mark notification as read
 pub async fn mark_notification_read(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(notification_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
-    // Check if notification exists
-    sqlx::query("SELECT id FROM notifications WHERE id = $1")
+    // Check if notification exists and enforce ownership/elevated access.
+    let notif_user_id = sqlx::query_scalar::<_, String>("SELECT user_id FROM notifications WHERE id = $1")
         .bind(&notification_id)
         .fetch_optional(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("Notification not found".to_string()))?;
+
+    let _claims = utils::require_self_or_min_role(&headers, &notif_user_id, "supervisor")?;
 
     sqlx::query(
         "UPDATE notifications SET read = true, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
@@ -130,8 +143,11 @@ pub async fn mark_notification_read(
 // Mark all notifications as read for a user
 pub async fn mark_all_read(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(user_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_self_or_min_role(&headers, &user_id, "supervisor")?;
+
     let result = sqlx::query(
         "UPDATE notifications SET read = true, updated_at = CURRENT_TIMESTAMP WHERE user_id = $1 AND read = false",
     )
@@ -149,15 +165,17 @@ pub async fn mark_all_read(
 // Delete a notification
 pub async fn delete_notification(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(notification_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
-    // Check if notification exists
-    sqlx::query("SELECT id FROM notifications WHERE id = $1")
+    let notif_user_id = sqlx::query_scalar::<_, String>("SELECT user_id FROM notifications WHERE id = $1")
         .bind(&notification_id)
         .fetch_optional(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("Notification not found".to_string()))?;
+
+    let _claims = utils::require_self_or_min_role(&headers, &notif_user_id, "supervisor")?;
 
     sqlx::query("DELETE FROM notifications WHERE id = $1")
         .bind(&notification_id)

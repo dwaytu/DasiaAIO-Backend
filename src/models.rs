@@ -5,8 +5,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, sqlx::Type)]
 #[sqlx(type_name = "varchar")]
 pub enum UserRole {
-    #[serde(rename = "user")]
-    User,
+    #[serde(rename = "guard")]
+    Guard,
+    #[serde(rename = "supervisor")]
+    Supervisor,
     #[serde(rename = "admin")]
     Admin,
     #[serde(rename = "superadmin")]
@@ -16,7 +18,8 @@ pub enum UserRole {
 impl std::fmt::Display for UserRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UserRole::User => write!(f, "user"),
+            UserRole::Guard => write!(f, "guard"),
+            UserRole::Supervisor => write!(f, "supervisor"),
             UserRole::Admin => write!(f, "admin"),
             UserRole::Superadmin => write!(f, "superadmin"),
         }
@@ -28,7 +31,8 @@ impl std::str::FromStr for UserRole {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "user" => Ok(UserRole::User),
+            "user" | "guard" => Ok(UserRole::Guard),
+            "supervisor" => Ok(UserRole::Supervisor),
             "admin" => Ok(UserRole::Admin),
             "superadmin" => Ok(UserRole::Superadmin),
             _ => Err(format!("Unknown role: {}", s)),
@@ -503,6 +507,7 @@ pub struct SupportTicket {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateSupportTicketRequest {
+    #[serde(alias = "guardId")]
     pub guard_id: String,
     pub subject: String,
     pub message: String,

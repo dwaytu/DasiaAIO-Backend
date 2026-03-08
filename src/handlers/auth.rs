@@ -20,40 +20,24 @@ pub async fn register(
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     tracing::info!("Register request received for user: {}", payload.email);
 
+    let requested_role = utils::normalize_role(&payload.role);
+
     // Validate required fields
-    if payload.role == "admin" {
-        if payload.email.is_empty() || payload.password.is_empty() || payload.username.is_empty() 
-            || payload.full_name.is_empty() || payload.phone_number.is_empty() {
-            return Err(AppError::BadRequest(
-                "Email, password, username, full name, and phone number are required for admin accounts".to_string()
-            ));
-        }
-    } else {
-        if payload.email.is_empty() || payload.password.is_empty() || payload.username.is_empty() 
-            || payload.full_name.is_empty() || payload.phone_number.is_empty() 
-            || payload.license_number.is_none() || payload.license_issued_date.is_none() 
-            || payload.license_expiry_date.is_none() {
-            return Err(AppError::BadRequest(
-                "All fields are required for regular user accounts".to_string()
-            ));
-        }
+    if payload.email.is_empty() || payload.password.is_empty() || payload.username.is_empty()
+        || payload.full_name.is_empty() || payload.phone_number.is_empty()
+        || payload.license_number.is_none() || payload.license_issued_date.is_none()
+        || payload.license_expiry_date.is_none() {
+        return Err(AppError::BadRequest(
+            "All fields are required for guard self-registration".to_string()
+        ));
     }
 
     // Validate Gmail
     utils::validate_gmail(&payload.email)?;
 
     // Validate role
-    if payload.role != "user" && payload.role != "admin" {
-        return Err(AppError::BadRequest("Role must be 'user' or 'admin'".to_string()));
-    }
-
-    // Validate admin code
-    if payload.role == "admin" {
-        let admin_code = payload.admin_code.as_ref()
-            .ok_or_else(|| AppError::BadRequest("Admin code is required".to_string()))?;
-        if admin_code != "122601" {
-            return Err(AppError::BadRequest("Invalid admin code".to_string()));
-        }
+    if requested_role != "guard" {
+        return Err(AppError::BadRequest("Public registration only supports guard accounts".to_string()));
     }
 
     // Check if user exists
@@ -84,14 +68,14 @@ pub async fn register(
 
     // Create user
     sqlx::query(
-        r#"INSERT INTO users (id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, verified)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"#
+        r#"INSERT INTO users (id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, verified, approval_status, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', NULL)"#
     )
     .bind(&user_id)
     .bind(&payload.email)
     .bind(&payload.username)
     .bind(&hashed_password)
-    .bind(&payload.role)
+    .bind(&requested_role)
     .bind(&payload.full_name)
     .bind(&payload.phone_number)
     .bind(&payload.license_number)
@@ -102,6 +86,38 @@ pub async fn register(
     .execute(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create user: {}", e)))?;
+
+    // Notify reviewers (superadmin/admin/supervisor) that a guard registration is waiting for approval.
+    let reviewer_ids = sqlx::query_scalar::<_, String>(
+        r#"SELECT id
+           FROM users
+           WHERE LOWER(role) IN ('superadmin', 'admin', 'supervisor')
+             AND verified = TRUE
+             AND COALESCE(approval_status, 'approved') = 'approved'"#,
+    )
+    .fetch_all(db.as_ref())
+    .await
+    .unwrap_or_default();
+
+    for reviewer_id in reviewer_ids {
+        let notification_id = utils::generate_id();
+        if let Err(e) = sqlx::query(
+            "INSERT INTO notifications (id, user_id, title, message, type, related_shift_id, read) VALUES ($1, $2, $3, $4, $5, NULL, false)",
+        )
+        .bind(&notification_id)
+        .bind(&reviewer_id)
+        .bind("Guard Registration Pending Approval")
+        .bind(format!(
+            "New guard registration submitted by {} ({}) and is waiting for approval.",
+            payload.full_name, payload.email
+        ))
+        .bind("approval_request")
+        .execute(db.as_ref())
+        .await
+        {
+            tracing::warn!("Failed to create reviewer notification: {}", e);
+        }
+    }
 
     // Only create verification record + send email when SMTP is configured
     if smtp_configured {
@@ -132,7 +148,7 @@ pub async fn register(
                 return Ok((
                     StatusCode::CREATED,
                     Json(json!({
-                        "message": "Registration successful! We couldn't send the verification email. Please use Resend Code to try again.",
+                        "message": "Registration submitted! We couldn't send the verification email. Please use Resend Code and wait for account approval.",
                         "userId": user_id,
                         "email": payload.email,
                         "requiresVerification": true
@@ -144,7 +160,7 @@ pub async fn register(
         return Ok((
             StatusCode::CREATED,
             Json(json!({
-                "message": "Registration successful! Check your Gmail for confirmation code.",
+                "message": "Registration submitted. Check your Gmail for confirmation code, then wait for supervisor/admin approval.",
                 "userId": user_id,
                 "email": payload.email,
                 "requiresVerification": true
@@ -157,7 +173,7 @@ pub async fn register(
     Ok((
         StatusCode::CREATED,
         Json(json!({
-            "message": "Registration successful! You can now log in.",
+            "message": "Registration submitted. Your account is pending approval.",
             "userId": user_id,
             "email": payload.email,
             "requiresVerification": false
@@ -290,7 +306,7 @@ pub async fn login(
 
     // Find user by email, username, or phone
     let user = sqlx::query(
-        r#"SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, created_at, updated_at FROM users 
+        r#"SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, COALESCE(approval_status, 'approved') AS approval_status, created_at, updated_at FROM users 
            WHERE email = $1 OR username = $1 OR phone_number = $1"#
     )
     .bind(&payload.identifier)
@@ -304,6 +320,13 @@ pub async fn login(
     if !verified {
         return Err(AppError::BadRequest(
             "Please verify your email first".to_string()
+        ));
+    }
+
+    let approval_status: String = user.try_get("approval_status").unwrap_or_else(|_| "approved".to_string());
+    if approval_status != "approved" {
+        return Err(AppError::Forbidden(
+            "Your account is pending approval".to_string()
         ));
     }
 

@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use serde_json::json;
@@ -15,8 +15,11 @@ use crate::{
 
 pub async fn get_guard_permits(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(guard_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_self_or_min_role(&headers, &guard_id, "supervisor")?;
+
     let permits = sqlx::query_as::<_, GuardFirearmPermit>(
         "SELECT id, guard_id, firearm_id, permit_type, issued_date, expiry_date, status, created_at, updated_at FROM guard_firearm_permits WHERE guard_id = $1 ORDER BY issued_date DESC",
     )
@@ -33,8 +36,11 @@ pub async fn get_guard_permits(
 
 pub async fn create_guard_permit(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateGuardFirearmPermitRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     if payload.guard_id.is_empty() || payload.permit_type.is_empty() {
         return Err(AppError::BadRequest(
             "Guard ID and permit type are required".to_string(),
@@ -69,7 +75,10 @@ pub async fn create_guard_permit(
 
 pub async fn get_all_permits(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let permits = sqlx::query_as::<_, GuardFirearmPermit>(
         "SELECT id, guard_id, firearm_id, permit_type, issued_date, expiry_date, status, created_at, updated_at FROM guard_firearm_permits ORDER BY issued_date DESC",
     )
@@ -86,7 +95,10 @@ pub async fn get_all_permits(
 /// GET /api/guard-firearm-permits/expiring  — expiring within 30 days
 pub async fn get_expiring_permits(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let permits = sqlx::query_as::<_, GuardFirearmPermit>(
         r#"SELECT id, guard_id, firearm_id, permit_type, issued_date, expiry_date, status, created_at, updated_at
            FROM guard_firearm_permits
@@ -107,8 +119,11 @@ pub async fn get_expiring_permits(
 /// PUT /api/guard-firearm-permits/:permit_id/revoke
 pub async fn revoke_permit(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(permit_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let result = sqlx::query(
         "UPDATE guard_firearm_permits SET status = 'revoked', updated_at = NOW() WHERE id = $1",
     )
@@ -127,7 +142,10 @@ pub async fn revoke_permit(
 /// POST /api/guard-firearm-permits/auto-expire  — batch expire all past-due permits
 pub async fn auto_expire_permits(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let result = sqlx::query(
         "UPDATE guard_firearm_permits SET status = 'expired', updated_at = NOW() WHERE status = 'active' AND expiry_date < NOW()",
     )

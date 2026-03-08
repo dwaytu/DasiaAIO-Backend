@@ -1,6 +1,6 @@
 use axum::{
     extract::{State, Path},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use sqlx::PgPool;
@@ -21,8 +21,11 @@ use crate::{
 
 pub async fn add_armored_car(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateArmoredCarRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     if payload.license_plate.is_empty() || payload.vin.is_empty() || payload.model.is_empty() {
         return Err(AppError::BadRequest(
             "License plate, VIN, and model are required".to_string(),
@@ -99,9 +102,12 @@ pub async fn get_armored_car_by_id(
 
 pub async fn update_armored_car(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(payload): Json<UpdateArmoredCarRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let car = sqlx::query_as::<_, ArmoredCar>(
         "SELECT id, license_plate, vin, model, manufacturer, capacity_kg, passenger_capacity, status, registration_expiry, insurance_expiry, last_maintenance_date, mileage, created_at, updated_at FROM armored_cars WHERE id = $1"
     )
@@ -133,8 +139,11 @@ pub async fn update_armored_car(
 
 pub async fn delete_armored_car(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     sqlx::query("DELETE FROM armored_cars WHERE id = $1")
         .bind(&id)
         .execute(db.as_ref())
@@ -148,8 +157,11 @@ pub async fn delete_armored_car(
 
 pub async fn issue_car(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<IssueCarRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let id = utils::generate_id();
 
     sqlx::query(
@@ -184,8 +196,11 @@ pub async fn issue_car(
 
 pub async fn return_car(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<ReturnCarRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let allocation = sqlx::query_as::<_, CarAllocation>(
         "SELECT id, car_id, client_id, allocation_date, return_date, expected_return_date, status, notes, created_at, updated_at FROM car_allocations WHERE id = $1"
     )
@@ -247,8 +262,11 @@ pub async fn get_active_car_allocations(
 
 pub async fn schedule_maintenance(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateMaintenanceRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let id = utils::generate_id();
 
     // Parse cost string to f64 for the NUMERIC column; null if absent or unparseable.
@@ -281,8 +299,11 @@ pub async fn schedule_maintenance(
 
 pub async fn complete_maintenance(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(maintenance_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let maintenance = sqlx::query_as::<_, CarMaintenance>(
         "SELECT id, car_id, maintenance_type, description, cost::FLOAT8 as cost, scheduled_date, completion_date, status, notes, created_at, updated_at FROM car_maintenance WHERE id = $1"
     )
@@ -330,8 +351,11 @@ pub async fn get_car_maintenance_records(
 
 pub async fn assign_driver(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<AssignDriverRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let id = utils::generate_id();
 
     sqlx::query(
@@ -356,8 +380,11 @@ pub async fn assign_driver(
 
 pub async fn unassign_driver(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(assignment_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     sqlx::query(
         "UPDATE driver_assignments SET end_date = CURRENT_TIMESTAMP, status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
     )
@@ -389,8 +416,11 @@ pub async fn get_car_drivers(
 
 pub async fn create_trip(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateTripRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let id = utils::generate_id();
 
     sqlx::query(
@@ -418,8 +448,11 @@ pub async fn create_trip(
 
 pub async fn end_trip(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<EndTripRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     // Parse distance_km string to f64 for the DECIMAL column; null if unparseable.
     let distance_km_f64: Option<f64> = payload.distance_km
         .as_deref()

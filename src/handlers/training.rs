@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use chrono::Utc;
@@ -11,13 +11,17 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     models::{CreateTrainingRecordRequest, TrainingRecord},
+    utils,
 };
 
 /// POST /api/training-records
 pub async fn create_training_record(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateTrainingRecordRequest>,
 ) -> AppResult<(StatusCode, Json<TrainingRecord>)> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
@@ -48,8 +52,11 @@ pub async fn create_training_record(
 /// GET /api/training-records/:guard_id
 pub async fn get_guard_training(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(guard_id): Path<String>,
 ) -> AppResult<Json<Vec<TrainingRecord>>> {
+    let _claims = utils::require_self_or_min_role(&headers, &guard_id, "supervisor")?;
+
     // Auto-expire any records past their expiry_date first
     sqlx::query(
         "UPDATE training_records
@@ -76,7 +83,10 @@ pub async fn get_guard_training(
 /// GET /api/training-records/expiring  (expiring within 30 days)
 pub async fn get_expiring_training(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
 ) -> AppResult<Json<Vec<TrainingRecord>>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
     let recs = sqlx::query_as::<_, TrainingRecord>(
         r#"
         SELECT * FROM training_records
