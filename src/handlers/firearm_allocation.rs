@@ -239,8 +239,8 @@ pub async fn get_all_allocations(
     })))
 }
 
-/// GET /api/firearm-allocation/overdue
-/// Returns active allocations where expected_return_date has passed
+/// GET /api/firearm-allocations/overdue
+/// Returns active allocations where return_date has passed
 pub async fn get_overdue_allocations(
     State(db): State<Arc<PgPool>>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -248,16 +248,16 @@ pub async fn get_overdue_allocations(
         r#"
         SELECT
             fa.id, fa.guard_id, fa.firearm_id, fa.allocation_date,
-            fa.expected_return_date, fa.status,
+                        fa.return_date, fa.status,
             u.full_name AS guard_name,
             f.model AS firearm_model, f.serial_number AS firearm_serial_number
         FROM firearm_allocations fa
         JOIN users u ON u.id = fa.guard_id
         JOIN firearms f ON f.id = fa.firearm_id
         WHERE fa.status = 'active'
-          AND fa.expected_return_date IS NOT NULL
-          AND fa.expected_return_date < NOW()
-        ORDER BY fa.expected_return_date ASC
+                    AND fa.return_date IS NOT NULL
+                    AND fa.return_date < NOW()
+                ORDER BY fa.return_date ASC
         "#,
     )
     .fetch_all(db.as_ref())
@@ -275,7 +275,7 @@ pub async fn get_overdue_allocations(
                 "firearmModel": r.get::<Option<String>, _>("firearm_model"),
                 "firearmSerialNumber": r.get::<Option<String>, _>("firearm_serial_number"),
                 "allocationDate": r.get::<chrono::DateTime<chrono::Utc>, _>("allocation_date"),
-                "expectedReturnDate": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("expected_return_date"),
+                "returnDate": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("return_date"),
                 "status": r.get::<String, _>("status"),
             })
         })
