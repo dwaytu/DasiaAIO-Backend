@@ -13,7 +13,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ## 2. Clone and Setup
 ```bash
-cd backend-rust
+cd DasiaAIO-Backend
 cp .env.example .env
 # Edit .env with your PostgreSQL connection string and Gmail credentials
 ```
@@ -27,6 +27,19 @@ CREATE DATABASE guard_firearm_system;
 Update the `DATABASE_URL` in your `.env` file with the correct PostgreSQL connection details.
 
 ## 4. Build and Run
+
+### Docker (recommended)
+
+```bash
+docker compose up -d --build
+curl http://localhost:5000/api/health
+```
+
+PowerShell health check:
+
+```powershell
+Invoke-WebRequest -Uri "http://localhost:5000/api/health" -UseBasicParsing
+```
 
 ### Development Mode (with auto-reload)
 ```bash
@@ -46,7 +59,7 @@ cargo test
 ```
 
 ## Environment Variables
-Create a `.env` file in the backend-rust directory:
+Create a `.env` file in the `DasiaAIO-Backend` directory:
 
 ```
 SERVER_HOST=0.0.0.0
@@ -154,3 +167,9 @@ The migrations run automatically on startup. If you need to reset:
 2. Configure environment variables in `.env`
 3. Run `cargo run` to start the development server
 4. Update your frontend to point to `http://localhost:5000` for API calls
+
+## Validation Checklist
+
+- `docker compose config -q` passes.
+- `docker compose up -d` starts both database and backend containers.
+- `GET /api/health` returns `{\"status\":\"ok\"}`.
