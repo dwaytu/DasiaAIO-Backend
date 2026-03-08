@@ -181,8 +181,11 @@ pub async fn return_firearm(
 
 pub async fn get_guard_allocations(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(guard_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_self_or_min_role(&headers, &guard_id, "supervisor")?;
+
     let allocations = sqlx::query_as::<_, GuardAllocationView>(
         r#"
         SELECT fa.id, fa.guard_id, fa.firearm_id, fa.allocation_date, fa.return_date, fa.status, fa.created_at, fa.updated_at,

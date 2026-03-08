@@ -77,6 +77,7 @@ pub async fn create_shift(
 
 pub async fn check_in(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CheckInRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     if payload.guard_id.is_empty() || payload.shift_id.is_empty() {
@@ -85,13 +86,25 @@ pub async fn check_in(
         ));
     }
 
+    let _claims = utils::require_self_or_min_role(&headers, &payload.guard_id, "supervisor")?;
+
     // Check if shift exists
-    sqlx::query("SELECT id FROM shifts WHERE id = $1")
+    let shift_guard = sqlx::query("SELECT id, guard_id FROM shifts WHERE id = $1")
         .bind(&payload.shift_id)
         .fetch_optional(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("Shift not found".to_string()))?;
+
+    let assigned_guard_id: String = shift_guard
+        .try_get("guard_id")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse shift guard: {}", e)))?;
+
+    if assigned_guard_id != payload.guard_id {
+        return Err(AppError::Forbidden(
+            "Guard can only check in for their assigned shift".to_string(),
+        ));
+    }
 
     let attendance_id = utils::generate_id();
 
@@ -134,6 +147,7 @@ pub async fn check_in(
 
 pub async fn check_out(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<CheckOutRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     if payload.attendance_id.is_empty() {
@@ -142,13 +156,19 @@ pub async fn check_out(
         ));
     }
 
-    // Check if attendance exists
-    sqlx::query("SELECT id FROM attendance WHERE id = $1")
+    // Check if attendance exists and capture guard ownership.
+    let attendance = sqlx::query("SELECT id, guard_id FROM attendance WHERE id = $1")
         .bind(&payload.attendance_id)
         .fetch_optional(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("Attendance not found".to_string()))?;
+
+    let attendance_guard_id: String = attendance
+        .try_get("guard_id")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse attendance guard: {}", e)))?;
+
+    let _claims = utils::require_self_or_min_role(&headers, &attendance_guard_id, "supervisor")?;
 
     sqlx::query(
         "UPDATE attendance SET check_out_time = CURRENT_TIMESTAMP, status = 'checked_out', updated_at = CURRENT_TIMESTAMP WHERE id = $1"
@@ -338,6 +358,7 @@ pub async fn request_replacement(
 
 pub async fn set_availability(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Json(payload): Json<SetAvailabilityRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     if payload.guard_id.is_empty() {
@@ -345,6 +366,8 @@ pub async fn set_availability(
             "Guard ID is required".to_string()
         ));
     }
+
+    let _claims = utils::require_self_or_min_role(&headers, &payload.guard_id, "supervisor")?;
 
     // Check if guard exists
     sqlx::query("SELECT id FROM users WHERE id = $1")
@@ -512,8 +535,11 @@ pub async fn get_guard_availability(
 
 pub async fn get_guard_shifts(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(guard_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_self_or_min_role(&headers, &guard_id, "supervisor")?;
+
     let shifts = sqlx::query_as::<_, Shift>(
         "SELECT id, guard_id, start_time, end_time, client_site, status, created_at, updated_at FROM shifts WHERE guard_id = $1 ORDER BY start_time DESC",
     )
@@ -530,8 +556,11 @@ pub async fn get_guard_shifts(
 
 pub async fn get_guard_attendance(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(guard_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_self_or_min_role(&headers, &guard_id, "supervisor")?;
+
     let attendance = sqlx::query_as::<_, Attendance>(
         "SELECT id, guard_id, shift_id, check_in_time, check_out_time, status, created_at, updated_at FROM attendance WHERE guard_id = $1 ORDER BY check_in_time DESC",
     )
