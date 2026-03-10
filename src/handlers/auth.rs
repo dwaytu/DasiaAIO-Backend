@@ -59,12 +59,13 @@ pub async fn register(
     let confirmation_code = utils::generate_confirmation_code();
     let expires_at = chrono::Utc::now() + Duration::minutes(10);
 
-    // Determine if Resend API key is configured
+    // Email verification is mandatory for guard self-registration.
     let resend_api_key = std::env::var("RESEND_API_KEY").unwrap_or_default();
-    let smtp_configured = !resend_api_key.is_empty();
-
-    // If email is not configured, auto-verify immediately so users can log in
-    let initial_verified = !smtp_configured;
+    if resend_api_key.is_empty() {
+        return Err(AppError::InternalServerError(
+            "Registration is temporarily unavailable because email verification is not configured".to_string(),
+        ));
+    }
 
     // Create user
     sqlx::query(
@@ -82,7 +83,7 @@ pub async fn register(
     .bind(&payload.license_issued_date)
     .bind(&payload.license_expiry_date)
     .bind(&payload.address)
-    .bind(initial_verified)
+    .bind(false)
     .execute(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create user: {}", e)))?;
@@ -119,64 +120,33 @@ pub async fn register(
         }
     }
 
-    // Only create verification record + send email when SMTP is configured
-    if smtp_configured {
-        // Create verification record
-        let verification_id = utils::generate_id();
-        sqlx::query(
-            "INSERT INTO verifications (id, user_id, code, expires_at) VALUES ($1, $2, $3, $4)"
-        )
-        .bind(&verification_id)
-        .bind(&user_id)
-        .bind(&confirmation_code)
-        .bind(expires_at)
-        .execute(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to create verification: {}", e)))?;
+    // Create verification record
+    let verification_id = utils::generate_id();
+    sqlx::query(
+        "INSERT INTO verifications (id, user_id, code, expires_at) VALUES ($1, $2, $3, $4)"
+    )
+    .bind(&verification_id)
+    .bind(&user_id)
+    .bind(&confirmation_code)
+    .bind(expires_at)
+    .execute(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create verification: {}", e)))?;
 
-        match utils::send_confirmation_email(
-            &resend_api_key,
-            &payload.email,
-            &confirmation_code,
-        ).await {
-            Ok(_) => {
-                tracing::info!("Verification email sent to {}", payload.email);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to send verification email to {}: {}. User must resend the verification code.", payload.email, e);
-                // Do NOT auto-verify — user must verify their email
-                return Ok((
-                    StatusCode::CREATED,
-                    Json(json!({
-                        "message": "Registration submitted! We couldn't send the verification email. Please use Resend Code and wait for account approval.",
-                        "userId": user_id,
-                        "email": payload.email,
-                        "requiresVerification": true
-                    })),
-                ));
-            }
-        }
+    utils::send_confirmation_email(
+        &resend_api_key,
+        &payload.email,
+        &confirmation_code,
+    ).await?;
 
-        return Ok((
-            StatusCode::CREATED,
-            Json(json!({
-                "message": "Registration submitted. Check your Gmail for confirmation code, then wait for supervisor/admin approval.",
-                "userId": user_id,
-                "email": payload.email,
-                "requiresVerification": true
-            })),
-        ));
-    }
-
-    // SMTP not configured — user is already verified, can log in immediately
-    tracing::info!("SMTP not configured — user {} auto-verified, can log in immediately.", payload.email);
+    tracing::info!("Verification email sent to {}", payload.email);
     Ok((
         StatusCode::CREATED,
         Json(json!({
-            "message": "Registration submitted. Your account is pending approval.",
+            "message": "Registration submitted. Check your Gmail for confirmation code, then wait for supervisor/admin approval.",
             "userId": user_id,
             "email": payload.email,
-            "requiresVerification": false
+            "requiresVerification": true
         })),
     ))
 }
@@ -193,9 +163,13 @@ pub async fn verify_email(
 
     // Find verification record
     let verification = sqlx::query(
-        "SELECT id, user_id, expires_at FROM verifications WHERE code = $1"
+        r#"SELECT v.id, v.user_id, v.expires_at
+           FROM verifications v
+           INNER JOIN users u ON u.id = v.user_id
+           WHERE v.code = $1 AND LOWER(u.email) = LOWER($2)"#
     )
     .bind(&payload.code)
+    .bind(&payload.email)
     .fetch_optional(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
