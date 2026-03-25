@@ -62,6 +62,18 @@ pub struct MissionStats {
     pub average_duration_hours: f64,
 }
 
+#[derive(Debug, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct GuardReliabilityScore {
+    pub guard_id: String,
+    pub guard_name: String,
+    pub attendance_score: f64,
+    pub mission_performance: f64,
+    pub permit_compliance: f64,
+    pub reliability_score: f64,
+    pub rank: i64,
+}
+
 // Get comprehensive analytics
 pub async fn get_analytics(
     State(db): State<Arc<PgPool>>,
@@ -299,6 +311,77 @@ pub async fn get_performance_trends(
         "daily_stats": daily_stats,
         "period": "Last 30 days"
     })))
+}
+
+pub async fn get_guard_reliability(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+) -> AppResult<Json<Vec<GuardReliabilityScore>>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
+    let rows = sqlx::query_as::<_, GuardReliabilityScore>(
+        r#"
+        WITH guard_base AS (
+            SELECT id,
+                   COALESCE(NULLIF(full_name, ''), username) AS guard_name
+            FROM users
+            WHERE role IN ('guard', 'user')
+        ), attendance AS (
+            SELECT
+                s.guard_id,
+                COUNT(*) AS total_shifts,
+                COUNT(*) FILTER (WHERE a.check_in_time IS NOT NULL) AS attended_shifts
+            FROM shifts s
+            LEFT JOIN attendance a ON a.shift_id = s.id AND a.guard_id = s.guard_id
+            GROUP BY s.guard_id
+        ), missions AS (
+            SELECT
+                driver_id AS guard_id,
+                COUNT(*) AS missions_total,
+                COUNT(*) FILTER (WHERE status = 'completed') AS missions_completed
+            FROM trips
+            GROUP BY driver_id
+        ), permits AS (
+            SELECT
+                guard_id,
+                COUNT(*) AS total_permits,
+                COUNT(*) FILTER (WHERE status = 'active' AND expiry_date > NOW()) AS active_permits
+            FROM guard_firearm_permits
+            GROUP BY guard_id
+        )
+        SELECT
+            gb.id AS guard_id,
+            gb.guard_name,
+            ROUND((COALESCE(att.attended_shifts::DOUBLE PRECISION / NULLIF(att.total_shifts, 0), 1.0) * 100.0)::NUMERIC, 2)::DOUBLE PRECISION AS attendance_score,
+            ROUND((COALESCE(mis.missions_completed::DOUBLE PRECISION / NULLIF(mis.missions_total, 0), 1.0) * 100.0)::NUMERIC, 2)::DOUBLE PRECISION AS mission_performance,
+            ROUND((COALESCE(perm.active_permits::DOUBLE PRECISION / NULLIF(perm.total_permits, 0), 1.0) * 100.0)::NUMERIC, 2)::DOUBLE PRECISION AS permit_compliance,
+            ROUND(
+                ((COALESCE(att.attended_shifts::DOUBLE PRECISION / NULLIF(att.total_shifts, 0), 1.0) * 100.0 * 0.4) +
+                (COALESCE(mis.missions_completed::DOUBLE PRECISION / NULLIF(mis.missions_total, 0), 1.0) * 100.0 * 0.4) +
+                (COALESCE(perm.active_permits::DOUBLE PRECISION / NULLIF(perm.total_permits, 0), 1.0) * 100.0 * 0.2))::NUMERIC,
+                2
+            )::DOUBLE PRECISION AS reliability_score,
+            ROW_NUMBER() OVER (
+                ORDER BY (
+                    (COALESCE(att.attended_shifts::DOUBLE PRECISION / NULLIF(att.total_shifts, 0), 1.0) * 100.0 * 0.4) +
+                    (COALESCE(mis.missions_completed::DOUBLE PRECISION / NULLIF(mis.missions_total, 0), 1.0) * 100.0 * 0.4) +
+                    (COALESCE(perm.active_permits::DOUBLE PRECISION / NULLIF(perm.total_permits, 0), 1.0) * 100.0 * 0.2)
+                ) DESC,
+                gb.guard_name ASC
+            ) AS rank
+        FROM guard_base gb
+        LEFT JOIN attendance att ON att.guard_id = gb.id
+        LEFT JOIN missions mis ON mis.guard_id = gb.id
+        LEFT JOIN permits perm ON perm.guard_id = gb.id
+        ORDER BY reliability_score DESC, gb.guard_name ASC
+        LIMIT 5
+        "#,
+    )
+    .fetch_all(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to fetch guard reliability: {}", e)))?;
+
+    Ok(Json(rows))
 }
 
 // Update mission status

@@ -328,6 +328,12 @@ pub async fn login(
     let address: Option<String> = user.try_get("address").ok();
     let profile_photo: Option<String> = user.try_get("profile_photo").ok();
 
+    sqlx::query("UPDATE users SET last_seen_at = CURRENT_TIMESTAMP WHERE id = $1")
+        .bind(&id)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to update last_seen_at: {}", e)))?;
+
     // Generate JWT token
     let token = utils::generate_token(&id, &email, &role)?;
 

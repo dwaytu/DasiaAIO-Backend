@@ -151,7 +151,7 @@ pub async fn get_all_users(
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
     let users = sqlx::query_as::<_, User>(
-        "SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, created_at, updated_at FROM users"
+        "SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, last_seen_at, created_at, updated_at FROM users"
     )
     .fetch_all(db.as_ref())
     .await
@@ -163,6 +163,29 @@ pub async fn get_all_users(
         "total": user_responses.len(),
         "users": user_responses
     })))
+}
+
+pub async fn get_guards(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+) -> AppResult<Json<Vec<UserResponse>>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
+    let guards = sqlx::query_as::<_, User>(
+        r#"SELECT id, email, username, password, role, full_name, phone_number,
+                  license_number, license_issued_date, license_expiry_date, address,
+                  profile_photo, verified, last_seen_at, created_at, updated_at
+           FROM users
+           WHERE LOWER(role) IN ('guard', 'user')
+             AND COALESCE(approval_status, 'approved') = 'approved'
+           ORDER BY full_name ASC"#,
+    )
+    .fetch_all(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+
+    let response: Vec<UserResponse> = guards.into_iter().map(|u| u.into()).collect();
+    Ok(Json(response))
 }
 
 pub async fn get_pending_guard_approvals(
@@ -284,7 +307,7 @@ pub async fn get_user_by_id(
     let _claims = utils::require_self_or_min_role(&headers, &id, "supervisor")?;
 
     let user = sqlx::query_as::<_, User>(
-        "SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, created_at, updated_at FROM users WHERE id = $1"
+        "SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, last_seen_at, created_at, updated_at FROM users WHERE id = $1"
     )
     .bind(&id)
     .fetch_optional(db.as_ref())

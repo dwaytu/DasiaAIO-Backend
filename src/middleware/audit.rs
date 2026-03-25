@@ -47,7 +47,7 @@ pub async fn audit_write_requests(
             .nth(2)
             .map(|s| s.to_string());
 
-        let _ = sqlx::query(
+        if let Err(err) = sqlx::query(
             r#"INSERT INTO audit_logs (
                     id, actor_user_id, action_key, entity_type, entity_id, result, reason, metadata
                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
@@ -65,7 +65,16 @@ pub async fn audit_write_requests(
             "method": method,
         }))
         .execute(db.as_ref())
-        .await;
+        .await
+        {
+            tracing::error!(
+                error = %err,
+                method = %method,
+                path = %path,
+                status = status_code,
+                "failed to persist audit log entry"
+            );
+        }
     }
 
     response

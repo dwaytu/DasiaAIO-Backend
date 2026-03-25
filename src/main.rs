@@ -2,6 +2,7 @@ mod db;
 mod handlers;
 mod models;
 mod routes;
+mod services;
 mod utils;
 mod error;
 mod config;
@@ -10,7 +11,7 @@ mod middleware;
 use axum::{
     extract::DefaultBodyLimit,
     middleware as axum_middleware,
-    routing::{get, post, put, delete},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use std::sync::Arc;
@@ -126,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/users/:id", get(handlers::users::get_user_by_id).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)))
         .route("/api/users/:id", put(handlers::users::update_user).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
         .route("/api/users/:id", delete(handlers::users::delete_user).route_layer(axum_middleware::from_fn(middleware::authz::require_manage_users)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
+        .route("/api/guards", get(handlers::users::get_guards).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)))
         .route("/api/users/:id/profile-photo", put(handlers::users::update_profile_photo).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
         .route("/api/users/:id/profile-photo", delete(handlers::users::delete_profile_photo).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
         
@@ -213,6 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Armored car routes
         .route("/api/armored-cars", post(handlers::armored_cars::add_armored_car).route_layer(axum_middleware::from_fn(middleware::authz::require_armored_car_management)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
         .route("/api/armored-cars", get(handlers::armored_cars::get_all_armored_cars).route_layer(axum_middleware::from_fn(middleware::authz::require_armored_car_management)))
+        .route("/api/vehicles", get(handlers::armored_cars::get_all_armored_cars).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)))
         .route("/api/armored-cars/:id", get(handlers::armored_cars::get_armored_car_by_id).route_layer(axum_middleware::from_fn(middleware::authz::require_armored_car_management)))
         .route("/api/armored-cars/:id", put(handlers::armored_cars::update_armored_car).route_layer(axum_middleware::from_fn(middleware::authz::require_armored_car_management)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
         .route("/api/armored-cars/:id", delete(handlers::armored_cars::delete_armored_car).route_layer(axum_middleware::from_fn(middleware::authz::require_armored_car_management)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
@@ -246,16 +249,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/trip-management/assign-driver", post(handlers::trip_management::assign_driver_to_trip).route_layer(axum_middleware::from_fn(middleware::authz::require_trip_management)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
         .route("/api/trip-management/driver-assignments", get(handlers::trip_management::get_driver_assignments).route_layer(axum_middleware::from_fn(middleware::authz::require_trip_management)))
         
+        // System audit logs
+        .route(
+            "/api/audit-logs",
+            get(handlers::audit::get_audit_logs)
+                .route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)),
+        )
+
         // Analytics routes
         .route("/api/analytics", get(handlers::analytics::get_analytics).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)))
         .route("/api/analytics/trends", get(handlers::analytics::get_performance_trends).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)))
+        .route("/api/analytics/guard-reliability", get(handlers::analytics::get_guard_reliability).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)))
         .route("/api/analytics/mission-status", put(handlers::analytics::update_mission_status).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
+        .route("/api/alerts/predictive", get(handlers::alerts::get_predictive_alerts).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)))
+        .route("/api/ai/guard-absence-risk", get(handlers::ai::get_guard_absence_risk).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)))
+        .route("/api/ai/replacement-suggestions", get(handlers::ai::get_replacement_suggestions).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)))
+        .route("/api/ai/vehicle-maintenance-risk", get(handlers::ai::get_vehicle_maintenance_risk).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)))
+        .route("/api/ai/classify-incident", post(handlers::ai::classify_incident).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)))
+        .route("/api/ai/summarize-incident", post(handlers::ai::summarize_incident).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)))
+
+        // Operational map tracking routes
+        .route("/api/tracking/map-data", get(handlers::tracking::get_map_data).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)))
+        .route("/api/tracking/ws", get(handlers::tracking::tracking_ws))
+        .route("/api/tracking/client-sites", get(handlers::tracking::get_client_sites).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)))
+        .route("/api/tracking/client-sites", post(handlers::tracking::create_client_site).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
+        .route("/api/tracking/client-sites/:id", put(handlers::tracking::update_client_site).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
+        .route("/api/tracking/client-sites/:id", delete(handlers::tracking::delete_client_site).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
+        .route("/api/tracking/heartbeat", post(handlers::tracking::guard_heartbeat).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
+        .route("/api/tracking/points", post(handlers::tracking::create_tracking_point).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
+        .route("/api/tracking/proximity-alerts/check", post(handlers::tracking::check_shift_proximity_alerts).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
+
+        // Incident management routes
+        .route("/api/incidents", post(handlers::incidents::create_incident).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
+        .route("/api/incidents", get(handlers::incidents::get_incidents).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)))
+        .route("/api/incidents/active", get(handlers::incidents::get_active_incidents).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)))
+        .route("/api/incidents/:id/status", patch(handlers::incidents::update_incident_status).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
         
         // Health check
         .route("/api/health", get(handlers::health::health_check))
         
         .layer(cors_layer)
         .layer(TraceLayer::new_for_http())
+        .layer(axum_middleware::from_fn_with_state(db.clone(), middleware::presence::touch_last_seen))
         .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB limit
         .with_state(db);
 

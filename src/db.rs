@@ -112,6 +112,99 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to add created_by column: {}", e)))?;
 
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP WITH TIME ZONE"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to add last_seen_at column: {}", e)))?;
+
+    // Operational tracking tables for real-time map monitoring.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS client_sites (
+            id VARCHAR(36) PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            address TEXT,
+            latitude DOUBLE PRECISION NOT NULL,
+            longitude DOUBLE PRECISION NOT NULL,
+            is_active BOOLEAN NOT NULL DEFAULT true,
+            created_by VARCHAR(36),
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create client_sites table: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS tracking_points (
+            id VARCHAR(36) PRIMARY KEY,
+            entity_type VARCHAR(32) NOT NULL,
+            entity_id VARCHAR(64) NOT NULL,
+            label VARCHAR(255),
+            status VARCHAR(50),
+            latitude DOUBLE PRECISION NOT NULL,
+            longitude DOUBLE PRECISION NOT NULL,
+            heading DOUBLE PRECISION,
+            speed_kph DOUBLE PRECISION,
+            accuracy_meters DOUBLE PRECISION,
+            recorded_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            created_by VARCHAR(36),
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create tracking_points table: {}", e)))?;
+
+    sqlx::query(
+        "ALTER TABLE tracking_points ADD COLUMN IF NOT EXISTS accuracy_meters DOUBLE PRECISION"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to add accuracy_meters column: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_tracking_points_entity_time ON tracking_points (entity_type, entity_id, recorded_at DESC)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create tracking index: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS incidents (
+            id VARCHAR(36) PRIMARY KEY,
+            title VARCHAR(255) NOT NULL,
+            description TEXT NOT NULL,
+            location VARCHAR(255) NOT NULL,
+            reported_by VARCHAR(36) NOT NULL,
+            status VARCHAR(32) NOT NULL DEFAULT 'open',
+            priority VARCHAR(32) NOT NULL DEFAULT 'medium',
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT incidents_status_check CHECK (status IN ('open', 'investigating', 'resolved')),
+            CONSTRAINT incidents_priority_check CHECK (priority IN ('low', 'medium', 'high', 'critical')),
+            FOREIGN KEY (reported_by) REFERENCES users(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create incidents table: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_incidents_status_priority_created ON incidents (status, priority, created_at DESC)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create incidents index: {}", e)))?;
+
     // Create normalized RBAC tables for permission-based authorization.
     sqlx::query(
         r#"
@@ -729,6 +822,208 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .execute(pool)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create firearm_maintenance table: {}", e)))?;
+
+    // Create AI-assisted SOC intelligence tables (deterministic/explainable outputs).
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS guard_absence_predictions (
+            id VARCHAR(36) PRIMARY KEY,
+            guard_id VARCHAR(36) NOT NULL,
+            prediction_window_hours INTEGER NOT NULL DEFAULT 24,
+            risk_score DOUBLE PRECISION NOT NULL CHECK (risk_score >= 0 AND risk_score <= 1),
+            risk_level VARCHAR(20) NOT NULL CHECK (risk_level IN ('low', 'medium', 'high', 'critical')),
+            confidence_score DOUBLE PRECISION NOT NULL DEFAULT 0.75 CHECK (confidence_score >= 0 AND confidence_score <= 1),
+            explanation JSONB NOT NULL DEFAULT '{}'::jsonb,
+            contributing_factors JSONB NOT NULL DEFAULT '[]'::jsonb,
+            source_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+            generated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            valid_until TIMESTAMP WITH TIME ZONE,
+            feature_version VARCHAR(64) NOT NULL DEFAULT 'absence-heuristic-v1',
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (guard_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create guard_absence_predictions table: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_guard_absence_predictions_guard_generated ON guard_absence_predictions (guard_id, generated_at DESC)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create guard_absence_predictions index: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_guard_absence_predictions_level_valid ON guard_absence_predictions (risk_level, valid_until DESC)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create guard_absence_predictions level index: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS smart_guard_replacements (
+            id VARCHAR(36) PRIMARY KEY,
+            shift_id VARCHAR(36) NOT NULL,
+            absent_guard_id VARCHAR(36),
+            recommended_guard_id VARCHAR(36),
+            recommendation_rank INTEGER NOT NULL DEFAULT 1,
+            compatibility_score DOUBLE PRECISION NOT NULL CHECK (compatibility_score >= 0 AND compatibility_score <= 1),
+            confidence_score DOUBLE PRECISION NOT NULL DEFAULT 0.75 CHECK (confidence_score >= 0 AND confidence_score <= 1),
+            rationale TEXT NOT NULL,
+            scoring_breakdown JSONB NOT NULL DEFAULT '{}'::jsonb,
+            candidate_pool JSONB NOT NULL DEFAULT '[]'::jsonb,
+            recommendation_status VARCHAR(20) NOT NULL DEFAULT 'proposed'
+                CHECK (recommendation_status IN ('proposed', 'accepted', 'rejected', 'expired')),
+            generated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP WITH TIME ZONE,
+            feature_version VARCHAR(64) NOT NULL DEFAULT 'replacement-heuristic-v1',
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (shift_id) REFERENCES shifts(id) ON DELETE CASCADE,
+            FOREIGN KEY (absent_guard_id) REFERENCES users(id) ON DELETE SET NULL,
+            FOREIGN KEY (recommended_guard_id) REFERENCES users(id) ON DELETE SET NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create smart_guard_replacements table: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_smart_guard_replacements_shift_rank ON smart_guard_replacements (shift_id, recommendation_rank, generated_at DESC)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create smart_guard_replacements index: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_smart_guard_replacements_status ON smart_guard_replacements (recommendation_status, generated_at DESC)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create smart_guard_replacements status index: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS incident_severity_classifications (
+            id VARCHAR(36) PRIMARY KEY,
+            incident_id VARCHAR(36) NOT NULL,
+            predicted_severity VARCHAR(20) NOT NULL CHECK (predicted_severity IN ('low', 'medium', 'high', 'critical')),
+            confidence_score DOUBLE PRECISION NOT NULL CHECK (confidence_score >= 0 AND confidence_score <= 1),
+            requires_human_review BOOLEAN NOT NULL DEFAULT false,
+            rationale TEXT NOT NULL,
+            feature_scores JSONB NOT NULL DEFAULT '{}'::jsonb,
+            supporting_signals JSONB NOT NULL DEFAULT '{}'::jsonb,
+            classified_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            classifier_version VARCHAR(64) NOT NULL DEFAULT 'severity-heuristic-v1',
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (incident_id) REFERENCES incidents(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create incident_severity_classifications table: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_incident_severity_classifications_incident ON incident_severity_classifications (incident_id, classified_at DESC)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create incident_severity_classifications index: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_incident_severity_classifications_severity ON incident_severity_classifications (predicted_severity, classified_at DESC)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create incident_severity_classifications severity index: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS predictive_vehicle_maintenance (
+            id VARCHAR(36) PRIMARY KEY,
+            car_id VARCHAR(36) NOT NULL,
+            risk_score DOUBLE PRECISION NOT NULL CHECK (risk_score >= 0 AND risk_score <= 1),
+            risk_level VARCHAR(20) NOT NULL CHECK (risk_level IN ('low', 'medium', 'high', 'critical')),
+            days_to_service INTEGER,
+            predicted_failure_window_days INTEGER,
+            recommended_action TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            signal_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+            maintenance_type_suggestion VARCHAR(100),
+            generated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            valid_until TIMESTAMP WITH TIME ZONE,
+            feature_version VARCHAR(64) NOT NULL DEFAULT 'vehicle-maintenance-heuristic-v1',
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (car_id) REFERENCES armored_cars(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create predictive_vehicle_maintenance table: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_predictive_vehicle_maintenance_car_generated ON predictive_vehicle_maintenance (car_id, generated_at DESC)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create predictive_vehicle_maintenance index: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_predictive_vehicle_maintenance_level ON predictive_vehicle_maintenance (risk_level, valid_until DESC)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create predictive_vehicle_maintenance level index: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS ai_incident_summaries (
+            id VARCHAR(36) PRIMARY KEY,
+            incident_id VARCHAR(36) NOT NULL,
+            summary_kind VARCHAR(32) NOT NULL DEFAULT 'operational'
+                CHECK (summary_kind IN ('operational', 'executive', 'handover')),
+            summary_text TEXT NOT NULL,
+            concise_headline VARCHAR(255),
+            key_points JSONB NOT NULL DEFAULT '[]'::jsonb,
+            action_items JSONB NOT NULL DEFAULT '[]'::jsonb,
+            entities JSONB NOT NULL DEFAULT '{}'::jsonb,
+            confidence_score DOUBLE PRECISION NOT NULL DEFAULT 0.75 CHECK (confidence_score >= 0 AND confidence_score <= 1),
+            explainability JSONB NOT NULL DEFAULT '{}'::jsonb,
+            source_event_count INTEGER NOT NULL DEFAULT 0,
+            generated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            summarizer_version VARCHAR(64) NOT NULL DEFAULT 'incident-summary-v1',
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (incident_id) REFERENCES incidents(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create ai_incident_summaries table: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_ai_incident_summaries_incident ON ai_incident_summaries (incident_id, generated_at DESC)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create ai_incident_summaries index: {}", e)))?;
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_ai_incident_summaries_incident_kind_generated ON ai_incident_summaries (incident_id, summary_kind, generated_at)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create ai_incident_summaries unique index: {}", e)))?;
 
     // Create password_reset_tokens table for forgot password feature
     sqlx::query(

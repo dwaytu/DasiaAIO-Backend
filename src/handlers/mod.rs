@@ -14,3 +14,8 @@ pub mod notifications;
 pub mod merit;
 pub mod firearm_maintenance;
 pub mod training;
+pub mod tracking;
+pub mod incidents;
+pub mod alerts;
+pub mod audit;
+pub mod ai;

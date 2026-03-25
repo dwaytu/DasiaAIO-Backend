@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 // User role enum
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, sqlx::Type)]
@@ -57,6 +58,7 @@ pub struct User {
     pub address: Option<String>,
     pub profile_photo: Option<String>,
     pub verified: bool,
+    pub last_seen_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -90,6 +92,7 @@ pub struct UserResponse {
     pub full_name: String,
     pub phone_number: String,
     pub profile_photo: Option<String>,
+    pub last_seen_at: Option<DateTime<Utc>>,
 }
 
 impl From<User> for UserResponse {
@@ -102,6 +105,7 @@ impl From<User> for UserResponse {
             full_name: user.full_name,
             phone_number: user.phone_number,
             profile_photo: user.profile_photo,
+            last_seen_at: user.last_seen_at,
         }
     }
 }
@@ -114,6 +118,37 @@ pub struct Verification {
     pub code: String,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+
+// Audit log API models
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct AuditLogEntry {
+    pub id: String,
+    pub actor_user_id: Option<String>,
+    pub actor_name: Option<String>,
+    pub actor_email: Option<String>,
+    pub actor_role: Option<String>,
+    pub action_key: String,
+    pub entity_type: String,
+    pub entity_id: Option<String>,
+    pub result: String,
+    pub reason: Option<String>,
+    pub metadata: Option<Value>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuditLogPageMeta {
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuditLogListResponse {
+    pub items: Vec<AuditLogEntry>,
+    pub meta: AuditLogPageMeta,
 }
 
 // Firearm status enum
@@ -144,6 +179,7 @@ pub struct Firearm {
     pub model: String,
     pub caliber: String,
     pub status: String,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -413,6 +449,34 @@ pub struct DriverAssignment {
 pub struct AssignDriverRequest {
     pub car_id: String,
     pub guard_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Incident {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub location: String,
+    pub reported_by: String,
+    pub status: String,
+    pub priority: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateIncidentRequest {
+    pub title: String,
+    pub description: String,
+    pub location: String,
+    pub priority: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateIncidentStatusRequest {
+    pub status: String,
 }
 
 // Trip model
@@ -750,6 +814,105 @@ pub struct CreateTrainingRecordRequest {
     pub expiry_date: Option<DateTime<Utc>>,
     pub certificate_number: Option<String>,
     pub notes: Option<String>,
+}
+
+// Phase 1: AI-assisted operational intelligence models.
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct GuardAbsencePrediction {
+    pub id: String,
+    pub guard_id: String,
+    pub prediction_window_hours: i32,
+    pub risk_score: f64,
+    pub risk_level: String,
+    pub confidence_score: f64,
+    pub explanation: Value,
+    pub contributing_factors: Value,
+    pub source_snapshot: Value,
+    pub generated_at: DateTime<Utc>,
+    pub valid_until: Option<DateTime<Utc>>,
+    pub feature_version: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartGuardReplacement {
+    pub id: String,
+    pub shift_id: String,
+    pub absent_guard_id: Option<String>,
+    pub recommended_guard_id: Option<String>,
+    pub recommendation_rank: i32,
+    pub compatibility_score: f64,
+    pub confidence_score: f64,
+    pub rationale: String,
+    pub scoring_breakdown: Value,
+    pub candidate_pool: Value,
+    pub recommendation_status: String,
+    pub generated_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub feature_version: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct IncidentSeverityClassification {
+    pub id: String,
+    pub incident_id: String,
+    pub predicted_severity: String,
+    pub confidence_score: f64,
+    pub requires_human_review: bool,
+    pub rationale: String,
+    pub feature_scores: Value,
+    pub supporting_signals: Value,
+    pub classified_at: DateTime<Utc>,
+    pub classifier_version: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct PredictiveVehicleMaintenance {
+    pub id: String,
+    pub car_id: String,
+    pub risk_score: f64,
+    pub risk_level: String,
+    pub days_to_service: Option<i32>,
+    pub predicted_failure_window_days: Option<i32>,
+    pub recommended_action: String,
+    pub rationale: String,
+    pub signal_snapshot: Value,
+    pub maintenance_type_suggestion: Option<String>,
+    pub generated_at: DateTime<Utc>,
+    pub valid_until: Option<DateTime<Utc>>,
+    pub feature_version: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AiIncidentSummary {
+    pub id: String,
+    pub incident_id: String,
+    pub summary_kind: String,
+    pub summary_text: String,
+    pub concise_headline: Option<String>,
+    pub key_points: Value,
+    pub action_items: Value,
+    pub entities: Value,
+    pub confidence_score: f64,
+    pub explainability: Value,
+    pub source_event_count: i32,
+    pub generated_at: DateTime<Utc>,
+    pub summarizer_version: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 // Custom serde module for parsing date strings (YYYY-MM-DD) into DateTime<Utc>
