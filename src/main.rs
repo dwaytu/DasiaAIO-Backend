@@ -115,6 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         HeaderValue::from_static("http://127.0.0.1:4173"),
                         HeaderValue::from_static("http://localhost:3000"),
                         HeaderValue::from_static("http://127.0.0.1:3000"),
+                        HeaderValue::from_static("https://dasiasentinel.xyz"),
+                        HeaderValue::from_static("https://www.dasiasentinel.xyz"),
+                        HeaderValue::from_static("https://dasiaaio.up.railway.app"),
                     ]))
                     .allow_methods([
                         Method::GET,
@@ -143,6 +146,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 HeaderValue::from_static("http://127.0.0.1:4173"),
                 HeaderValue::from_static("http://localhost:3000"),
                 HeaderValue::from_static("http://127.0.0.1:3000"),
+                HeaderValue::from_static("https://dasiasentinel.xyz"),
+                HeaderValue::from_static("https://www.dasiasentinel.xyz"),
+                HeaderValue::from_static("https://dasiaaio.up.railway.app"),
             ]))
             .allow_methods([
                 Method::GET,
