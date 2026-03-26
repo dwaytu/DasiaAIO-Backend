@@ -133,6 +133,7 @@ pub struct AuditLogEntry {
     pub entity_id: Option<String>,
     pub result: String,
     pub reason: Option<String>,
+    pub source_ip: Option<String>,
     pub metadata: Option<Value>,
     pub created_at: DateTime<Utc>,
 }
@@ -279,6 +280,12 @@ pub struct ResetPasswordRequest {
     pub email: String,
     pub code: String,
     pub new_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshTokenRequest {
+    pub refresh_token: String,
 }
 
 // Guard Replacement related models

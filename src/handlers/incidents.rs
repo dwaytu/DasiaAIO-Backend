@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -80,18 +80,31 @@ pub async fn create_incident(
 pub async fn get_incidents(
     State(db): State<Arc<PgPool>>,
     _headers: HeaderMap,
+    Query(pagination): Query<utils::PaginationQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let (page, page_size, offset) = utils::resolve_pagination(pagination, 50, 200);
+
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM incidents")
+        .fetch_one(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to fetch incidents count: {}", e)))?;
+
     let incidents = sqlx::query_as::<_, Incident>(
         r#"SELECT id, title, description, location, reported_by, status, priority, created_at, updated_at
            FROM incidents
-           ORDER BY created_at DESC"#,
+           ORDER BY created_at DESC
+           LIMIT $1 OFFSET $2"#,
     )
+    .bind(page_size)
+    .bind(offset)
     .fetch_all(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to fetch incidents: {}", e)))?;
 
     Ok(Json(json!({
-        "total": incidents.len(),
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
         "incidents": incidents
     })))
 }
@@ -99,7 +112,15 @@ pub async fn get_incidents(
 pub async fn get_active_incidents(
     State(db): State<Arc<PgPool>>,
     _headers: HeaderMap,
+    Query(pagination): Query<utils::PaginationQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let (page, page_size, offset) = utils::resolve_pagination(pagination, 50, 200);
+
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM incidents WHERE status IN ('open', 'investigating')")
+        .fetch_one(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to fetch active incidents count: {}", e)))?;
+
     let incidents = sqlx::query_as::<_, Incident>(
         r#"SELECT id, title, description, location, reported_by, status, priority, created_at, updated_at
            FROM incidents
@@ -111,14 +132,19 @@ pub async fn get_active_incidents(
                WHEN 'medium' THEN 2
                ELSE 1
              END DESC,
-             created_at DESC"#,
+             created_at DESC
+           LIMIT $1 OFFSET $2"#,
     )
+    .bind(page_size)
+    .bind(offset)
     .fetch_all(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to fetch active incidents: {}", e)))?;
 
     Ok(Json(json!({
-        "total": incidents.len(),
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
         "incidents": incidents
     })))
 }

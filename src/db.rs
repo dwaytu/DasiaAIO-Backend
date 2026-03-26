@@ -1043,6 +1043,45 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create password_reset_tokens table: {}", e)))?;
 
+    // Create distributed login-attempt lockout table.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS auth_login_attempts (
+            scope_key VARCHAR(255) PRIMARY KEY,
+            failed_attempts INTEGER NOT NULL DEFAULT 0,
+            first_failed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_failed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            locked_until TIMESTAMP WITH TIME ZONE,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create auth_login_attempts table: {}", e)))?;
+
+    // Persist refresh token sessions for revocation and rotation tracking.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS refresh_token_sessions (
+            jti VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            token_hash VARCHAR(128) NOT NULL,
+            issued_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+            revoked_at TIMESTAMP WITH TIME ZONE,
+            replaced_by_jti VARCHAR(64),
+            last_used_at TIMESTAMP WITH TIME ZONE,
+            source_ip VARCHAR(64),
+            user_agent TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create refresh_token_sessions table: {}", e)))?;
+
     // Create audit logs table for centralized write-traceability.
     sqlx::query(
         r#"
@@ -1054,6 +1093,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             entity_id VARCHAR(255),
             result VARCHAR(50) NOT NULL,
             reason TEXT,
+            source_ip VARCHAR(64),
             metadata JSONB,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (actor_user_id) REFERENCES users(id) ON DELETE SET NULL
@@ -1064,10 +1104,16 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create audit_logs table: {}", e)))?;
 
+    sqlx::query("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS source_ip VARCHAR(64)")
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to add audit source_ip column: {}", e)))?;
+
     for index in &[
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_created ON audit_logs(actor_user_id, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_logs_source_ip_created ON audit_logs(source_ip, created_at DESC)",
     ] {
         sqlx::query(index)
             .execute(pool)
@@ -1080,6 +1126,10 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_token ON password_reset_tokens(token)",
         "CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_id ON password_reset_tokens(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_auth_login_attempts_locked_until ON auth_login_attempts(locked_until)",
+        "CREATE INDEX IF NOT EXISTS idx_auth_login_attempts_last_failed ON auth_login_attempts(last_failed_at)",
+        "CREATE INDEX IF NOT EXISTS idx_refresh_token_sessions_user_active ON refresh_token_sessions(user_id, revoked_at, expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_refresh_token_sessions_expires_at ON refresh_token_sessions(expires_at)",
     ] {
         sqlx::query(index)
             .execute(pool)

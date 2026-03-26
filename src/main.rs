@@ -10,12 +10,13 @@ mod middleware;
 
 use axum::{
     extract::DefaultBodyLimit,
+    http::{header, HeaderValue, Method},
     middleware as axum_middleware,
     routing::{delete, get, patch, post, put},
     Router,
 };
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber;
 
@@ -37,43 +38,151 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("✓ Database migrations completed");
 
     let db = Arc::new(db_pool);
+    let auth_rate_limiter = Arc::new(middleware::rate_limit::RateLimiter::from_env());
+    let api_rate_limiter = Arc::new(middleware::rate_limit::RateLimiter::api_from_env());
+    let expensive_rate_limiter = Arc::new(middleware::rate_limit::RateLimiter::expensive_from_env());
 
-    // CORS configuration — allow all origins (no credentials, pure JWT via header)
-    // Set CORS_ORIGIN env var in Railway to restrict to a specific frontend domain.
-    let cors_layer = if let Ok(origin) = std::env::var("CORS_ORIGIN") {
+    // CORS configuration with explicit allow-lists and safe localhost fallback.
+    // Prefer CORS_ORIGINS=origin1,origin2 in production.
+    let parsed_cors_origins: Vec<HeaderValue> = std::env::var("CORS_ORIGINS")
+        .ok()
+        .map(|origins| {
+            origins
+                .split(',')
+                .filter_map(|value| {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        return None;
+                    }
+                    match trimmed.parse::<HeaderValue>() {
+                        Ok(origin) => Some(origin),
+                        Err(_) => {
+                            tracing::warn!(origin = %trimmed, "Skipping invalid CORS origin");
+                            None
+                        }
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let cors_layer = if !parsed_cors_origins.is_empty() {
+        tracing::info!(count = parsed_cors_origins.len(), "CORS restricted to configured origin list");
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(parsed_cors_origins))
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                header::ACCEPT,
+                header::ORIGIN,
+            ])
+            .max_age(std::time::Duration::from_secs(3600))
+    } else if let Ok(origin) = std::env::var("CORS_ORIGIN") {
         tracing::info!("CORS restricted to origin: {}", origin);
-        origin
-            .parse::<axum::http::HeaderValue>()
-            .map(|hv| {
+        match origin.parse::<HeaderValue>() {
+            Ok(origin_header) => CorsLayer::new()
+                .allow_origin(origin_header)
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::PATCH,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers([
+                    header::AUTHORIZATION,
+                    header::CONTENT_TYPE,
+                    header::ACCEPT,
+                    header::ORIGIN,
+                ])
+                .max_age(std::time::Duration::from_secs(3600)),
+            Err(_) => {
+                tracing::warn!("Invalid CORS_ORIGIN value. Falling back to localhost allow-list.");
                 CorsLayer::new()
-                    .allow_origin(hv)
-                    .allow_methods(tower_http::cors::Any)
-                    .allow_headers(tower_http::cors::Any)
+                    .allow_origin(AllowOrigin::list([
+                        HeaderValue::from_static("http://localhost:5173"),
+                        HeaderValue::from_static("http://127.0.0.1:5173"),
+                        HeaderValue::from_static("http://localhost:4173"),
+                        HeaderValue::from_static("http://127.0.0.1:4173"),
+                        HeaderValue::from_static("http://localhost:3000"),
+                        HeaderValue::from_static("http://127.0.0.1:3000"),
+                    ]))
+                    .allow_methods([
+                        Method::GET,
+                        Method::POST,
+                        Method::PUT,
+                        Method::PATCH,
+                        Method::DELETE,
+                        Method::OPTIONS,
+                    ])
+                    .allow_headers([
+                        header::AUTHORIZATION,
+                        header::CONTENT_TYPE,
+                        header::ACCEPT,
+                        header::ORIGIN,
+                    ])
                     .max_age(std::time::Duration::from_secs(3600))
-            })
-            .unwrap_or_else(|_| CorsLayer::very_permissive())
+            }
+        }
     } else {
-        CorsLayer::very_permissive()
+        tracing::warn!("CORS_ORIGINS/CORS_ORIGIN not set. Allowing localhost origins only.");
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list([
+                HeaderValue::from_static("http://localhost:5173"),
+                HeaderValue::from_static("http://127.0.0.1:5173"),
+                HeaderValue::from_static("http://localhost:4173"),
+                HeaderValue::from_static("http://127.0.0.1:4173"),
+                HeaderValue::from_static("http://localhost:3000"),
+                HeaderValue::from_static("http://127.0.0.1:3000"),
+            ]))
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                header::ACCEPT,
+                header::ORIGIN,
+            ])
+            .max_age(std::time::Duration::from_secs(3600))
     };
 
     // Build router
     let app = Router::new()
         // Auth routes
-        .route("/api/register", post(handlers::auth::register))
-        .route("/api/login", post(handlers::auth::login))
-        .route("/api/verify", post(handlers::auth::verify_email))
-        .route("/api/resend-code", post(handlers::auth::resend_verification_code))
-        .route("/api/forgot-password", post(handlers::auth::forgot_password))
-        .route("/api/verify-reset-code", post(handlers::auth::verify_reset_code))
-        .route("/api/reset-password", post(handlers::auth::reset_password))
+        .route("/api/register", post(handlers::auth::register).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/login", post(handlers::auth::login).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/verify", post(handlers::auth::verify_email).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/resend-code", post(handlers::auth::resend_verification_code).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/forgot-password", post(handlers::auth::forgot_password).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/verify-reset-code", post(handlers::auth::verify_reset_code).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/reset-password", post(handlers::auth::reset_password).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/refresh", post(handlers::auth::refresh_token).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/logout", post(handlers::auth::logout).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
         // Auth routes with /auth prefix (alternative URIs)
-        .route("/api/auth/register", post(handlers::auth::register))
-        .route("/api/auth/login", post(handlers::auth::login))
-        .route("/api/auth/verify", post(handlers::auth::verify_email))
-        .route("/api/auth/resend-code", post(handlers::auth::resend_verification_code))
-        .route("/api/auth/forgot-password", post(handlers::auth::forgot_password))
-        .route("/api/auth/verify-reset-code", post(handlers::auth::verify_reset_code))
-        .route("/api/auth/reset-password", post(handlers::auth::reset_password))
+        .route("/api/auth/register", post(handlers::auth::register).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/auth/login", post(handlers::auth::login).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/auth/verify", post(handlers::auth::verify_email).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/auth/resend-code", post(handlers::auth::resend_verification_code).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/auth/forgot-password", post(handlers::auth::forgot_password).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/auth/verify-reset-code", post(handlers::auth::verify_reset_code).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/auth/reset-password", post(handlers::auth::reset_password).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/auth/refresh", post(handlers::auth::refresh_token).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
+        .route("/api/auth/logout", post(handlers::auth::logout).route_layer(axum_middleware::from_fn_with_state(auth_rate_limiter.clone(), middleware::rate_limit::auth_rate_limit)))
         
         // User routes
         .route(
@@ -261,12 +370,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/analytics/trends", get(handlers::analytics::get_performance_trends).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)))
         .route("/api/analytics/guard-reliability", get(handlers::analytics::get_guard_reliability).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)))
         .route("/api/analytics/mission-status", put(handlers::analytics::update_mission_status).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)).route_layer(axum_middleware::from_fn_with_state(db.clone(), middleware::audit::audit_write_requests)))
-        .route("/api/alerts/predictive", get(handlers::alerts::get_predictive_alerts).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)))
-        .route("/api/ai/guard-absence-risk", get(handlers::ai::get_guard_absence_risk).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)))
-        .route("/api/ai/replacement-suggestions", get(handlers::ai::get_replacement_suggestions).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)))
-        .route("/api/ai/vehicle-maintenance-risk", get(handlers::ai::get_vehicle_maintenance_risk).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)))
-        .route("/api/ai/classify-incident", post(handlers::ai::classify_incident).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)))
-        .route("/api/ai/summarize-incident", post(handlers::ai::summarize_incident).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)))
+        .route("/api/alerts/predictive", get(handlers::alerts::get_predictive_alerts).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)).route_layer(axum_middleware::from_fn_with_state(expensive_rate_limiter.clone(), middleware::rate_limit::expensive_endpoint_rate_limit)))
+        .route("/api/ai/guard-absence-risk", get(handlers::ai::get_guard_absence_risk).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)).route_layer(axum_middleware::from_fn_with_state(expensive_rate_limiter.clone(), middleware::rate_limit::expensive_endpoint_rate_limit)))
+        .route("/api/ai/replacement-suggestions", get(handlers::ai::get_replacement_suggestions).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)).route_layer(axum_middleware::from_fn_with_state(expensive_rate_limiter.clone(), middleware::rate_limit::expensive_endpoint_rate_limit)))
+        .route("/api/ai/vehicle-maintenance-risk", get(handlers::ai::get_vehicle_maintenance_risk).route_layer(axum_middleware::from_fn(middleware::authz::require_analytics_view)).route_layer(axum_middleware::from_fn_with_state(expensive_rate_limiter.clone(), middleware::rate_limit::expensive_endpoint_rate_limit)))
+        .route("/api/ai/classify-incident", post(handlers::ai::classify_incident).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)).route_layer(axum_middleware::from_fn_with_state(expensive_rate_limiter.clone(), middleware::rate_limit::expensive_endpoint_rate_limit)))
+        .route("/api/ai/summarize-incident", post(handlers::ai::summarize_incident).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)).route_layer(axum_middleware::from_fn_with_state(expensive_rate_limiter.clone(), middleware::rate_limit::expensive_endpoint_rate_limit)))
 
         // Operational map tracking routes
         .route("/api/tracking/map-data", get(handlers::tracking::get_map_data).route_layer(axum_middleware::from_fn(middleware::authz::require_authenticated)))
@@ -287,8 +396,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         // Health check
         .route("/api/health", get(handlers::health::health_check))
+        .route("/api/health/system", get(handlers::health::system_health))
         
         .layer(cors_layer)
+        .layer(axum_middleware::from_fn_with_state(api_rate_limiter.clone(), middleware::rate_limit::api_rate_limit))
         .layer(TraceLayer::new_for_http())
         .layer(axum_middleware::from_fn_with_state(db.clone(), middleware::presence::touch_last_seen))
         .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB limit

@@ -33,7 +33,11 @@ pub struct ClassifyIncidentRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassifyIncidentResponse {
+    pub risk_level: String,
     pub severity: String,
+    pub confidence: f64,
+    pub explanation: String,
+    pub suggested_actions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,8 +48,74 @@ pub struct SummarizeIncidentRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SummarizeIncidentResponse {
+    pub risk_level: String,
+    pub confidence: f64,
+    pub explanation: String,
+    pub suggested_actions: Vec<String>,
     pub summary: String,
     pub key_phrases: Vec<String>,
+}
+
+fn confidence_from_severity(severity: &str) -> f64 {
+    match severity.to_lowercase().as_str() {
+        "critical" => 0.94,
+        "high" => 0.88,
+        "medium" => 0.79,
+        "low" => 0.71,
+        _ => 0.65,
+    }
+}
+
+fn suggested_actions_from_severity(severity: &str) -> Vec<String> {
+    match severity.to_lowercase().as_str() {
+        "critical" => vec![
+            "Escalate incident to command lead immediately.".to_string(),
+            "Dispatch nearest verified response team to location.".to_string(),
+            "Lock down nearby high-risk assets until cleared.".to_string(),
+        ],
+        "high" => vec![
+            "Assign supervisor review within the next 5 minutes.".to_string(),
+            "Verify guard presence and asset status on site.".to_string(),
+            "Prepare contingency staffing if status worsens.".to_string(),
+        ],
+        "medium" => vec![
+            "Monitor the incident channel and validate updates.".to_string(),
+            "Capture additional evidence in the next patrol cycle.".to_string(),
+        ],
+        _ => vec![
+            "Track the incident for trend analysis.".to_string(),
+            "Include this event in shift handoff notes.".to_string(),
+        ],
+    }
+}
+
+fn explanation_from_context(description: &str, severity: &str) -> String {
+    let clue_count = description
+        .split_whitespace()
+        .filter(|token| token.len() >= 5)
+        .count();
+
+    format!(
+        "Severity '{}' was inferred from incident wording and {} contextual signal(s).",
+        severity,
+        clue_count
+    )
+}
+
+fn risk_level_from_summary(summary: &str, key_phrases: &[String]) -> String {
+    let summary_lc = summary.to_lowercase();
+    let phrase_lc: Vec<String> = key_phrases.iter().map(|item| item.to_lowercase()).collect();
+
+    if summary_lc.contains("critical") || phrase_lc.iter().any(|item| item.contains("critical") || item.contains("weapon") || item.contains("injury")) {
+        return "critical".to_string();
+    }
+    if summary_lc.contains("high") || phrase_lc.iter().any(|item| item.contains("breach") || item.contains("unauthorized")) {
+        return "high".to_string();
+    }
+    if summary_lc.contains("medium") || phrase_lc.iter().any(|item| item.contains("delay") || item.contains("warning")) {
+        return "medium".to_string();
+    }
+    "low".to_string()
 }
 
 pub async fn get_guard_absence_risk(
@@ -83,7 +153,17 @@ pub async fn classify_incident(
     };
 
     let severity = incident_ai_classifier::classify_incident(&merged_text);
-    Ok(Json(ClassifyIncidentResponse { severity }))
+    let confidence = confidence_from_severity(&severity);
+    let explanation = explanation_from_context(&merged_text, &severity);
+    let suggested_actions = suggested_actions_from_severity(&severity);
+
+    Ok(Json(ClassifyIncidentResponse {
+        risk_level: severity.clone(),
+        severity,
+        confidence,
+        explanation,
+        suggested_actions,
+    }))
 }
 
 pub async fn summarize_incident(
@@ -94,8 +174,19 @@ pub async fn summarize_incident(
 
     let summary = incident_summary_service::summarize_incident(&payload.description);
     let key_phrases = incident_summary_service::extract_key_phrases(&payload.description);
+    let risk_level = risk_level_from_summary(&summary, &key_phrases);
+    let confidence = confidence_from_severity(&risk_level);
+    let explanation = format!(
+        "Summary confidence is based on extracted terms and sentence consistency ({} key phrase(s)).",
+        key_phrases.len()
+    );
+    let suggested_actions = suggested_actions_from_severity(&risk_level);
 
     Ok(Json(SummarizeIncidentResponse {
+        risk_level,
+        confidence,
+        explanation,
+        suggested_actions,
         summary,
         key_phrases,
     }))

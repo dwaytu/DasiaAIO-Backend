@@ -1,5 +1,5 @@
 use axum::{
-    extract::{State, Path},
+    extract::{Query, State, Path},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -147,12 +147,22 @@ pub async fn create_user_by_actor(
 pub async fn get_all_users(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
+    Query(pagination): Query<utils::PaginationQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
+    let (page, page_size, offset) = utils::resolve_pagination(pagination, 50, 200);
+
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+
     let users = sqlx::query_as::<_, User>(
-        "SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, last_seen_at, created_at, updated_at FROM users"
+        "SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, last_seen_at, created_at, updated_at FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2"
     )
+    .bind(page_size)
+    .bind(offset)
     .fetch_all(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
@@ -160,7 +170,9 @@ pub async fn get_all_users(
     let user_responses: Vec<UserResponse> = users.into_iter().map(|u| u.into()).collect();
 
     Ok(Json(json!({
-        "total": user_responses.len(),
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
         "users": user_responses
     })))
 }

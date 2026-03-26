@@ -20,6 +20,7 @@ pub struct AuditLogQuery {
     pub result: Option<String>,
     pub entity_type: Option<String>,
     pub actor_id: Option<String>,
+    pub source_ip: Option<String>,
     pub search: Option<String>,
 }
 
@@ -44,6 +45,7 @@ pub async fn get_audit_logs(
             al.entity_id,
             al.result,
             al.reason,
+            al.source_ip,
             al.metadata,
             al.created_at,
             u.full_name AS actor_name,
@@ -139,6 +141,17 @@ fn apply_filters(builder: &mut QueryBuilder<'_, Postgres>, params: &AuditLogQuer
         builder.push_bind(actor_id.to_string());
     }
 
+    if let Some(source_ip) = params
+        .source_ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        append_condition_prefix(builder, &mut has_where);
+        builder.push("COALESCE(al.source_ip, '') ILIKE ");
+        builder.push_bind(format!("%{}%", source_ip));
+    }
+
     if let Some(search) = params
         .search
         .as_deref()
@@ -151,6 +164,8 @@ fn apply_filters(builder: &mut QueryBuilder<'_, Postgres>, params: &AuditLogQuer
         builder.push("al.action_key ILIKE ");
         builder.push_bind(like_value.clone());
         builder.push(" OR COALESCE(al.reason, '') ILIKE ");
+        builder.push_bind(like_value.clone());
+        builder.push(" OR COALESCE(al.source_ip, '') ILIKE ");
         builder.push_bind(like_value.clone());
         builder.push(" OR COALESCE(al.entity_id, '') ILIKE ");
         builder.push_bind(like_value.clone());

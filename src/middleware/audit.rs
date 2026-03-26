@@ -26,6 +26,7 @@ pub async fn audit_write_requests(
         .map(|claims| claims.sub);
 
     let is_write = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+    let source_ip = utils::extract_requester(req.headers());
 
     let response = next.run(req).await;
 
@@ -49,8 +50,8 @@ pub async fn audit_write_requests(
 
         if let Err(err) = sqlx::query(
             r#"INSERT INTO audit_logs (
-                    id, actor_user_id, action_key, entity_type, entity_id, result, reason, metadata
-               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+                    id, actor_user_id, action_key, entity_type, entity_id, result, reason, source_ip, metadata
+               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
         )
         .bind(utils::generate_id())
         .bind(actor_user_id)
@@ -59,6 +60,7 @@ pub async fn audit_write_requests(
         .bind(entity_id)
         .bind(result)
         .bind(format!("HTTP {}", status_code))
+        .bind(source_ip)
         .bind(serde_json::json!({
             "status": status_code,
             "path": path,

@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -537,19 +537,32 @@ pub async fn get_guard_shifts(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
     Path(guard_id): Path<String>,
+    Query(pagination): Query<utils::PaginationQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
     let _claims = utils::require_self_or_min_role(&headers, &guard_id, "supervisor")?;
 
+    let (page, page_size, offset) = utils::resolve_pagination(pagination, 30, 120);
+
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shifts WHERE guard_id = $1")
+        .bind(&guard_id)
+        .fetch_one(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+
     let shifts = sqlx::query_as::<_, Shift>(
-        "SELECT id, guard_id, start_time, end_time, client_site, status, created_at, updated_at FROM shifts WHERE guard_id = $1 ORDER BY start_time DESC",
+        "SELECT id, guard_id, start_time, end_time, client_site, status, created_at, updated_at FROM shifts WHERE guard_id = $1 ORDER BY start_time DESC LIMIT $2 OFFSET $3",
     )
     .bind(&guard_id)
+    .bind(page_size)
+    .bind(offset)
     .fetch_all(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
     Ok(Json(json!({
-        "total": shifts.len(),
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
         "shifts": shifts
     })))
 }
@@ -579,8 +592,11 @@ pub async fn get_guard_attendance(
 pub async fn get_all_shifts(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
+    Query(pagination): Query<utils::PaginationQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
+
+    let (page, page_size, offset) = utils::resolve_pagination(pagination, 40, 200);
 
     #[derive(sqlx::FromRow, serde::Serialize)]
     struct ShiftWithGuard {
@@ -596,19 +612,29 @@ pub async fn get_all_shifts(
         updated_at: chrono::DateTime<chrono::Utc>,
     }
 
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shifts")
+        .fetch_one(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+
     let shifts = sqlx::query_as::<_, ShiftWithGuard>(
         "SELECT s.id, s.guard_id, u.full_name as guard_name, u.username as guard_username, 
          s.start_time, s.end_time, s.client_site, s.status, s.created_at, s.updated_at 
          FROM shifts s 
          JOIN users u ON s.guard_id = u.id 
-         ORDER BY s.start_time DESC",
+         ORDER BY s.start_time DESC
+         LIMIT $1 OFFSET $2",
     )
+    .bind(page_size)
+    .bind(offset)
     .fetch_all(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
     Ok(Json(json!({
-        "total": shifts.len(),
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
         "shifts": shifts
     })))
 }
