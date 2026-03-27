@@ -20,6 +20,15 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber;
 
+fn native_wrapper_origins() -> [HeaderValue; 4] {
+    [
+        HeaderValue::from_static("capacitor://localhost"),
+        HeaderValue::from_static("tauri://localhost"),
+        HeaderValue::from_static("http://localhost"),
+        HeaderValue::from_static("https://localhost"),
+    ]
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
@@ -67,9 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
 
     let cors_layer = if !parsed_cors_origins.is_empty() {
-        tracing::info!(count = parsed_cors_origins.len(), "CORS restricted to configured origin list");
+        let configured_origin_count = parsed_cors_origins.len();
+        let mut effective_origins = parsed_cors_origins;
+        effective_origins.extend(native_wrapper_origins());
+        tracing::info!(count = configured_origin_count, "CORS restricted to configured origin list");
         CorsLayer::new()
-            .allow_origin(AllowOrigin::list(parsed_cors_origins))
+            .allow_origin(AllowOrigin::list(effective_origins))
             .allow_methods([
                 Method::GET,
                 Method::POST,
@@ -89,7 +101,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("CORS restricted to origin: {}", origin);
         match origin.parse::<HeaderValue>() {
             Ok(origin_header) => CorsLayer::new()
-                .allow_origin(origin_header)
+                .allow_origin(AllowOrigin::list([
+                    origin_header,
+                    HeaderValue::from_static("capacitor://localhost"),
+                    HeaderValue::from_static("tauri://localhost"),
+                    HeaderValue::from_static("http://localhost"),
+                    HeaderValue::from_static("https://localhost"),
+                ]))
                 .allow_methods([
                     Method::GET,
                     Method::POST,

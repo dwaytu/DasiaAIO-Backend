@@ -28,6 +28,13 @@ GMAIL_PASSWORD=your_app_specific_password
 ADMIN_CODE=122601
 ```
 
+Production hardening note:
+
+- When `APP_ENV=production` (or `NODE_ENV=production`), backend startup now validates critical settings and fails fast if unsafe:
+	- `JWT_SECRET` must be set to a strong secret (32+ chars)
+	- `ADMIN_CODE` must not use default `122601`
+	- `CORS_ORIGINS` or `CORS_ORIGIN` must be configured
+
 `ADMIN_CODE` remains for compatibility, while public registration flow is guard self-registration with approval.
 
 ## Run Options
