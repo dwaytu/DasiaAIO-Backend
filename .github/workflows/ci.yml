@@ -1,0 +1,45 @@
+name: Backend Quality Gate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "backend-quality-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  build-and-health-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Build and start services
+        run: docker compose up -d --build
+
+      - name: Wait for health endpoint
+        run: |
+          set -e
+          for i in {1..60}; do
+            if curl -fsS "http://localhost:5000/api/health" >/dev/null; then
+              echo "Backend health endpoint is reachable"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Backend health endpoint did not become ready in time"
+          docker compose logs backend
+          exit 1
+
+      - name: Tear down services
+        if: always()
+        run: docker compose down -v
