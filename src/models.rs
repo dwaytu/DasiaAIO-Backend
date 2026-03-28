@@ -134,6 +134,7 @@ pub struct AuditLogEntry {
     pub result: String,
     pub reason: Option<String>,
     pub source_ip: Option<String>,
+    pub user_agent: Option<String>,
     pub metadata: Option<Value>,
     pub created_at: DateTime<Utc>,
 }
@@ -418,7 +419,7 @@ pub struct CarMaintenance {
     pub car_id: Option<String>,
     pub maintenance_type: Option<String>,
     pub description: Option<String>,
-    pub cost: Option<f64>,  // DB column is NUMERIC; queried with ::FLOAT8 cast
+    pub cost: Option<f64>, // DB column is NUMERIC; queried with ::FLOAT8 cast
     pub scheduled_date: Option<DateTime<Utc>>,
     pub completion_date: Option<DateTime<Utc>>,
     pub status: Option<String>,
@@ -497,7 +498,7 @@ pub struct Trip {
     pub end_location: Option<String>,
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
-    pub distance_km: Option<f64>,  // DB column is NUMERIC; EndTripRequest uses Option<String> for parsing
+    pub distance_km: Option<f64>, // DB column is NUMERIC; EndTripRequest uses Option<String> for parsing
     pub status: Option<String>,
     pub mission_details: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
@@ -924,7 +925,7 @@ pub struct AiIncidentSummary {
 
 // Custom serde module for parsing date strings (YYYY-MM-DD) into DateTime<Utc>
 mod option_date_format {
-    use chrono::{DateTime, Utc, NaiveDate};
+    use chrono::{DateTime, NaiveDate, Utc};
     use serde::{Deserialize, Deserializer};
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
@@ -939,20 +940,22 @@ mod option_date_format {
                 if date_str.trim().is_empty() {
                     return Ok(None);
                 }
-                
+
                 // Parse YYYY-MM-DD format
                 let naive_date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
                     .map_err(serde::de::Error::custom)?;
-                
+
                 // Convert to NaiveDateTime with time 00:00:00
-                let naive_datetime = naive_date.and_hms_opt(0, 0, 0)
+                let naive_datetime = naive_date
+                    .and_hms_opt(0, 0, 0)
                     .ok_or_else(|| serde::de::Error::custom("Invalid datetime"))?;
-                
+
                 // Convert to DateTime<Utc>
-                Ok(Some(DateTime::<Utc>::from_naive_utc_and_offset(naive_datetime, Utc)))
+                Ok(Some(DateTime::<Utc>::from_naive_utc_and_offset(
+                    naive_datetime,
+                    Utc,
+                )))
             }
         }
     }
 }
-
-

@@ -1,5 +1,5 @@
-use sqlx::postgres::{PgPool, PgPoolOptions};
 use crate::error::{AppError, AppResult};
+use sqlx::postgres::{PgPool, PgPoolOptions};
 
 pub async fn init_db_pool(database_url: &str) -> AppResult<PgPool> {
     const MAX_RETRIES: u32 = 10;
@@ -13,13 +13,20 @@ pub async fn init_db_pool(database_url: &str) -> AppResult<PgPool> {
             .await
         {
             Ok(pool) => {
-                tracing::info!("✓ Database connected on attempt {}/{}", attempt, MAX_RETRIES);
+                tracing::info!(
+                    "✓ Database connected on attempt {}/{}",
+                    attempt,
+                    MAX_RETRIES
+                );
                 return Ok(pool);
             }
             Err(e) if attempt < MAX_RETRIES => {
                 tracing::warn!(
                     "DB connection attempt {}/{} failed: {}. Retrying in {}s...",
-                    attempt, MAX_RETRIES, e, RETRY_DELAY_SECS
+                    attempt,
+                    MAX_RETRIES,
+                    e,
+                    RETRY_DELAY_SECS
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
             }
@@ -60,28 +67,28 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .map_err(|e| AppError::DatabaseError(format!("Failed to create users table: {}", e)))?;
 
     // Backfill profile_photo column for databases created before this migration
-    sqlx::query(
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_photo TEXT"
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to add profile_photo column: {}", e)))?;
+    sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_photo TEXT")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to add profile_photo column: {}", e))
+        })?;
 
     // Add license_issued_date column
     sqlx::query(
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS license_issued_date TIMESTAMP WITH TIME ZONE"
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS license_issued_date TIMESTAMP WITH TIME ZONE",
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to add license_issued_date column: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to add license_issued_date column: {}", e))
+    })?;
 
     // Add address column
-    sqlx::query(
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT"
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to add address column: {}", e)))?;
+    sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT")
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to add address column: {}", e)))?;
 
     // Add RBAC and approval workflow columns
     sqlx::query(
@@ -91,33 +98,29 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to add approval_status column: {}", e)))?;
 
-    sqlx::query(
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS approved_by VARCHAR(36)"
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to add approved_by column: {}", e)))?;
+    sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS approved_by VARCHAR(36)")
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to add approved_by column: {}", e)))?;
 
     sqlx::query(
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS approval_date TIMESTAMP WITH TIME ZONE"
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS approval_date TIMESTAMP WITH TIME ZONE",
     )
     .execute(pool)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to add approval_date column: {}", e)))?;
 
-    sqlx::query(
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by VARCHAR(36)"
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to add created_by column: {}", e)))?;
+    sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by VARCHAR(36)")
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to add created_by column: {}", e)))?;
 
-    sqlx::query(
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP WITH TIME ZONE"
-    )
-    .execute(pool)
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to add last_seen_at column: {}", e)))?;
+    sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP WITH TIME ZONE")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to add last_seen_at column: {}", e))
+        })?;
 
     // Operational tracking tables for real-time map monitoring.
     sqlx::query(
@@ -145,6 +148,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             id VARCHAR(36) PRIMARY KEY,
             entity_type VARCHAR(32) NOT NULL,
             entity_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(36),
             label VARCHAR(255),
             status VARCHAR(50),
             latitude DOUBLE PRECISION NOT NULL,
@@ -154,20 +158,49 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             accuracy_meters DOUBLE PRECISION,
             recorded_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
             created_by VARCHAR(36),
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
         )
         "#,
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create tracking_points table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create tracking_points table: {}", e))
+    })?;
 
     sqlx::query(
-        "ALTER TABLE tracking_points ADD COLUMN IF NOT EXISTS accuracy_meters DOUBLE PRECISION"
+        "ALTER TABLE tracking_points ADD COLUMN IF NOT EXISTS accuracy_meters DOUBLE PRECISION",
     )
     .execute(pool)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to add accuracy_meters column: {}", e)))?;
+
+    sqlx::query("ALTER TABLE tracking_points ADD COLUMN IF NOT EXISTS user_id VARCHAR(36)")
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to add user_id column: {}", e)))?;
+
+    sqlx::query(
+        r#"DO $$
+                     BEGIN
+                         IF NOT EXISTS (
+                             SELECT 1
+                             FROM information_schema.table_constraints
+                             WHERE constraint_name = 'tracking_points_user_id_fkey'
+                                 AND table_name = 'tracking_points'
+                         ) THEN
+                             ALTER TABLE tracking_points
+                                 ADD CONSTRAINT tracking_points_user_id_fkey
+                                 FOREIGN KEY (user_id)
+                                 REFERENCES users(id)
+                                 ON DELETE SET NULL;
+                         END IF;
+                     END $$;"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to ensure user_id foreign key: {}", e)))?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_tracking_points_entity_time ON tracking_points (entity_type, entity_id, recorded_at DESC)"
@@ -175,6 +208,80 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .execute(pool)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create tracking index: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_tracking_points_user_time ON tracking_points (user_id, recorded_at DESC)"
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create tracking user index: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS geofence_events (
+            id VARCHAR(36) PRIMARY KEY,
+            guard_id VARCHAR(36) NOT NULL,
+            client_site_id VARCHAR(36) NOT NULL,
+            event_type VARCHAR(16) NOT NULL,
+            latitude DOUBLE PRECISION,
+            longitude DOUBLE PRECISION,
+            distance_km DOUBLE PRECISION,
+            message TEXT,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (guard_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (client_site_id) REFERENCES client_sites(id) ON DELETE CASCADE,
+            CONSTRAINT geofence_events_type_check CHECK (event_type IN ('enter', 'exit'))
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create geofence_events table: {}", e))
+    })?;
+
+    for geofence_index in &[
+        "CREATE INDEX IF NOT EXISTS idx_geofence_events_guard_created ON geofence_events(guard_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_geofence_events_site_created ON geofence_events(client_site_id, created_at DESC)",
+    ] {
+        sqlx::query(geofence_index)
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Failed to create geofence index: {}", e)))?;
+    }
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS site_geofences (
+            id VARCHAR(36) PRIMARY KEY,
+            client_site_id VARCHAR(36) NOT NULL,
+            zone_type VARCHAR(16) NOT NULL,
+            radius_km DOUBLE PRECISION,
+            polygon_points JSONB,
+            is_active BOOLEAN NOT NULL DEFAULT true,
+            created_by VARCHAR(36),
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (client_site_id) REFERENCES client_sites(id) ON DELETE CASCADE,
+            CONSTRAINT site_geofences_zone_type_check CHECK (zone_type IN ('radius', 'polygon'))
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create site_geofences table: {}", e))
+    })?;
+
+    for geofence_zone_index in &[
+        "CREATE INDEX IF NOT EXISTS idx_site_geofences_site_active ON site_geofences(client_site_id, is_active)",
+        "CREATE INDEX IF NOT EXISTS idx_site_geofences_type_active ON site_geofences(zone_type, is_active)",
+    ] {
+        sqlx::query(geofence_zone_index)
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Failed to create site geofence index: {}", e)))?;
+    }
 
     sqlx::query(
         r#"
@@ -251,7 +358,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create role_permissions table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create role_permissions table: {}", e))
+    })?;
 
     sqlx::query(
         r#"
@@ -295,11 +404,17 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         ("create_user", "Create user accounts"),
         ("update_user", "Update user accounts"),
         ("delete_user", "Delete user accounts"),
-        ("approve_guard_registration", "Approve or reject pending guard registrations"),
+        (
+            "approve_guard_registration",
+            "Approve or reject pending guard registrations",
+        ),
         ("manage_firearms", "Manage firearm inventory"),
         ("allocate_firearm", "Issue and return firearm allocations"),
         ("manage_armored_cars", "Manage armored car fleet records"),
-        ("assign_vehicle_driver", "Assign drivers to vehicles and trips"),
+        (
+            "assign_vehicle_driver",
+            "Assign drivers to vehicles and trips",
+        ),
         ("manage_missions", "Create and manage mission assignments"),
         ("manage_schedules", "Create and manage guard schedules"),
         ("view_analytics", "View analytics dashboards and trends"),
@@ -450,7 +565,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create firearm_allocations table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create firearm_allocations table: {}", e))
+    })?;
 
     // Create shifts table
     sqlx::query(
@@ -538,7 +655,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create car_allocations table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create car_allocations table: {}", e))
+    })?;
 
     // Create car_maintenance table
     sqlx::query(
@@ -561,7 +680,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create car_maintenance table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create car_maintenance table: {}", e))
+    })?;
 
     // Create driver_assignments table
     sqlx::query(
@@ -582,7 +703,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create driver_assignments table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create driver_assignments table: {}", e))
+    })?;
 
     // Create trips table
     sqlx::query(
@@ -632,7 +755,12 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create guard_firearm_permits table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to create guard_firearm_permits table: {}",
+            e
+        ))
+    })?;
 
     // Create support_tickets table
     sqlx::query(
@@ -651,7 +779,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create support_tickets table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create support_tickets table: {}", e))
+    })?;
 
     // ── Schema migrations for existing databases ──────────────────────────────
     // Add columns that may be missing from DBs created before these schema updates.
@@ -660,10 +790,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         "ALTER TABLE trips ALTER COLUMN start_location DROP NOT NULL",
         "ALTER TABLE armored_cars ADD COLUMN IF NOT EXISTS passenger_capacity INTEGER DEFAULT 4",
     ] {
-        sqlx::query(migration)
-            .execute(pool)
-            .await
-            .map_err(|e| AppError::DatabaseError(format!("Migration failed '{}': {}", migration, e)))?;
+        sqlx::query(migration).execute(pool).await.map_err(|e| {
+            AppError::DatabaseError(format!("Migration failed '{}': {}", migration, e))
+        })?;
     }
 
     // Create notifications table
@@ -705,7 +834,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create guard_availability table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create guard_availability table: {}", e))
+    })?;
 
     // Create guard_merit_scores table
     sqlx::query(
@@ -733,7 +864,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create guard_merit_scores table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create guard_merit_scores table: {}", e))
+    })?;
 
     // Create client_evaluations table
     sqlx::query(
@@ -754,7 +887,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create client_evaluations table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create client_evaluations table: {}", e))
+    })?;
 
     // Create punctuality_records table
     sqlx::query(
@@ -775,7 +910,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create punctuality_records table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create punctuality_records table: {}", e))
+    })?;
 
     // Create training_records table
     sqlx::query(
@@ -797,7 +934,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create training_records table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create training_records table: {}", e))
+    })?;
 
     // Create firearm_maintenance table
     sqlx::query(
@@ -821,7 +960,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create firearm_maintenance table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create firearm_maintenance table: {}", e))
+    })?;
 
     // Create AI-assisted SOC intelligence tables (deterministic/explainable outputs).
     sqlx::query(
@@ -1041,7 +1182,12 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create password_reset_tokens table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to create password_reset_tokens table: {}",
+            e
+        ))
+    })?;
 
     // Create distributed login-attempt lockout table.
     sqlx::query(
@@ -1058,7 +1204,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create auth_login_attempts table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create auth_login_attempts table: {}", e))
+    })?;
 
     // Persist refresh token sessions for revocation and rotation tracking.
     sqlx::query(
@@ -1080,7 +1228,12 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create refresh_token_sessions table: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to create refresh_token_sessions table: {}",
+            e
+        ))
+    })?;
 
     // Create audit logs table for centralized write-traceability.
     sqlx::query(
@@ -1094,6 +1247,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             result VARCHAR(50) NOT NULL,
             reason TEXT,
             source_ip VARCHAR(64),
+            user_agent TEXT,
             metadata JSONB,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (actor_user_id) REFERENCES users(id) ON DELETE SET NULL
@@ -1107,13 +1261,23 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     sqlx::query("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS source_ip VARCHAR(64)")
         .execute(pool)
         .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to add audit source_ip column: {}", e)))?;
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to add audit source_ip column: {}", e))
+        })?;
+
+    sqlx::query("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS user_agent TEXT")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to add audit user_agent column: {}", e))
+        })?;
 
     for index in &[
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_created ON audit_logs(actor_user_id, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_source_ip_created ON audit_logs(source_ip, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_logs_result_created ON audit_logs(result, created_at DESC)",
     ] {
         sqlx::query(index)
             .execute(pool)

@@ -1,12 +1,8 @@
-use axum::{
-    extract::State,
-    http::HeaderMap,
-    Json,
-};
-use sqlx::PgPool;
-use std::sync::Arc;
+use axum::{extract::State, http::HeaderMap, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::PgPool;
+use std::sync::Arc;
 
 use crate::{
     error::{AppError, AppResult},
@@ -82,69 +78,59 @@ pub async fn get_analytics(
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
     // Overview stats
-    let total_guards = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM users WHERE role IN ('guard', 'user')"
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(0);
+    let total_guards =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE role IN ('guard', 'user')")
+            .fetch_one(db.as_ref())
+            .await
+            .unwrap_or(0);
 
     let active_guards = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(DISTINCT guard_id) FROM shifts 
-         WHERE status = 'in_progress' OR status = 'scheduled'"
+         WHERE status = 'in_progress' OR status = 'scheduled'",
     )
     .fetch_one(db.as_ref())
     .await
     .unwrap_or(0);
 
-    let total_missions = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM trips"
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(0);
+    let total_missions = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trips")
+        .fetch_one(db.as_ref())
+        .await
+        .unwrap_or(0);
 
-    let completed_missions = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM trips WHERE status = 'completed'"
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(0);
+    let completed_missions =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trips WHERE status = 'completed'")
+            .fetch_one(db.as_ref())
+            .await
+            .unwrap_or(0);
 
     let active_missions = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM trips WHERE status = 'in_progress' OR status = 'scheduled'"
+        "SELECT COUNT(*) FROM trips WHERE status = 'in_progress' OR status = 'scheduled'",
     )
     .fetch_one(db.as_ref())
     .await
     .unwrap_or(0);
 
-    let total_firearms = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM firearms"
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(0);
+    let total_firearms = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM firearms")
+        .fetch_one(db.as_ref())
+        .await
+        .unwrap_or(0);
 
-    let allocated_firearms = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM firearms WHERE status = 'allocated'"
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(0);
+    let allocated_firearms =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM firearms WHERE status = 'allocated'")
+            .fetch_one(db.as_ref())
+            .await
+            .unwrap_or(0);
 
-    let total_vehicles = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM armored_cars"
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(0);
+    let total_vehicles = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM armored_cars")
+        .fetch_one(db.as_ref())
+        .await
+        .unwrap_or(0);
 
-    let deployed_vehicles = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM armored_cars WHERE status = 'deployed'"
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(0);
+    let deployed_vehicles =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM armored_cars WHERE status = 'deployed'")
+            .fetch_one(db.as_ref())
+            .await
+            .unwrap_or(0);
 
     // Performance metrics
     let mission_completion_rate = if total_missions > 0 {
@@ -155,22 +141,21 @@ pub async fn get_analytics(
 
     let average_mission_duration = sqlx::query_scalar::<_, Option<f64>>(
         "SELECT AVG(EXTRACT(EPOCH FROM (end_time - start_time)) / 3600.0) 
-         FROM trips WHERE end_time IS NOT NULL AND start_time IS NOT NULL"
+         FROM trips WHERE end_time IS NOT NULL AND start_time IS NOT NULL",
     )
     .fetch_one(db.as_ref())
     .await
     .unwrap_or(None)
     .unwrap_or(0.0);
 
-    let total_shifts = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM shifts WHERE status = 'completed'"
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(0);
+    let total_shifts =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM shifts WHERE status = 'completed'")
+            .fetch_one(db.as_ref())
+            .await
+            .unwrap_or(0);
 
     let attended_shifts = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(DISTINCT shift_id) FROM attendance WHERE check_in_time IS NOT NULL"
+        "SELECT COUNT(DISTINCT shift_id) FROM attendance WHERE check_in_time IS NOT NULL",
     )
     .fetch_one(db.as_ref())
     .await
@@ -203,7 +188,7 @@ pub async fn get_analytics(
     let total_missions_this_month = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM trips 
          WHERE EXTRACT(MONTH FROM start_time) = EXTRACT(MONTH FROM CURRENT_TIMESTAMP)
-         AND EXTRACT(YEAR FROM start_time) = EXTRACT(YEAR FROM CURRENT_TIMESTAMP)"
+         AND EXTRACT(YEAR FROM start_time) = EXTRACT(YEAR FROM CURRENT_TIMESTAMP)",
     )
     .fetch_one(db.as_ref())
     .await
@@ -213,18 +198,17 @@ pub async fn get_analytics(
         "SELECT COUNT(*) FROM trips 
          WHERE status = 'completed'
          AND EXTRACT(MONTH FROM start_time) = EXTRACT(MONTH FROM CURRENT_TIMESTAMP)
-         AND EXTRACT(YEAR FROM start_time) = EXTRACT(YEAR FROM CURRENT_TIMESTAMP)"
+         AND EXTRACT(YEAR FROM start_time) = EXTRACT(YEAR FROM CURRENT_TIMESTAMP)",
     )
     .fetch_one(db.as_ref())
     .await
     .unwrap_or(0);
 
-    let pending_missions = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM trips WHERE status = 'scheduled'"
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(0);
+    let pending_missions =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trips WHERE status = 'scheduled'")
+            .fetch_one(db.as_ref())
+            .await
+            .unwrap_or(0);
 
     let average_guards_per_mission = sqlx::query_scalar::<_, Option<f64>>(
         "SELECT AVG(guard_count) FROM (
@@ -233,7 +217,7 @@ pub async fn get_analytics(
             LEFT JOIN shifts s ON DATE(t.start_time) = DATE(s.start_time)
             WHERE t.start_time IS NOT NULL
             GROUP BY t.id
-        ) mission_guards"
+        ) mission_guards",
     )
     .fetch_one(db.as_ref())
     .await
@@ -301,7 +285,7 @@ pub async fn get_performance_trends(
          WHERE start_time >= CURRENT_DATE - INTERVAL '30 days'
          GROUP BY DATE(start_time)
          ORDER BY DATE(start_time) DESC
-         LIMIT 30"
+         LIMIT 30",
     )
     .fetch_all(db.as_ref())
     .await
@@ -393,20 +377,18 @@ pub async fn update_mission_status(
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
     // Update trip status
-    sqlx::query(
-        "UPDATE trips SET status = $1 WHERE id = $2"
-    )
-    .bind(&payload.status)
-    .bind(&payload.mission_id)
-    .execute(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to update mission: {}", e)))?;
+    sqlx::query("UPDATE trips SET status = $1 WHERE id = $2")
+        .bind(&payload.status)
+        .bind(&payload.mission_id)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to update mission: {}", e)))?;
 
     // If completed, update vehicle status back to operational
     if payload.status == "completed" {
         sqlx::query(
             "UPDATE armored_cars SET status = 'operational' 
-             WHERE id IN (SELECT car_id FROM trips WHERE id = $1)"
+             WHERE id IN (SELECT car_id FROM trips WHERE id = $1)",
         )
         .bind(&payload.mission_id)
         .execute(db.as_ref())
@@ -421,7 +403,7 @@ pub async fn update_mission_status(
                  JOIN shifts s ON fa.guard_id = s.guard_id
                  JOIN trips t ON DATE(s.start_time) = DATE(t.start_time)
                  WHERE t.id = $1 AND fa.status = 'active'
-             )"
+             )",
         )
         .bind(&payload.mission_id)
         .execute(db.as_ref())
@@ -435,7 +417,7 @@ pub async fn update_mission_status(
                  SELECT s.guard_id FROM shifts s
                  JOIN trips t ON DATE(s.start_time) = DATE(t.start_time)
                  WHERE t.id = $1
-             ) AND status = 'active'"
+             ) AND status = 'active'",
         )
         .bind(&payload.mission_id)
         .execute(db.as_ref())

@@ -118,12 +118,13 @@ pub async fn mark_notification_read(
     Path(notification_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     // Check if notification exists and enforce ownership/elevated access.
-    let notif_user_id = sqlx::query_scalar::<_, String>("SELECT user_id FROM notifications WHERE id = $1")
-        .bind(&notification_id)
-        .fetch_optional(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
-        .ok_or_else(|| AppError::NotFound("Notification not found".to_string()))?;
+    let notif_user_id =
+        sqlx::query_scalar::<_, String>("SELECT user_id FROM notifications WHERE id = $1")
+            .bind(&notification_id)
+            .fetch_optional(db.as_ref())
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+            .ok_or_else(|| AppError::NotFound("Notification not found".to_string()))?;
 
     let _claims = utils::require_self_or_min_role(&headers, &notif_user_id, "supervisor")?;
 
@@ -168,12 +169,13 @@ pub async fn delete_notification(
     headers: HeaderMap,
     Path(notification_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let notif_user_id = sqlx::query_scalar::<_, String>("SELECT user_id FROM notifications WHERE id = $1")
-        .bind(&notification_id)
-        .fetch_optional(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
-        .ok_or_else(|| AppError::NotFound("Notification not found".to_string()))?;
+    let notif_user_id =
+        sqlx::query_scalar::<_, String>("SELECT user_id FROM notifications WHERE id = $1")
+            .bind(&notification_id)
+            .fetch_optional(db.as_ref())
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+            .ok_or_else(|| AppError::NotFound("Notification not found".to_string()))?;
 
     let _claims = utils::require_self_or_min_role(&headers, &notif_user_id, "supervisor")?;
 

@@ -89,7 +89,10 @@ async fn load_vehicle_metrics(pool: &PgPool, vehicle_id: &str) -> AppResult<Vehi
     Ok(metrics)
 }
 
-async fn persist_vehicle_prediction(pool: &PgPool, prediction: &VehicleMaintenanceRiskResult) -> AppResult<()> {
+async fn persist_vehicle_prediction(
+    pool: &PgPool,
+    prediction: &VehicleMaintenanceRiskResult,
+) -> AppResult<()> {
     let lower_level = prediction.risk_level.to_lowercase();
 
     sqlx::query(
@@ -151,12 +154,20 @@ async fn persist_vehicle_prediction(pool: &PgPool, prediction: &VehicleMaintenan
     }))
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to persist vehicle maintenance prediction: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to persist vehicle maintenance prediction: {}",
+            e
+        ))
+    })?;
 
     Ok(())
 }
 
-pub async fn predict_vehicle_risk(pool: &PgPool, vehicle_id: &str) -> AppResult<VehicleMaintenanceRiskResult> {
+pub async fn predict_vehicle_risk(
+    pool: &PgPool,
+    vehicle_id: &str,
+) -> AppResult<VehicleMaintenanceRiskResult> {
     let metrics = load_vehicle_metrics(pool, vehicle_id).await?;
 
     let reference_date = metrics.last_maintenance_date.unwrap_or(metrics.created_at);
@@ -195,7 +206,9 @@ pub async fn predict_vehicle_risk(pool: &PgPool, vehicle_id: &str) -> AppResult<
     Ok(prediction)
 }
 
-pub async fn predict_fleet_vehicle_risk(pool: &PgPool) -> AppResult<Vec<VehicleMaintenanceRiskResult>> {
+pub async fn predict_fleet_vehicle_risk(
+    pool: &PgPool,
+) -> AppResult<Vec<VehicleMaintenanceRiskResult>> {
     let vehicle_ids = sqlx::query_as::<_, VehicleIdRow>(
         r#"
         SELECT id
@@ -205,7 +218,12 @@ pub async fn predict_fleet_vehicle_risk(pool: &PgPool) -> AppResult<Vec<VehicleM
     )
     .fetch_all(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to list vehicles for maintenance prediction: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to list vehicles for maintenance prediction: {}",
+            e
+        ))
+    })?;
 
     let mut predictions = Vec::new();
     for row in vehicle_ids {

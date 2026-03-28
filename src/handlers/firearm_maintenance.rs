@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
-    models::{CompleteFirearmMaintenanceRequest, CreateFirearmMaintenanceRequest, FirearmMaintenance},
+    models::{
+        CompleteFirearmMaintenanceRequest, CreateFirearmMaintenanceRequest, FirearmMaintenance,
+    },
     utils,
 };
 
@@ -105,14 +107,13 @@ pub async fn complete_maintenance(
     let now = Utc::now();
 
     // Get firearm_id so we can restore its status
-    let firearm_id: String = sqlx::query_scalar(
-        "SELECT firearm_id FROM firearm_maintenance WHERE id = $1",
-    )
-    .bind(&maintenance_id)
-    .fetch_optional(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
-    .ok_or_else(|| AppError::NotFound("Maintenance record not found".to_string()))?;
+    let firearm_id: String =
+        sqlx::query_scalar("SELECT firearm_id FROM firearm_maintenance WHERE id = $1")
+            .bind(&maintenance_id)
+            .fetch_optional(db.as_ref())
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+            .ok_or_else(|| AppError::NotFound("Maintenance record not found".to_string()))?;
 
     let rec = sqlx::query_as::<_, FirearmMaintenance>(
         r#"

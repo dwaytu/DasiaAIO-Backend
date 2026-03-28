@@ -1,10 +1,4 @@
-use axum::{
-    body::Body,
-    extract::State,
-    http::Request,
-    middleware::Next,
-    response::Response,
-};
+use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -25,6 +19,12 @@ pub async fn audit_write_requests(
         .and_then(|token| utils::verify_token(&token).ok())
         .map(|claims| claims.sub);
 
+    let user_agent = req
+        .headers()
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+
     let is_write = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
     let source_ip = utils::extract_requester(req.headers());
 
@@ -32,7 +32,11 @@ pub async fn audit_write_requests(
 
     if is_write {
         let status_code = response.status().as_u16();
-        let result = if status_code < 400 { "success" } else { "failed" };
+        let result = if status_code < 400 {
+            "success"
+        } else {
+            "failed"
+        };
         let action_key = format!("{} {}", method, path);
 
         let entity_type = path
@@ -50,8 +54,8 @@ pub async fn audit_write_requests(
 
         if let Err(err) = sqlx::query(
             r#"INSERT INTO audit_logs (
-                    id, actor_user_id, action_key, entity_type, entity_id, result, reason, source_ip, metadata
-               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+                    id, actor_user_id, action_key, entity_type, entity_id, result, reason, source_ip, user_agent, metadata
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
         )
         .bind(utils::generate_id())
         .bind(actor_user_id)
@@ -61,6 +65,7 @@ pub async fn audit_write_requests(
         .bind(result)
         .bind(format!("HTTP {}", status_code))
         .bind(source_ip)
+        .bind(user_agent)
         .bind(serde_json::json!({
             "status": status_code,
             "path": path,

@@ -3,9 +3,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
+use serde_json::json;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
-use serde_json::json;
 
 use crate::{
     error::{AppError, AppResult},
@@ -23,11 +23,12 @@ pub async fn create_shift(
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
-    if payload.guard_id.is_empty() || payload.start_time.is_empty() 
-        || payload.end_time.is_empty() || payload.client_site.is_empty() {
-        return Err(AppError::BadRequest(
-            "All fields are required".to_string()
-        ));
+    if payload.guard_id.is_empty()
+        || payload.start_time.is_empty()
+        || payload.end_time.is_empty()
+        || payload.client_site.is_empty()
+    {
+        return Err(AppError::BadRequest("All fields are required".to_string()));
     }
 
     // Check if guard exists
@@ -39,13 +40,13 @@ pub async fn create_shift(
         .ok_or_else(|| AppError::NotFound("Guard not found".to_string()))?;
 
     let shift_id = utils::generate_id();
-    
+
     // Parse datetime strings
     let start_time = chrono::DateTime::parse_from_rfc3339(&payload.start_time)
         .ok()
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .ok_or_else(|| AppError::BadRequest("Invalid start_time format".to_string()))?;
-    
+
     let end_time = chrono::DateTime::parse_from_rfc3339(&payload.end_time)
         .ok()
         .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -63,16 +64,19 @@ pub async fn create_shift(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create shift: {}", e)))?;
 
-    Ok((StatusCode::CREATED, Json(json!({
-        "message": "Shift created successfully",
-        "shiftId": shift_id,
-        "shift": {
-            "guardId": payload.guard_id,
-            "startTime": payload.start_time,
-            "endTime": payload.end_time,
-            "clientSite": payload.client_site
-        }
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "message": "Shift created successfully",
+            "shiftId": shift_id,
+            "shift": {
+                "guardId": payload.guard_id,
+                "startTime": payload.start_time,
+                "endTime": payload.end_time,
+                "clientSite": payload.client_site
+            }
+        })),
+    ))
 }
 
 pub async fn check_in(
@@ -82,7 +86,7 @@ pub async fn check_in(
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     if payload.guard_id.is_empty() || payload.shift_id.is_empty() {
         return Err(AppError::BadRequest(
-            "Guard ID and Shift ID are required".to_string()
+            "Guard ID and Shift ID are required".to_string(),
         ));
     }
 
@@ -139,10 +143,13 @@ pub async fn check_in(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to record punctuality: {}", e)))?;
 
-    Ok((StatusCode::CREATED, Json(json!({
-        "message": "Check-in recorded successfully",
-        "attendanceId": attendance_id
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "message": "Check-in recorded successfully",
+            "attendanceId": attendance_id
+        })),
+    ))
 }
 
 pub async fn check_out(
@@ -152,7 +159,7 @@ pub async fn check_out(
 ) -> AppResult<Json<serde_json::Value>> {
     if payload.attendance_id.is_empty() {
         return Err(AppError::BadRequest(
-            "Attendance ID is required".to_string()
+            "Attendance ID is required".to_string(),
         ));
     }
 
@@ -190,7 +197,7 @@ pub async fn detect_no_shows(
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
     // Enhanced no-show detection with grace period and automatic notifications
-    
+
     // Step 1: Find shifts that have passed their grace period without check-in
     #[derive(sqlx::FromRow)]
     struct NoShowShift {
@@ -202,7 +209,7 @@ pub async fn detect_no_shows(
         grace_period_minutes: Option<i32>,
         replacement_status: Option<String>,
     }
-    
+
     let no_show_shifts = sqlx::query_as::<_, NoShowShift>(
         "SELECT s.id, s.guard_id, s.start_time, s.end_time, s.client_site, 
                 s.grace_period_minutes, s.replacement_status
@@ -218,7 +225,7 @@ pub async fn detect_no_shows(
     .map_err(|e| AppError::DatabaseError(format!("Failed to detect no-shows: {}", e)))?;
 
     let mut notified_guards = Vec::new();
-    
+
     // Step 2: For each no-show, find available substitutes and notify them
     for shift in &no_show_shifts {
         // Update shift status to searching
@@ -229,7 +236,7 @@ pub async fn detect_no_shows(
         .execute(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to update shift status: {}", e)))?;
-        
+
         // Find available guards (not the original guard, verified users, with role 'user')
         #[derive(sqlx::FromRow)]
         struct AvailableGuard {
@@ -237,7 +244,7 @@ pub async fn detect_no_shows(
             username: String,
             full_name: Option<String>,
         }
-        
+
         let available_guards = sqlx::query_as::<_, AvailableGuard>(
             "SELECT DISTINCT u.id, u.username, u.full_name 
              FROM users u
@@ -253,7 +260,7 @@ pub async fn detect_no_shows(
                  AND s2.start_time <= $2 
                  AND s2.end_time >= $3
              )
-             LIMIT 20"
+             LIMIT 20",
         )
         .bind(&shift.guard_id)
         .bind(&shift.end_time)
@@ -261,12 +268,12 @@ pub async fn detect_no_shows(
         .fetch_all(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to find available guards: {}", e)))?;
-        
+
         // Step 3: Create notifications for available guards
         for guard in &available_guards {
             let notification_id = utils::generate_id();
             let guard_name = guard.full_name.as_ref().unwrap_or(&guard.username);
-            
+
             sqlx::query(
                 "INSERT INTO notifications (id, user_id, title, message, type, related_shift_id, read) 
                  VALUES ($1, $2, $3, $4, 'replacement_request', $5, false)"
@@ -284,17 +291,19 @@ pub async fn detect_no_shows(
             .execute(db.as_ref())
             .await
             .map_err(|e| AppError::DatabaseError(format!("Failed to create notification: {}", e)))?;
-            
+
             notified_guards.push(json!({
                 "guardId": guard.id,
                 "guardName": guard_name,
                 "shiftId": shift.id
             }));
         }
-        
+
         tracing::info!(
             "No-show detected for shift {} (Guard: {}). Notified {} available guards.",
-            shift.id, shift.guard_id, available_guards.len()
+            shift.id,
+            shift.guard_id,
+            available_guards.len()
         );
     }
 
@@ -310,14 +319,17 @@ pub async fn request_replacement(
     headers: HeaderMap,
     Json(payload): Json<RequestReplacementRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    if payload.original_guard_id.is_empty() || payload.replacement_guard_id.is_empty() 
-        || payload.shift_id.is_empty() {
+    if payload.original_guard_id.is_empty()
+        || payload.replacement_guard_id.is_empty()
+        || payload.shift_id.is_empty()
+    {
         return Err(AppError::BadRequest(
-            "Original Guard ID, Replacement Guard ID, and Shift ID are required".to_string()
+            "Original Guard ID, Replacement Guard ID, and Shift ID are required".to_string(),
         ));
     }
 
-    let _claims = utils::require_self_or_min_role(&headers, &payload.original_guard_id, "supervisor")?;
+    let _claims =
+        utils::require_self_or_min_role(&headers, &payload.original_guard_id, "supervisor")?;
 
     // Verify all references exist
     sqlx::query("SELECT id FROM users WHERE id = $1")
@@ -342,14 +354,12 @@ pub async fn request_replacement(
         .ok_or_else(|| AppError::NotFound("Shift not found".to_string()))?;
 
     // Update shift to use replacement guard
-    sqlx::query(
-        "UPDATE shifts SET guard_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
-    )
-    .bind(&payload.replacement_guard_id)
-    .bind(&payload.shift_id)
-    .execute(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to update shift: {}", e)))?;
+    sqlx::query("UPDATE shifts SET guard_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+        .bind(&payload.replacement_guard_id)
+        .bind(&payload.shift_id)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to update shift: {}", e)))?;
 
     Ok(Json(json!({
         "message": "Replacement accepted successfully"
@@ -362,9 +372,7 @@ pub async fn set_availability(
     Json(payload): Json<SetAvailabilityRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     if payload.guard_id.is_empty() {
-        return Err(AppError::BadRequest(
-            "Guard ID is required".to_string()
-        ));
+        return Err(AppError::BadRequest("Guard ID is required".to_string()));
     }
 
     let _claims = utils::require_self_or_min_role(&headers, &payload.guard_id, "supervisor")?;
@@ -379,7 +387,7 @@ pub async fn set_availability(
 
     // Check if availability record exists
     let existing = sqlx::query(
-        "SELECT id FROM guard_availability WHERE guard_id = $1 ORDER BY created_at DESC LIMIT 1"
+        "SELECT id FROM guard_availability WHERE guard_id = $1 ORDER BY created_at DESC LIMIT 1",
     )
     .bind(&payload.guard_id)
     .fetch_optional(db.as_ref())
@@ -391,7 +399,7 @@ pub async fn set_availability(
         sqlx::query(
             "UPDATE guard_availability 
              SET available = $1, updated_at = CURRENT_TIMESTAMP 
-             WHERE guard_id = $2"
+             WHERE guard_id = $2",
         )
         .bind(payload.available.unwrap_or(true))
         .bind(&payload.guard_id)
@@ -401,15 +409,15 @@ pub async fn set_availability(
     } else {
         // Create new record
         let id = utils::generate_id();
-        sqlx::query(
-            "INSERT INTO guard_availability (id, guard_id, available) VALUES ($1, $2, $3)"
-        )
-        .bind(&id)
-        .bind(&payload.guard_id)
-        .bind(payload.available.unwrap_or(true))
-        .execute(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to create availability: {}", e)))?;
+        sqlx::query("INSERT INTO guard_availability (id, guard_id, available) VALUES ($1, $2, $3)")
+            .bind(&id)
+            .bind(&payload.guard_id)
+            .bind(payload.available.unwrap_or(true))
+            .execute(db.as_ref())
+            .await
+            .map_err(|e| {
+                AppError::DatabaseError(format!("Failed to create availability: {}", e))
+            })?;
     }
 
     Ok(Json(json!({
@@ -422,16 +430,17 @@ pub async fn accept_replacement(
     State(db): State<Arc<PgPool>>,
     Json(payload): Json<serde_json::Value>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let guard_id = payload.get("guardId")
+    let guard_id = payload
+        .get("guardId")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("Guard ID is required".to_string()))?;
-    
-    let shift_id = payload.get("shiftId")
+
+    let shift_id = payload
+        .get("shiftId")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("Shift ID is required".to_string()))?;
-    
-    let notification_id = payload.get("notificationId")
-        .and_then(|v| v.as_str());
+
+    let notification_id = payload.get("notificationId").and_then(|v| v.as_str());
 
     // Verify guard exists
     sqlx::query("SELECT id FROM users WHERE id = $1")
@@ -442,20 +451,18 @@ pub async fn accept_replacement(
         .ok_or_else(|| AppError::NotFound("Guard not found".to_string()))?;
 
     // Verify shift exists and needs replacement
-    let _shift = sqlx::query(
-        "SELECT id, replacement_status FROM shifts WHERE id = $1"
-    )
-    .bind(shift_id)
-    .fetch_optional(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
-    .ok_or_else(|| AppError::NotFound("Shift not found".to_string()))?;
+    let _shift = sqlx::query("SELECT id, replacement_status FROM shifts WHERE id = $1")
+        .bind(shift_id)
+        .fetch_optional(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+        .ok_or_else(|| AppError::NotFound("Shift not found".to_string()))?;
 
     // Update shift with new guard and mark as accepted
     sqlx::query(
         "UPDATE shifts 
          SET guard_id = $1, replacement_status = 'accepted', updated_at = CURRENT_TIMESTAMP 
-         WHERE id = $2"
+         WHERE id = $2",
     )
     .bind(guard_id)
     .bind(shift_id)
@@ -466,7 +473,7 @@ pub async fn accept_replacement(
     // Mark the notification as read if provided
     if let Some(notif_id) = notification_id {
         sqlx::query(
-            "UPDATE notifications SET read = true, updated_at = CURRENT_TIMESTAMP WHERE id = $1"
+            "UPDATE notifications SET read = true, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
         )
         .bind(notif_id)
         .execute(db.as_ref())
@@ -478,7 +485,7 @@ pub async fn accept_replacement(
     sqlx::query(
         "UPDATE notifications 
          SET read = true, updated_at = CURRENT_TIMESTAMP 
-         WHERE related_shift_id = $1 AND type = 'replacement_request' AND read = false"
+         WHERE related_shift_id = $1 AND type = 'replacement_request' AND read = false",
     )
     .bind(shift_id)
     .execute(db.as_ref())
@@ -487,7 +494,8 @@ pub async fn accept_replacement(
 
     tracing::info!(
         "Replacement accepted: Guard {} accepted shift {}",
-        guard_id, shift_id
+        guard_id,
+        shift_id
     );
 
     Ok(Json(json!({
@@ -531,7 +539,6 @@ pub async fn get_guard_availability(
         })))
     }
 }
-
 
 pub async fn get_guard_shifts(
     State(db): State<Arc<PgPool>>,
@@ -661,7 +668,7 @@ pub async fn update_shift(
         .ok()
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .ok_or_else(|| AppError::BadRequest("Invalid start_time format".to_string()))?;
-    
+
     let end_time = chrono::DateTime::parse_from_rfc3339(&payload.end_time)
         .ok()
         .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -712,5 +719,3 @@ pub async fn delete_shift(
         "message": "Shift deleted successfully"
     })))
 }
-
-

@@ -1,18 +1,18 @@
 use axum::{
-    extract::{State, Path},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
+use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
-use serde_json::json;
 
 use crate::{
     error::{AppError, AppResult},
     models::{
-        ArmoredCar, CreateArmoredCarRequest, UpdateArmoredCarRequest, CarAllocation, IssueCarRequest,
-        ReturnCarRequest, CarMaintenance, CreateMaintenanceRequest, DriverAssignment,
-        AssignDriverRequest, Trip, CreateTripRequest, EndTripRequest,
+        ArmoredCar, AssignDriverRequest, CarAllocation, CarMaintenance, CreateArmoredCarRequest,
+        CreateMaintenanceRequest, CreateTripRequest, DriverAssignment, EndTripRequest,
+        IssueCarRequest, ReturnCarRequest, Trip, UpdateArmoredCarRequest,
     },
     utils,
 };
@@ -134,7 +134,9 @@ pub async fn update_armored_car(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to update armored car: {}", e)))?;
 
-    Ok(Json(json!({ "message": "Armored car updated successfully" })))
+    Ok(Json(
+        json!({ "message": "Armored car updated successfully" }),
+    ))
 }
 
 pub async fn delete_armored_car(
@@ -150,7 +152,9 @@ pub async fn delete_armored_car(
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to delete armored car: {}", e)))?;
 
-    Ok(Json(json!({ "message": "Armored car deleted successfully" })))
+    Ok(Json(
+        json!({ "message": "Armored car deleted successfully" }),
+    ))
 }
 
 // ========== Car Allocation Management ==========
@@ -178,12 +182,14 @@ pub async fn issue_car(
     .map_err(|e| AppError::DatabaseError(format!("Failed to issue car: {}", e)))?;
 
     // Update car status to allocated
-    sqlx::query("UPDATE armored_cars SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
-        .bind("allocated")
-        .bind(&payload.car_id)
-        .execute(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to update car status: {}", e)))?;
+    sqlx::query(
+        "UPDATE armored_cars SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+    )
+    .bind("allocated")
+    .bind(&payload.car_id)
+    .execute(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to update car status: {}", e)))?;
 
     Ok((
         StatusCode::CREATED,
@@ -220,12 +226,14 @@ pub async fn return_car(
     .map_err(|e| AppError::DatabaseError(format!("Failed to return car: {}", e)))?;
 
     // Update car status to available
-    sqlx::query("UPDATE armored_cars SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
-        .bind("available")
-        .bind(&allocation.car_id)
-        .execute(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to update car status: {}", e)))?;
+    sqlx::query(
+        "UPDATE armored_cars SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+    )
+    .bind("available")
+    .bind(&allocation.car_id)
+    .execute(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to update car status: {}", e)))?;
 
     Ok(Json(json!({ "message": "Car returned successfully" })))
 }
@@ -270,9 +278,7 @@ pub async fn schedule_maintenance(
     let id = utils::generate_id();
 
     // Parse cost string to f64 for the NUMERIC column; null if absent or unparseable.
-    let cost_f64: Option<f64> = payload.cost
-        .as_deref()
-        .and_then(|s| s.parse::<f64>().ok());
+    let cost_f64: Option<f64> = payload.cost.as_deref().and_then(|s| s.parse::<f64>().ok());
 
     sqlx::query(
         "INSERT INTO car_maintenance (id, car_id, maintenance_type, description, scheduled_date, cost, status) VALUES ($1, $2, $3, $4, $5, $6, $7)"
@@ -329,7 +335,9 @@ pub async fn complete_maintenance(
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to update car maintenance date: {}", e)))?;
 
-    Ok(Json(json!({ "message": "Maintenance completed successfully" })))
+    Ok(Json(
+        json!({ "message": "Maintenance completed successfully" }),
+    ))
 }
 
 pub async fn get_car_maintenance_records(
@@ -359,7 +367,7 @@ pub async fn assign_driver(
     let id = utils::generate_id();
 
     sqlx::query(
-        "INSERT INTO driver_assignments (id, car_id, guard_id, status) VALUES ($1, $2, $3, $4)"
+        "INSERT INTO driver_assignments (id, car_id, guard_id, status) VALUES ($1, $2, $3, $4)",
     )
     .bind(&id)
     .bind(&payload.car_id)
@@ -454,7 +462,8 @@ pub async fn end_trip(
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
     // Parse distance_km string to f64 for the DECIMAL column; null if unparseable.
-    let distance_km_f64: Option<f64> = payload.distance_km
+    let distance_km_f64: Option<f64> = payload
+        .distance_km
         .as_deref()
         .and_then(|s| s.parse::<f64>().ok());
 
@@ -487,9 +496,7 @@ pub async fn get_car_trips(
     Ok(Json(trips))
 }
 
-pub async fn get_all_trips(
-    State(db): State<Arc<PgPool>>,
-) -> AppResult<Json<Vec<Trip>>> {
+pub async fn get_all_trips(State(db): State<Arc<PgPool>>) -> AppResult<Json<Vec<Trip>>> {
     let trips = sqlx::query_as::<_, Trip>(
         "SELECT id, car_id, driver_id, allocation_id, start_location, end_location, start_time, end_time, distance_km::FLOAT8 as distance_km, status, mission_details, created_at, updated_at FROM trips ORDER BY start_time DESC"
     )

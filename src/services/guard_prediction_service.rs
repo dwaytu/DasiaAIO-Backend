@@ -34,7 +34,10 @@ struct UpcomingGuardRow {
     guard_id: String,
 }
 
-async fn persist_absence_prediction(pool: &PgPool, prediction: &GuardAbsenceRiskResult) -> AppResult<()> {
+async fn persist_absence_prediction(
+    pool: &PgPool,
+    prediction: &GuardAbsenceRiskResult,
+) -> AppResult<()> {
     let lower_level = prediction.risk_level.to_lowercase();
     let feature_version = "absence-heuristic-v1";
     let explanation = json!({
@@ -92,7 +95,10 @@ async fn persist_absence_prediction(pool: &PgPool, prediction: &GuardAbsenceRisk
     Ok(())
 }
 
-pub async fn calculate_absence_risk(pool: &PgPool, guard_id: &str) -> AppResult<GuardAbsenceRiskResult> {
+pub async fn calculate_absence_risk(
+    pool: &PgPool,
+    guard_id: &str,
+) -> AppResult<GuardAbsenceRiskResult> {
     let guard_name_row = sqlx::query_as::<_, GuardNameRow>(
         r#"
         SELECT COALESCE(NULLIF(full_name, ''), username) AS guard_name
@@ -150,7 +156,9 @@ pub async fn calculate_absence_risk(pool: &PgPool, guard_id: &str) -> AppResult<
     .bind(guard_id)
     .fetch_one(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to query availability leave signals: {}", e)))?
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to query availability leave signals: {}", e))
+    })?
     .count
     .unwrap_or(0);
 
@@ -202,7 +210,9 @@ pub async fn calculate_absence_risk(pool: &PgPool, guard_id: &str) -> AppResult<
     })
 }
 
-pub async fn calculate_upcoming_shift_absence_risks(pool: &PgPool) -> AppResult<Vec<GuardAbsenceRiskResult>> {
+pub async fn calculate_upcoming_shift_absence_risks(
+    pool: &PgPool,
+) -> AppResult<Vec<GuardAbsenceRiskResult>> {
     let guards = sqlx::query_as::<_, UpcomingGuardRow>(
         r#"
         SELECT DISTINCT s.guard_id
@@ -215,7 +225,9 @@ pub async fn calculate_upcoming_shift_absence_risks(pool: &PgPool) -> AppResult<
     )
     .fetch_all(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to query upcoming shift guards: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to query upcoming shift guards: {}", e))
+    })?;
 
     let mut results = Vec::new();
     for guard in guards {

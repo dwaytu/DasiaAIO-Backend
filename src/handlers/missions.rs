@@ -3,10 +3,10 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use sqlx::PgPool;
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::PgPool;
+use std::sync::Arc;
 
 use crate::{
     error::{AppError, AppResult},
@@ -81,26 +81,31 @@ pub async fn assign_mission(
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
-    use chrono::{NaiveDate, NaiveTime, NaiveDateTime};
-    
+    use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+
     // Parse date (YYYY-MM-DD format from HTML date input)
-    let date = NaiveDate::parse_from_str(&payload.date, "%Y-%m-%d")
-        .map_err(|_| AppError::BadRequest("Invalid date format. Expected YYYY-MM-DD".to_string()))?;
-    
+    let date = NaiveDate::parse_from_str(&payload.date, "%Y-%m-%d").map_err(|_| {
+        AppError::BadRequest("Invalid date format. Expected YYYY-MM-DD".to_string())
+    })?;
+
     // Parse times (HH:MM format from HTML time input)
-    let start_time_naive = NaiveTime::parse_from_str(&payload.start_time, "%H:%M")
-        .map_err(|_| AppError::BadRequest("Invalid start time format. Expected HH:MM".to_string()))?;
-    
+    let start_time_naive =
+        NaiveTime::parse_from_str(&payload.start_time, "%H:%M").map_err(|_| {
+            AppError::BadRequest("Invalid start time format. Expected HH:MM".to_string())
+        })?;
+
     let end_time_naive = NaiveTime::parse_from_str(&payload.end_time, "%H:%M")
         .map_err(|_| AppError::BadRequest("Invalid end time format. Expected HH:MM".to_string()))?;
-    
+
     // Combine date and time
     let start_datetime = NaiveDateTime::new(date, start_time_naive);
     let end_datetime = NaiveDateTime::new(date, end_time_naive);
-    
+
     // Convert to UTC DateTime
-    let start_time = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(start_datetime, chrono::Utc);
-    let end_time = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(end_datetime, chrono::Utc);
+    let start_time =
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(start_datetime, chrono::Utc);
+    let end_time =
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(end_datetime, chrono::Utc);
 
     let duration = (end_time - start_time).num_hours() as f64;
 
@@ -111,12 +116,12 @@ pub async fn assign_mission(
         full_name: Option<String>,
         username: String,
     }
-    
+
     let guards = sqlx::query_as::<_, GuardRow>(
         "SELECT id, full_name, username FROM users 
          WHERE role IN ('guard', 'user') 
          AND verified = true 
-         LIMIT $1"
+         LIMIT $1",
     )
     .bind(payload.guards_required as i64)
     .fetch_all(db.as_ref())
@@ -126,7 +131,8 @@ pub async fn assign_mission(
     if guards.len() < payload.guards_required as usize {
         return Err(AppError::BadRequest(format!(
             "Insufficient guards available. Requested: {}, Available: {}",
-            payload.guards_required, guards.len()
+            payload.guards_required,
+            guards.len()
         )));
     }
 
@@ -137,11 +143,11 @@ pub async fn assign_mission(
         name: Option<String>,
         model: Option<String>,
     }
-    
+
     let firearms = sqlx::query_as::<_, FirearmRow>(
         "SELECT id, name, model FROM firearms 
          WHERE status = 'available' 
-         LIMIT $1"
+         LIMIT $1",
     )
     .bind(payload.firearms_required as i64)
     .fetch_all(db.as_ref())
@@ -151,7 +157,8 @@ pub async fn assign_mission(
     if firearms.len() < payload.firearms_required as usize {
         return Err(AppError::BadRequest(format!(
             "Insufficient firearms available. Requested: {}, Available: {}",
-            payload.firearms_required, firearms.len()
+            payload.firearms_required,
+            firearms.len()
         )));
     }
 
@@ -162,11 +169,11 @@ pub async fn assign_mission(
         model: Option<String>,
         passenger_capacity: Option<i32>,
     }
-    
+
     let vehicles = sqlx::query_as::<_, VehicleRow>(
         "SELECT id, model, passenger_capacity FROM armored_cars 
          WHERE status IN ('operational', 'available') 
-         LIMIT $1"
+         LIMIT $1",
     )
     .bind(payload.vehicles_required as i64)
     .fetch_all(db.as_ref())
@@ -176,11 +183,13 @@ pub async fn assign_mission(
     if vehicles.len() < payload.vehicles_required as usize {
         return Err(AppError::BadRequest(format!(
             "Insufficient vehicles available. Requested: {}, Available: {}",
-            payload.vehicles_required, vehicles.len()
+            payload.vehicles_required,
+            vehicles.len()
         )));
     }
 
-    let mission_id = format!("MISSION_{}_{}", 
+    let mission_id = format!(
+        "MISSION_{}_{}",
         start_time.format("%Y%m%d"),
         utils::generate_id().split('-').next().unwrap_or("001")
     );
@@ -191,7 +200,7 @@ pub async fn assign_mission(
         let shift_id = utils::generate_id();
         sqlx::query(
             "INSERT INTO shifts (id, guard_id, start_time, end_time, client_site, status) 
-             VALUES ($1, $2, $3, $4, $5, 'scheduled')"
+             VALUES ($1, $2, $3, $4, $5, 'scheduled')",
         )
         .bind(&shift_id)
         .bind(&guard.id)
@@ -204,7 +213,10 @@ pub async fn assign_mission(
 
         guard_assignments.push(GuardAssignment {
             id: guard.id.clone(),
-            name: guard.full_name.clone().unwrap_or_else(|| guard.username.clone()),
+            name: guard
+                .full_name
+                .clone()
+                .unwrap_or_else(|| guard.username.clone()),
             assignment_status: "confirmed".to_string(),
         });
     }
@@ -235,7 +247,11 @@ pub async fn assign_mission(
 
             firearm_assignments.push(FirearmAssignment {
                 id: firearm.id.clone(),
-                r#type: format!("{} {}", firearm.model.as_deref().unwrap_or("Unknown"), firearm.name.as_deref().unwrap_or("")),
+                r#type: format!(
+                    "{} {}",
+                    firearm.model.as_deref().unwrap_or("Unknown"),
+                    firearm.name.as_deref().unwrap_or("")
+                ),
                 allocation_status: "active".to_string(),
             });
         }
@@ -247,7 +263,7 @@ pub async fn assign_mission(
         let trip_id = utils::generate_id();
         sqlx::query(
             "INSERT INTO trips (id, car_id, start_time, end_time, destination, driver_id, status) 
-             VALUES ($1, $2, $3, $4, $5, $6, 'scheduled')"
+             VALUES ($1, $2, $3, $4, $5, $6, 'scheduled')",
         )
         .bind(&trip_id)
         .bind(&vehicle.id)
@@ -261,7 +277,10 @@ pub async fn assign_mission(
 
         vehicle_assignments.push(VehicleAssignment {
             id: vehicle.id.clone(),
-            r#type: vehicle.model.clone().unwrap_or_else(|| "Armored Vehicle".to_string()),
+            r#type: vehicle
+                .model
+                .clone()
+                .unwrap_or_else(|| "Armored Vehicle".to_string()),
             capacity_passengers: vehicle.passenger_capacity.unwrap_or(0),
             deployment_status: "ready".to_string(),
         });
@@ -305,7 +324,7 @@ pub async fn get_missions(
         vehicle_model: Option<String>,
         driver_name: Option<String>,
     }
-    
+
     let missions = sqlx::query_as::<_, MissionRow>(
         "SELECT t.id, t.destination, t.start_time, t.end_time, t.status,
          ac.model as vehicle_model, u.full_name as driver_name
@@ -313,7 +332,7 @@ pub async fn get_missions(
          LEFT JOIN armored_cars ac ON t.car_id = ac.id
          LEFT JOIN users u ON t.driver_id = u.id
          ORDER BY t.start_time DESC
-         LIMIT 50"
+         LIMIT 50",
     )
     .fetch_all(db.as_ref())
     .await

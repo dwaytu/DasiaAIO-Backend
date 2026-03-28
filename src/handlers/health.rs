@@ -9,9 +9,7 @@ pub async fn health_check() -> Json<serde_json::Value> {
     }))
 }
 
-pub async fn system_health(
-    State(db): State<Arc<PgPool>>,
-) -> Json<serde_json::Value> {
+pub async fn system_health(State(db): State<Arc<PgPool>>) -> Json<serde_json::Value> {
     let db_status = match sqlx::query_scalar::<_, i64>("SELECT 1")
         .fetch_one(db.as_ref())
         .await
@@ -31,4 +29,3 @@ pub async fn system_health(
         "timestamp": chrono::Utc::now().to_rfc3339(),
     }))
 }
-

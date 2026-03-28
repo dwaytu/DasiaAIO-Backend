@@ -1,11 +1,11 @@
 use axum::{
-    extract::{State, Path},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
+use serde_json::json;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
-use serde_json::json;
 
 use crate::{
     error::{AppError, AppResult},
@@ -22,7 +22,7 @@ pub async fn issue_firearm(
 
     if payload.firearm_id.is_empty() || payload.guard_id.is_empty() {
         return Err(AppError::BadRequest(
-            "Firearm ID and Guard ID are required".to_string()
+            "Firearm ID and Guard ID are required".to_string(),
         ));
     }
 
@@ -125,12 +125,14 @@ pub async fn issue_firearm(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to update firearm: {}", e)))?;
 
-    Ok((StatusCode::CREATED, Json(json!({
-        "message": "Firearm allocated successfully",
-        "allocationId": allocation_id
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "message": "Firearm allocated successfully",
+            "allocationId": allocation_id
+        })),
+    ))
 }
-
 
 pub async fn return_firearm(
     State(db): State<Arc<PgPool>>,
@@ -141,19 +143,17 @@ pub async fn return_firearm(
 
     if payload.allocation_id.is_empty() {
         return Err(AppError::BadRequest(
-            "Allocation ID is required".to_string()
+            "Allocation ID is required".to_string(),
         ));
     }
 
     // Get the allocation
-    let allocation = sqlx::query(
-        "SELECT firearm_id FROM firearm_allocations WHERE id = $1"
-    )
-    .bind(&payload.allocation_id)
-    .fetch_optional(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
-    .ok_or_else(|| AppError::NotFound("Allocation not found".to_string()))?;
+    let allocation = sqlx::query("SELECT firearm_id FROM firearm_allocations WHERE id = $1")
+        .bind(&payload.allocation_id)
+        .fetch_optional(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+        .ok_or_else(|| AppError::NotFound("Allocation not found".to_string()))?;
 
     // Update allocation
     sqlx::query(
@@ -167,7 +167,7 @@ pub async fn return_firearm(
     // Update firearm status back to available
     let firearm_id: String = allocation.get("firearm_id");
     sqlx::query(
-        "UPDATE firearms SET status = 'available', updated_at = CURRENT_TIMESTAMP WHERE id = $1"
+        "UPDATE firearms SET status = 'available', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
     )
     .bind(&firearm_id)
     .execute(db.as_ref())
@@ -286,5 +286,3 @@ pub async fn get_overdue_allocations(
         "overdueAllocations": overdue
     })))
 }
-
-

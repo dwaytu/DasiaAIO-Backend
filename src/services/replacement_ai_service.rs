@@ -137,13 +137,18 @@ async fn persist_suggestions(
         }))
         .execute(pool)
         .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to persist replacement suggestion: {}", e)))?;
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to persist replacement suggestion: {}", e))
+        })?;
     }
 
     Ok(())
 }
 
-pub async fn suggest_replacement(pool: &PgPool, post_id: &str) -> AppResult<Vec<ReplacementSuggestion>> {
+pub async fn suggest_replacement(
+    pool: &PgPool,
+    post_id: &str,
+) -> AppResult<Vec<ReplacementSuggestion>> {
     let post = sqlx::query_as::<_, PostRow>(
         r#"
         SELECT id, name, latitude, longitude
@@ -284,7 +289,12 @@ pub async fn suggest_replacement(pool: &PgPool, post_id: &str) -> AppResult<Vec<
     .bind(post.id.as_str())
     .fetch_optional(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to locate post shift for persistence: {}", e)))?
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to locate post shift for persistence: {}",
+            e
+        ))
+    })?
     .map(|row| row.id);
 
     persist_suggestions(pool, &post, shift_id.as_deref(), &top_three).await?;

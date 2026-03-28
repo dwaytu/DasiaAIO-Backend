@@ -1,15 +1,15 @@
 use axum::{
-    extract::{State, Path},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
+use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
-use serde_json::json;
 
 use crate::{
     error::{AppError, AppResult},
-    models::{CreateFirearmRequest, UpdateFirearmRequest, Firearm, FirearmAllocation},
+    models::{CreateFirearmRequest, Firearm, FirearmAllocation, UpdateFirearmRequest},
     utils,
 };
 
@@ -22,7 +22,7 @@ pub async fn add_firearm(
 
     if payload.serial_number.is_empty() || payload.model.is_empty() || payload.caliber.is_empty() {
         return Err(AppError::BadRequest(
-            "Serial number, model, and caliber are required".to_string()
+            "Serial number, model, and caliber are required".to_string(),
         ));
     }
 
@@ -42,15 +42,16 @@ pub async fn add_firearm(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create firearm: {}", e)))?;
 
-    Ok((StatusCode::CREATED, Json(json!({
-        "message": "Firearm added successfully",
-        "firearmId": id
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "message": "Firearm added successfully",
+            "firearmId": id
+        })),
+    ))
 }
 
-pub async fn get_all_firearms(
-    State(db): State<Arc<PgPool>>,
-) -> AppResult<Json<Vec<Firearm>>> {
+pub async fn get_all_firearms(State(db): State<Arc<PgPool>>) -> AppResult<Json<Vec<Firearm>>> {
     let firearms = sqlx::query_as::<_, Firearm>(
         "SELECT id, name, serial_number, model, caliber, status, created_at, updated_at FROM firearms"
     )
@@ -106,7 +107,7 @@ pub async fn update_firearm(
 
     if let Some(status) = payload.status {
         sqlx::query(
-            "UPDATE firearms SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+            "UPDATE firearms SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
         )
         .bind(&status)
         .bind(&id)
@@ -117,7 +118,7 @@ pub async fn update_firearm(
 
     if let Some(caliber) = payload.caliber {
         sqlx::query(
-            "UPDATE firearms SET caliber = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+            "UPDATE firearms SET caliber = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
         )
         .bind(&caliber)
         .bind(&id)
@@ -176,4 +177,3 @@ pub async fn get_firearm_maintenance(
         "maintenances": maintenance_firearms
     })))
 }
-

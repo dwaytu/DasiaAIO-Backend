@@ -44,8 +44,7 @@ fn validate_production_env(config: &Config) -> Result<(), String> {
 
     if cors_origins.is_none() && cors_origin.is_none() {
         return Err(
-            "CORS_ORIGINS or CORS_ORIGIN must be configured when APP_ENV=production."
-                .to_string(),
+            "CORS_ORIGINS or CORS_ORIGIN must be configured when APP_ENV=production.".to_string(),
         );
     }
 
@@ -87,4 +86,3 @@ impl Config {
         Ok(config)
     }
 }
-

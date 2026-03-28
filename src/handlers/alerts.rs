@@ -1,8 +1,4 @@
-use axum::{
-    extract::State,
-    http::HeaderMap,
-    Json,
-};
+use axum::{extract::State, http::HeaderMap, Json};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::json;
@@ -91,7 +87,11 @@ pub async fn get_predictive_alerts(
         alerts.push(PredictiveAlert {
             id: "permits-expiring".to_string(),
             category: "permits".to_string(),
-            severity: if permit_total >= 3 { "critical".into() } else { "warning".into() },
+            severity: if permit_total >= 3 {
+                "critical".into()
+            } else {
+                "warning".into()
+            },
             message,
             detected_at: Utc::now(),
             context: json!({
@@ -116,7 +116,12 @@ pub async fn get_predictive_alerts(
     )
     .fetch_all(db.as_ref())
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to query overdue vehicle maintenance: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to query overdue vehicle maintenance: {}",
+            e
+        ))
+    })?;
 
     if !vehicle_rows.is_empty() {
         let first_plate = vehicle_rows
@@ -126,13 +131,20 @@ pub async fn get_predictive_alerts(
         let message = if vehicle_rows.len() == 1 {
             format!("Vehicle {first_plate} maintenance overdue")
         } else {
-            format!("{} vehicles with overdue maintenance (earliest: {first_plate})", vehicle_rows.len())
+            format!(
+                "{} vehicles with overdue maintenance (earliest: {first_plate})",
+                vehicle_rows.len()
+            )
         };
 
         alerts.push(PredictiveAlert {
             id: "vehicle-maintenance".to_string(),
             category: "vehicles".to_string(),
-            severity: if vehicle_rows.len() >= 3 { "critical".into() } else { "warning".into() },
+            severity: if vehicle_rows.len() >= 3 {
+                "critical".into()
+            } else {
+                "warning".into()
+            },
             message,
             detected_at: Utc::now(),
             context: json!({
@@ -148,7 +160,7 @@ pub async fn get_predictive_alerts(
     }
 
     // Guards with repeated recent no-shows
-        let guard_rows = sqlx::query_as::<_, GuardNoShowRow>(
+    let guard_rows = sqlx::query_as::<_, GuardNoShowRow>(
         r#"
                 SELECT pr.guard_id,
                              COALESCE(NULLIF(u.full_name, ''), u.username) AS guard_name,
@@ -171,19 +183,30 @@ pub async fn get_predictive_alerts(
         let preview_names = guard_rows
             .iter()
             .take(3)
-            .map(|row| row.guard_name.clone().unwrap_or_else(|| "Guard".to_string()))
+            .map(|row| {
+                row.guard_name
+                    .clone()
+                    .unwrap_or_else(|| "Guard".to_string())
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let message = if guard_rows.len() == 1 {
             format!("{} flagged for repeated no-shows", preview_names)
         } else {
-            format!("{} guards flagged for repeated no-shows ({preview_names}...)", guard_rows.len())
+            format!(
+                "{} guards flagged for repeated no-shows ({preview_names}...)",
+                guard_rows.len()
+            )
         };
 
         alerts.push(PredictiveAlert {
             id: "guard-absence-risk".to_string(),
             category: "personnel".to_string(),
-            severity: if guard_rows.len() >= 3 { "critical".into() } else { "warning".into() },
+            severity: if guard_rows.len() >= 3 {
+                "critical".into()
+            } else {
+                "warning".into()
+            },
             message,
             detected_at: Utc::now(),
             context: json!({
@@ -223,15 +246,22 @@ pub async fn get_predictive_alerts(
         };
 
         if available_tomorrow <= 3 || availability_ratio < 0.25 {
-            let plural = if available_tomorrow == 1 { "guard" } else { "guards" };
-            let message = format!(
-                "Only {available_tomorrow} {plural} unassigned for tomorrow's roster"
-            );
+            let plural = if available_tomorrow == 1 {
+                "guard"
+            } else {
+                "guards"
+            };
+            let message =
+                format!("Only {available_tomorrow} {plural} unassigned for tomorrow's roster");
 
             alerts.push(PredictiveAlert {
                 id: "guard-availability".to_string(),
                 category: "capacity".to_string(),
-                severity: if available_tomorrow <= 1 { "critical".into() } else { "warning".into() },
+                severity: if available_tomorrow <= 1 {
+                    "critical".into()
+                } else {
+                    "warning".into()
+                },
                 message,
                 detected_at: Utc::now(),
                 context: json!({

@@ -10,11 +10,8 @@ use std::sync::Arc;
 use crate::{
     error::AppResult,
     services::{
-        guard_prediction_service,
-        incident_ai_classifier,
-        incident_summary_service,
-        replacement_ai_service,
-        vehicle_predictive_service,
+        guard_prediction_service, incident_ai_classifier, incident_summary_service,
+        replacement_ai_service, vehicle_predictive_service,
     },
     utils,
 };
@@ -97,8 +94,7 @@ fn explanation_from_context(description: &str, severity: &str) -> String {
 
     format!(
         "Severity '{}' was inferred from incident wording and {} contextual signal(s).",
-        severity,
-        clue_count
+        severity, clue_count
     )
 }
 
@@ -106,13 +102,25 @@ fn risk_level_from_summary(summary: &str, key_phrases: &[String]) -> String {
     let summary_lc = summary.to_lowercase();
     let phrase_lc: Vec<String> = key_phrases.iter().map(|item| item.to_lowercase()).collect();
 
-    if summary_lc.contains("critical") || phrase_lc.iter().any(|item| item.contains("critical") || item.contains("weapon") || item.contains("injury")) {
+    if summary_lc.contains("critical")
+        || phrase_lc.iter().any(|item| {
+            item.contains("critical") || item.contains("weapon") || item.contains("injury")
+        })
+    {
         return "critical".to_string();
     }
-    if summary_lc.contains("high") || phrase_lc.iter().any(|item| item.contains("breach") || item.contains("unauthorized")) {
+    if summary_lc.contains("high")
+        || phrase_lc
+            .iter()
+            .any(|item| item.contains("breach") || item.contains("unauthorized"))
+    {
         return "high".to_string();
     }
-    if summary_lc.contains("medium") || phrase_lc.iter().any(|item| item.contains("delay") || item.contains("warning")) {
+    if summary_lc.contains("medium")
+        || phrase_lc
+            .iter()
+            .any(|item| item.contains("delay") || item.contains("warning"))
+    {
         return "medium".to_string();
     }
     "low".to_string()
@@ -124,7 +132,8 @@ pub async fn get_guard_absence_risk(
 ) -> AppResult<Json<Vec<guard_prediction_service::GuardAbsenceRiskResult>>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
-    let rows = guard_prediction_service::calculate_upcoming_shift_absence_risks(db.as_ref()).await?;
+    let rows =
+        guard_prediction_service::calculate_upcoming_shift_absence_risks(db.as_ref()).await?;
     Ok(Json(rows))
 }
 

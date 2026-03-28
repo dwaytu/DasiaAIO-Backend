@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 const STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "had", "has", "have", "he",
-    "her", "his", "in", "is", "it", "its", "of", "on", "or", "she", "that", "the", "their", "there",
-    "they", "to", "was", "were", "with", "near", "into", "this", "while", "but", "after", "before",
+    "her", "his", "in", "is", "it", "its", "of", "on", "or", "she", "that", "the", "their",
+    "there", "they", "to", "was", "were", "with", "near", "into", "this", "while", "but", "after",
+    "before",
 ];
 
 fn normalize_sentence(text: &str) -> String {

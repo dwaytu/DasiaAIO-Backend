@@ -158,4 +158,3 @@ pub async fn auto_expire_permits(
         "expiredCount": result.rows_affected()
     })))
 }
-

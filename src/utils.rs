@@ -1,9 +1,9 @@
 use crate::error::{AppError, AppResult};
 use axum::http::HeaderMap;
+use chrono::{Duration, Utc};
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use regex::Regex;
-use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey};
 use serde::{Deserialize, Serialize};
-use chrono::{Utc, Duration};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -12,7 +12,11 @@ pub struct PaginationQuery {
     pub page_size: Option<i64>,
 }
 
-pub fn resolve_pagination(query: PaginationQuery, default_size: i64, max_size: i64) -> (i64, i64, i64) {
+pub fn resolve_pagination(
+    query: PaginationQuery,
+    default_size: i64,
+    max_size: i64,
+) -> (i64, i64, i64) {
     let page = query.page.unwrap_or(1).max(1);
     let requested_size = query.page_size.unwrap_or(default_size).max(1);
     let page_size = requested_size.min(max_size.max(1));
@@ -22,11 +26,11 @@ pub fn resolve_pagination(query: PaginationQuery, default_size: i64, max_size: i
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TokenClaims {
-    pub sub: String,  // user_id
+    pub sub: String, // user_id
     pub email: String,
     pub role: String,
-    pub exp: i64,     // expiration time
-    pub iat: i64,     // issued at time
+    pub exp: i64, // expiration time
+    pub iat: i64, // issued at time
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -41,7 +45,8 @@ pub struct RefreshTokenClaims {
 }
 
 fn jwt_secret() -> String {
-    std::env::var("JWT_SECRET").unwrap_or_else(|_| "your-secret-key-change-in-production".to_string())
+    std::env::var("JWT_SECRET")
+        .unwrap_or_else(|_| "your-secret-key-change-in-production".to_string())
 }
 
 pub fn generate_access_token(user_id: &str, email: &str, role: &str) -> AppResult<String> {
@@ -100,7 +105,7 @@ pub fn generate_refresh_token(user_id: &str, email: &str, role: &str) -> AppResu
 
 pub fn verify_token(token: &str) -> AppResult<TokenClaims> {
     let secret = jwt_secret();
-    
+
     decode::<TokenClaims>(
         token,
         &DecodingKey::from_secret(secret.as_ref()),
@@ -122,7 +127,9 @@ pub fn verify_refresh_token(token: &str) -> AppResult<RefreshTokenClaims> {
     .map_err(|e| AppError::Unauthorized(format!("Invalid or expired refresh token: {}", e)))?;
 
     if claims.token_type != "refresh" {
-        return Err(AppError::Unauthorized("Invalid refresh token type".to_string()));
+        return Err(AppError::Unauthorized(
+            "Invalid refresh token type".to_string(),
+        ));
     }
 
     Ok(claims)
@@ -353,7 +360,7 @@ pub fn hash_token(token: &str) -> String {
 pub fn validate_gmail(email: &str) -> AppResult<()> {
     if !email.ends_with("@gmail.com") {
         return Err(AppError::ValidationError(
-            "You must use a Gmail account (email must end with @gmail.com)".to_string()
+            "You must use a Gmail account (email must end with @gmail.com)".to_string(),
         ));
     }
     Ok(())
@@ -363,9 +370,11 @@ pub fn validate_email(email: &str) -> AppResult<()> {
     let email_regex = Regex::new(
         r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"
     ).unwrap();
-    
+
     if !email_regex.is_match(email) {
-        return Err(AppError::ValidationError("Invalid email format".to_string()));
+        return Err(AppError::ValidationError(
+            "Invalid email format".to_string(),
+        ));
     }
     Ok(())
 }
@@ -398,11 +407,7 @@ pub fn validate_password_strength(password: &str) -> AppResult<()> {
     Ok(())
 }
 
-pub async fn send_confirmation_email(
-    api_key: &str,
-    to_email: &str,
-    code: &str,
-) -> AppResult<()> {
+pub async fn send_confirmation_email(api_key: &str, to_email: &str, code: &str) -> AppResult<()> {
     let html_body = format!(
         r#"
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
@@ -452,8 +457,15 @@ pub async fn send_confirmation_email(
     } else {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
-        tracing::error!("Failed to send verification email to {}: {} {}", to_email, status, error_text);
-        Err(AppError::InternalServerError(format!("Email API error {}: {}", status, error_text)))
+        tracing::error!(
+            "Failed to send verification email to {}: {} {}",
+            to_email,
+            status,
+            error_text
+        );
+        Err(AppError::InternalServerError(format!(
+            "Email API error {}: {}",
+            status, error_text
+        )))
     }
 }
-

@@ -1,17 +1,17 @@
 use axum::{
-    extract::{Query, State, Path},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
+use serde::Deserialize;
+use serde_json::json;
 use sqlx::PgPool;
 use sqlx::Row;
 use std::sync::Arc;
-use serde::Deserialize;
-use serde_json::json;
 
 use crate::{
     error::{AppError, AppResult},
-    models::{UserResponse, User},
+    models::{User, UserResponse},
     utils,
 };
 
@@ -71,8 +71,12 @@ pub async fn create_user_by_actor(
         )));
     }
 
-    if payload.email.is_empty() || payload.password.is_empty() || payload.username.is_empty()
-        || payload.full_name.is_empty() || payload.phone_number.is_empty() {
+    if payload.email.is_empty()
+        || payload.password.is_empty()
+        || payload.username.is_empty()
+        || payload.full_name.is_empty()
+        || payload.phone_number.is_empty()
+    {
         return Err(AppError::BadRequest(
             "Email, password, username, full name, and phone number are required".to_string(),
         ));
@@ -98,7 +102,9 @@ pub async fn create_user_by_actor(
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
     if existing.is_some() {
-        return Err(AppError::Conflict("User with email or username already exists".to_string()));
+        return Err(AppError::Conflict(
+            "User with email or username already exists".to_string(),
+        ));
     }
 
     let user_id = utils::generate_id();
@@ -281,10 +287,16 @@ pub async fn update_guard_approval_status(
     };
     let notification_message = if new_status == "approved" {
         "Your guard account has been approved. You can now log in.".to_string()
-    } else if let Some(reason) = payload.reason.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    } else if let Some(reason) = payload
+        .reason
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         format!("Your guard account was not approved. Reason: {}", reason)
     } else {
-        "Your guard account was not approved. Please contact an administrator for details.".to_string()
+        "Your guard account was not approved. Please contact an administrator for details."
+            .to_string()
     };
 
     let notification_id = utils::generate_id();
@@ -357,7 +369,7 @@ pub async fn update_user(
     // Build query based on provided fields
     if let Some(full_name) = full_name {
         sqlx::query(
-            "UPDATE users SET full_name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+            "UPDATE users SET full_name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
         )
         .bind(full_name)
         .bind(&id)
@@ -367,19 +379,17 @@ pub async fn update_user(
     }
 
     if let Some(email) = email {
-        sqlx::query(
-            "UPDATE users SET email = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
-        )
-        .bind(email)
-        .bind(&id)
-        .execute(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+        sqlx::query("UPDATE users SET email = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+            .bind(email)
+            .bind(&id)
+            .execute(db.as_ref())
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
     }
 
     if let Some(phone_number) = phone_number {
         sqlx::query(
-            "UPDATE users SET phone_number = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+            "UPDATE users SET phone_number = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
         )
         .bind(phone_number)
         .bind(&id)
@@ -390,7 +400,7 @@ pub async fn update_user(
 
     if let Some(license_number) = license_number {
         sqlx::query(
-            "UPDATE users SET license_number = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+            "UPDATE users SET license_number = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
         )
         .bind(license_number)
         .bind(&id)
@@ -403,7 +413,7 @@ pub async fn update_user(
         let expiry_date = chrono::DateTime::parse_from_rfc3339(license_expiry_date)
             .ok()
             .map(|dt| dt.with_timezone(&chrono::Utc));
-        
+
         if let Some(expiry_date) = expiry_date {
             sqlx::query(
                 "UPDATE users SET license_expiry_date = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
@@ -420,7 +430,7 @@ pub async fn update_user(
         let issued_date = chrono::DateTime::parse_from_rfc3339(license_issued_date)
             .ok()
             .map(|dt| dt.with_timezone(&chrono::Utc));
-        
+
         if let Some(issued_date) = issued_date {
             sqlx::query(
                 "UPDATE users SET license_issued_date = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
@@ -434,14 +444,12 @@ pub async fn update_user(
     }
 
     if let Some(address) = address {
-        sqlx::query(
-            "UPDATE users SET address = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
-        )
-        .bind(address)
-        .bind(&id)
-        .execute(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+        sqlx::query("UPDATE users SET address = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+            .bind(address)
+            .bind(&id)
+            .execute(db.as_ref())
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
     }
 
     Ok(Json(json!({
@@ -457,7 +465,9 @@ pub async fn delete_user(
     let claims = utils::require_min_role(&headers, "admin")?;
 
     if claims.sub == id {
-        return Err(AppError::Forbidden("You cannot delete your own account".to_string()));
+        return Err(AppError::Forbidden(
+            "You cannot delete your own account".to_string(),
+        ));
     }
 
     // Check if user exists
@@ -495,7 +505,8 @@ pub async fn update_profile_photo(
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    let profile_photo = payload.get("profilePhoto")
+    let profile_photo = payload
+        .get("profilePhoto")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("Missing profilePhoto field".to_string()))?;
 
@@ -507,7 +518,7 @@ pub async fn update_profile_photo(
     tracing::info!("Updating profile photo for user: {}", id);
 
     sqlx::query(
-        "UPDATE users SET profile_photo = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+        "UPDATE users SET profile_photo = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
     )
     .bind(profile_photo)
     .bind(&id)
@@ -538,7 +549,7 @@ pub async fn delete_profile_photo(
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
     sqlx::query(
-        "UPDATE users SET profile_photo = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1"
+        "UPDATE users SET profile_photo = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
     )
     .bind(&id)
     .execute(db.as_ref())
@@ -549,4 +560,3 @@ pub async fn delete_profile_photo(
         "message": "Profile photo removed successfully"
     })))
 }
-

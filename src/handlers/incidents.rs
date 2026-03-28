@@ -116,10 +116,14 @@ pub async fn get_active_incidents(
 ) -> AppResult<Json<serde_json::Value>> {
     let (page, page_size, offset) = utils::resolve_pagination(pagination, 50, 200);
 
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM incidents WHERE status IN ('open', 'investigating')")
-        .fetch_one(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to fetch active incidents count: {}", e)))?;
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM incidents WHERE status IN ('open', 'investigating')",
+    )
+    .fetch_one(db.as_ref())
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to fetch active incidents count: {}", e))
+    })?;
 
     let incidents = sqlx::query_as::<_, Incident>(
         r#"SELECT id, title, description, location, reported_by, status, priority, created_at, updated_at

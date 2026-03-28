@@ -4,13 +4,16 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Duration, Utc};
+use serde_json::json;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
-use serde_json::json;
 
 use crate::{
     error::{AppError, AppResult},
-    models::{CreateUserRequest, LoginRequest, VerifyEmailRequest, ResendCodeRequest, ForgotPasswordRequest, VerifyResetCodeRequest, ResetPasswordRequest, RefreshTokenRequest},
+    models::{
+        CreateUserRequest, ForgotPasswordRequest, LoginRequest, RefreshTokenRequest,
+        ResendCodeRequest, ResetPasswordRequest, VerifyEmailRequest, VerifyResetCodeRequest,
+    },
     utils::{self, verify_password},
 };
 
@@ -43,8 +46,9 @@ fn make_login_key(prefix: &str, value: &str) -> String {
 }
 
 fn refresh_expiry_datetime(epoch_seconds: i64) -> AppResult<DateTime<Utc>> {
-    DateTime::<Utc>::from_timestamp(epoch_seconds, 0)
-        .ok_or_else(|| AppError::InternalServerError("Invalid refresh token expiry value".to_string()))
+    DateTime::<Utc>::from_timestamp(epoch_seconds, 0).ok_or_else(|| {
+        AppError::InternalServerError("Invalid refresh token expiry value".to_string())
+    })
 }
 
 fn extract_user_agent(headers: &HeaderMap) -> Option<String> {
@@ -85,32 +89,33 @@ async fn register_login_failure(db: &PgPool, key: &str) -> AppResult<bool> {
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to load login failure state: {}", e)))?;
 
-    let (next_failed_attempts, next_first_failed_at, next_locked_until) = if let Some(row) = existing {
-        let mut failed_attempts: i32 = row.try_get("failed_attempts").unwrap_or(0);
-        let mut first_failed_at: DateTime<Utc> = row.try_get("first_failed_at").unwrap_or(now);
-        let mut locked_until: Option<DateTime<Utc>> = row.try_get("locked_until").ok();
+    let (next_failed_attempts, next_first_failed_at, next_locked_until) =
+        if let Some(row) = existing {
+            let mut failed_attempts: i32 = row.try_get("failed_attempts").unwrap_or(0);
+            let mut first_failed_at: DateTime<Utc> = row.try_get("first_failed_at").unwrap_or(now);
+            let mut locked_until: Option<DateTime<Utc>> = row.try_get("locked_until").ok();
 
-        if locked_until.map(|until| until <= now).unwrap_or(false) {
-            failed_attempts = 0;
-            first_failed_at = now;
-            locked_until = None;
-        }
+            if locked_until.map(|until| until <= now).unwrap_or(false) {
+                failed_attempts = 0;
+                first_failed_at = now;
+                locked_until = None;
+            }
 
-        if now.signed_duration_since(first_failed_at) >= failure_window {
-            failed_attempts = 0;
-            first_failed_at = now;
-            locked_until = None;
-        }
+            if now.signed_duration_since(first_failed_at) >= failure_window {
+                failed_attempts = 0;
+                first_failed_at = now;
+                locked_until = None;
+            }
 
-        failed_attempts += 1;
-        if failed_attempts >= threshold {
-            locked_until = Some(lockout_until);
-        }
+            failed_attempts += 1;
+            if failed_attempts >= threshold {
+                locked_until = Some(lockout_until);
+            }
 
-        (failed_attempts, first_failed_at, locked_until)
-    } else {
-        (1, now, None)
-    };
+            (failed_attempts, first_failed_at, locked_until)
+        } else {
+            (1, now, None)
+        };
 
     sqlx::query(
         r#"INSERT INTO auth_login_attempts (scope_key, failed_attempts, first_failed_at, last_failed_at, locked_until)
@@ -139,7 +144,9 @@ async fn clear_login_failures(db: &PgPool, keys: &[String]) -> AppResult<()> {
             .bind(key)
             .execute(db)
             .await
-            .map_err(|e| AppError::DatabaseError(format!("Failed to clear login failure state: {}", e)))?;
+            .map_err(|e| {
+                AppError::DatabaseError(format!("Failed to clear login failure state: {}", e))
+            })?;
     }
 
     Ok(())
@@ -169,7 +176,9 @@ async fn store_refresh_session(
     .bind(user_agent)
     .execute(db)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to persist refresh token session: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to persist refresh token session: {}", e))
+    })?;
 
     Ok(())
 }
@@ -187,10 +196,12 @@ async fn rotate_refresh_session(
     let new_hash = utils::hash_token(new_refresh_token);
     let new_expires_at = refresh_expiry_datetime(new_claims.exp)?;
 
-    let mut tx = db
-        .begin()
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to start refresh rotation transaction: {}", e)))?;
+    let mut tx = db.begin().await.map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to start refresh rotation transaction: {}",
+            e
+        ))
+    })?;
 
     let updated = sqlx::query(
         r#"UPDATE refresh_token_sessions
@@ -209,13 +220,20 @@ async fn rotate_refresh_session(
     .bind(current_hash)
     .execute(&mut *tx)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to revoke previous refresh token: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to revoke previous refresh token: {}", e))
+    })?;
 
     if updated.rows_affected() != 1 {
-        tx.rollback()
-            .await
-            .map_err(|e| AppError::DatabaseError(format!("Failed to rollback refresh rotation transaction: {}", e)))?;
-        return Err(AppError::Unauthorized("Invalid or revoked refresh token".to_string()));
+        tx.rollback().await.map_err(|e| {
+            AppError::DatabaseError(format!(
+                "Failed to rollback refresh rotation transaction: {}",
+                e
+            ))
+        })?;
+        return Err(AppError::Unauthorized(
+            "Invalid or revoked refresh token".to_string(),
+        ));
     }
 
     sqlx::query(
@@ -231,11 +249,16 @@ async fn rotate_refresh_session(
     .bind(user_agent)
     .execute(&mut *tx)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to persist rotated refresh token: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to persist rotated refresh token: {}", e))
+    })?;
 
-    tx.commit()
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to commit refresh rotation transaction: {}", e)))?;
+    tx.commit().await.map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to commit refresh rotation transaction: {}",
+            e
+        ))
+    })?;
 
     Ok(())
 }
@@ -279,12 +302,17 @@ pub async fn register(
     let requested_role = utils::normalize_role(&payload.role);
 
     // Validate required fields
-    if payload.email.is_empty() || payload.password.is_empty() || payload.username.is_empty()
-        || payload.full_name.is_empty() || payload.phone_number.is_empty()
-        || payload.license_number.is_none() || payload.license_issued_date.is_none()
-        || payload.license_expiry_date.is_none() {
+    if payload.email.is_empty()
+        || payload.password.is_empty()
+        || payload.username.is_empty()
+        || payload.full_name.is_empty()
+        || payload.phone_number.is_empty()
+        || payload.license_number.is_none()
+        || payload.license_issued_date.is_none()
+        || payload.license_expiry_date.is_none()
+    {
         return Err(AppError::BadRequest(
-            "All fields are required for guard self-registration".to_string()
+            "All fields are required for guard self-registration".to_string(),
         ));
     }
 
@@ -295,7 +323,9 @@ pub async fn register(
 
     // Validate role
     if requested_role != "guard" {
-        return Err(AppError::BadRequest("Public registration only supports guard accounts".to_string()));
+        return Err(AppError::BadRequest(
+            "Public registration only supports guard accounts".to_string(),
+        ));
     }
 
     // Check if user exists
@@ -321,7 +351,8 @@ pub async fn register(
     let resend_api_key = std::env::var("RESEND_API_KEY").unwrap_or_default();
     if resend_api_key.is_empty() {
         return Err(AppError::InternalServerError(
-            "Registration is temporarily unavailable because email verification is not configured".to_string(),
+            "Registration is temporarily unavailable because email verification is not configured"
+                .to_string(),
         ));
     }
 
@@ -381,7 +412,7 @@ pub async fn register(
     // Create verification record
     let verification_id = utils::generate_id();
     sqlx::query(
-        "INSERT INTO verifications (id, user_id, code, expires_at) VALUES ($1, $2, $3, $4)"
+        "INSERT INTO verifications (id, user_id, code, expires_at) VALUES ($1, $2, $3, $4)",
     )
     .bind(&verification_id)
     .bind(&user_id)
@@ -391,11 +422,7 @@ pub async fn register(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create verification: {}", e)))?;
 
-    utils::send_confirmation_email(
-        &resend_api_key,
-        &payload.email,
-        &confirmation_code,
-    ).await?;
+    utils::send_confirmation_email(&resend_api_key, &payload.email, &confirmation_code).await?;
 
     tracing::info!("Verification email sent to {}", payload.email);
     Ok((
@@ -415,7 +442,7 @@ pub async fn verify_email(
 ) -> AppResult<Json<serde_json::Value>> {
     if payload.email.is_empty() || payload.code.is_empty() {
         return Err(AppError::BadRequest(
-            "Email and code are required".to_string()
+            "Email and code are required".to_string(),
         ));
     }
 
@@ -424,7 +451,7 @@ pub async fn verify_email(
         r#"SELECT v.id, v.user_id, v.expires_at
            FROM verifications v
            INNER JOIN users u ON u.id = v.user_id
-           WHERE v.code = $1 AND LOWER(u.email) = LOWER($2)"#
+           WHERE v.code = $1 AND LOWER(u.email) = LOWER($2)"#,
     )
     .bind(&payload.code)
     .bind(&payload.email)
@@ -434,32 +461,37 @@ pub async fn verify_email(
     .ok_or_else(|| AppError::BadRequest("Invalid confirmation code".to_string()))?;
 
     // Check if code expired
-    let expires_at: chrono::DateTime<chrono::Utc> = verification.try_get("expires_at")
-        .map_err(|e| AppError::DatabaseError(format!("Failed to parse verification expiry: {}", e)))?;
+    let expires_at: chrono::DateTime<chrono::Utc> =
+        verification.try_get("expires_at").map_err(|e| {
+            AppError::DatabaseError(format!("Failed to parse verification expiry: {}", e))
+        })?;
     if chrono::Utc::now() > expires_at {
-        let ver_id: String = verification.try_get("id")
-            .map_err(|e| AppError::DatabaseError(format!("Failed to parse verification id: {}", e)))?;
+        let ver_id: String = verification.try_get("id").map_err(|e| {
+            AppError::DatabaseError(format!("Failed to parse verification id: {}", e))
+        })?;
         sqlx::query("DELETE FROM verifications WHERE id = $1")
             .bind(&ver_id)
             .execute(db.as_ref())
             .await
             .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
-        return Err(AppError::BadRequest("Confirmation code expired".to_string()));
+        return Err(AppError::BadRequest(
+            "Confirmation code expired".to_string(),
+        ));
     }
 
     // Mark user as verified
-    let user_id: String = verification.try_get("user_id")
+    let user_id: String = verification
+        .try_get("user_id")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse user_id: {}", e)))?;
-    sqlx::query(
-        "UPDATE users SET verified = TRUE WHERE id = $1"
-    )
-    .bind(&user_id)
-    .execute(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+    sqlx::query("UPDATE users SET verified = TRUE WHERE id = $1")
+        .bind(&user_id)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
     // Delete verification record
-    let ver_id: String = verification.try_get("id")
+    let ver_id: String = verification
+        .try_get("id")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse verification id: {}", e)))?;
     sqlx::query("DELETE FROM verifications WHERE id = $1")
         .bind(&ver_id)
@@ -493,7 +525,8 @@ pub async fn resend_verification_code(
     let expires_at = chrono::Utc::now() + Duration::minutes(10);
 
     // Delete old verification
-    let user_id: String = user.try_get("id")
+    let user_id: String = user
+        .try_get("id")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse user id: {}", e)))?;
     sqlx::query("DELETE FROM verifications WHERE user_id = $1")
         .bind(&user_id)
@@ -504,7 +537,7 @@ pub async fn resend_verification_code(
     // Create new verification
     let verification_id = utils::generate_id();
     sqlx::query(
-        "INSERT INTO verifications (id, user_id, code, expires_at) VALUES ($1, $2, $3, $4)"
+        "INSERT INTO verifications (id, user_id, code, expires_at) VALUES ($1, $2, $3, $4)",
     )
     .bind(&verification_id)
     .bind(&user_id)
@@ -515,11 +548,7 @@ pub async fn resend_verification_code(
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
     let resend_api_key = std::env::var("RESEND_API_KEY").unwrap_or_default();
-    utils::send_confirmation_email(
-        &resend_api_key,
-        &payload.email,
-        &confirmation_code,
-    ).await?;
+    utils::send_confirmation_email(&resend_api_key, &payload.email, &confirmation_code).await?;
 
     Ok(Json(json!({
         "message": "Verification code resent to your email"
@@ -536,7 +565,7 @@ pub async fn login(
 
     if identifier.is_empty() || password.is_empty() {
         return Err(AppError::BadRequest(
-            "Email, username, phone number, and password are required".to_string()
+            "Email, username, phone number, and password are required".to_string(),
         ));
     }
 
@@ -620,7 +649,8 @@ pub async fn login(
         return Err(AppError::BadRequest("Invalid credentials".to_string()));
     };
 
-    let id: String = user.try_get("id")
+    let id: String = user
+        .try_get("id")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse user id: {}", e)))?;
 
     // Check if user is verified
@@ -637,11 +667,13 @@ pub async fn login(
         )
         .await;
         return Err(AppError::BadRequest(
-            "Please verify your email first".to_string()
+            "Please verify your email first".to_string(),
         ));
     }
 
-    let approval_status: String = user.try_get("approval_status").unwrap_or_else(|_| "approved".to_string());
+    let approval_status: String = user
+        .try_get("approval_status")
+        .unwrap_or_else(|_| "approved".to_string());
     if approval_status != "approved" {
         log_security_event(
             db.as_ref(),
@@ -654,12 +686,13 @@ pub async fn login(
         )
         .await;
         return Err(AppError::Forbidden(
-            "Your account is pending approval".to_string()
+            "Your account is pending approval".to_string(),
         ));
     }
 
     // Verify password
-    let password_hash: String = user.try_get("password")
+    let password_hash: String = user
+        .try_get("password")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse password hash: {}", e)))?;
     let password_valid = verify_password(password, &password_hash).await?;
     if !password_valid {
@@ -685,17 +718,22 @@ pub async fn login(
         return Err(AppError::BadRequest("Invalid credentials".to_string()));
     }
 
-    let email: String = user.try_get("email")
+    let email: String = user
+        .try_get("email")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse email: {}", e)))?;
-    let username: String = user.try_get("username")
+    let username: String = user
+        .try_get("username")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse username: {}", e)))?;
-    let role: String = user.try_get("role")
+    let role: String = user
+        .try_get("role")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse role: {}", e)))?;
     let full_name: Option<String> = user.try_get("full_name").ok();
     let phone_number: Option<String> = user.try_get("phone_number").ok();
     let license_number: Option<String> = user.try_get("license_number").ok();
-    let license_issued_date: Option<chrono::DateTime<chrono::Utc>> = user.try_get("license_issued_date").ok();
-    let license_expiry_date: Option<chrono::DateTime<chrono::Utc>> = user.try_get("license_expiry_date").ok();
+    let license_issued_date: Option<chrono::DateTime<chrono::Utc>> =
+        user.try_get("license_issued_date").ok();
+    let license_expiry_date: Option<chrono::DateTime<chrono::Utc>> =
+        user.try_get("license_expiry_date").ok();
     let address: Option<String> = user.try_get("address").ok();
     let profile_photo: Option<String> = user.try_get("profile_photo").ok();
 
@@ -737,7 +775,8 @@ pub async fn login(
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value >= 1 && *value <= 168)
-        .unwrap_or(24) * 3600;
+        .unwrap_or(24)
+        * 3600;
 
     Ok(Json(json!({
         "message": "Login successful",
@@ -768,7 +807,9 @@ pub async fn refresh_token(
 ) -> AppResult<Json<serde_json::Value>> {
     let presented_refresh_token = payload.refresh_token.trim();
     if presented_refresh_token.is_empty() {
-        return Err(AppError::BadRequest("Refresh token is required".to_string()));
+        return Err(AppError::BadRequest(
+            "Refresh token is required".to_string(),
+        ));
     }
 
     let claims = utils::verify_refresh_token(presented_refresh_token)?;
@@ -788,7 +829,12 @@ pub async fn refresh_token(
     .bind(&claims.sub)
     .fetch_one(db.as_ref())
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to validate refresh token user state: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to validate refresh token user state: {}",
+            e
+        ))
+    })?;
 
     if !user_is_active {
         log_security_event(
@@ -801,7 +847,9 @@ pub async fn refresh_token(
             json!({ "jti": claims.jti }),
         )
         .await;
-        return Err(AppError::Unauthorized("Invalid refresh token session".to_string()));
+        return Err(AppError::Unauthorized(
+            "Invalid refresh token session".to_string(),
+        ));
     }
 
     let token = utils::generate_access_token(&claims.sub, &claims.email, &claims.role)?;
@@ -928,7 +976,8 @@ pub async fn forgot_password(
         })));
     };
 
-    let user_id: String = user.try_get("id")
+    let user_id: String = user
+        .try_get("id")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse user id: {}", e)))?;
 
     // Generate reset code (6 digits)
@@ -944,7 +993,7 @@ pub async fn forgot_password(
 
     // Create new password reset token
     sqlx::query(
-        "INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)"
+        "INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)",
     )
     .bind(&user_id)
     .bind(&reset_code)
@@ -1011,13 +1060,17 @@ pub async fn verify_reset_code(
     let code = payload.code.trim();
 
     if email.is_empty() || code.is_empty() {
-        return Err(AppError::BadRequest("Email and code are required".to_string()));
+        return Err(AppError::BadRequest(
+            "Email and code are required".to_string(),
+        ));
     }
 
     utils::validate_email(email)?;
 
     if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
-        return Err(AppError::BadRequest("Invalid reset code format".to_string()));
+        return Err(AppError::BadRequest(
+            "Invalid reset code format".to_string(),
+        ));
     }
 
     // Find user
@@ -1028,7 +1081,8 @@ pub async fn verify_reset_code(
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    let user_id: String = user.try_get("id")
+    let user_id: String = user
+        .try_get("id")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse user id: {}", e)))?;
 
     // Find reset token
@@ -1042,14 +1096,16 @@ pub async fn verify_reset_code(
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
     .ok_or_else(|| AppError::BadRequest("Invalid reset code".to_string()))?;
 
-    let is_used: bool = token_record.try_get("is_used")
-        .unwrap_or(false);
+    let is_used: bool = token_record.try_get("is_used").unwrap_or(false);
     if is_used {
-        return Err(AppError::BadRequest("Reset code has already been used".to_string()));
+        return Err(AppError::BadRequest(
+            "Reset code has already been used".to_string(),
+        ));
     }
 
     // Check if code expired
-    let expires_at: chrono::DateTime<chrono::Utc> = token_record.try_get("expires_at")
+    let expires_at: chrono::DateTime<chrono::Utc> = token_record
+        .try_get("expires_at")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse expiry: {}", e)))?;
     if chrono::Utc::now() > expires_at {
         return Err(AppError::BadRequest("Reset code expired".to_string()));
@@ -1069,14 +1125,18 @@ pub async fn reset_password(
     let new_password = payload.new_password.as_str();
 
     if email.is_empty() || code.is_empty() || new_password.is_empty() {
-        return Err(AppError::BadRequest("Email, code, and new password are required".to_string()));
+        return Err(AppError::BadRequest(
+            "Email, code, and new password are required".to_string(),
+        ));
     }
 
     utils::validate_email(email)?;
     utils::validate_password_strength(new_password)?;
 
     if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
-        return Err(AppError::BadRequest("Invalid reset code format".to_string()));
+        return Err(AppError::BadRequest(
+            "Invalid reset code format".to_string(),
+        ));
     }
 
     // Find user
@@ -1087,7 +1147,8 @@ pub async fn reset_password(
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
-    let user_id: String = user.try_get("id")
+    let user_id: String = user
+        .try_get("id")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse user id: {}", e)))?;
 
     // Find and validate reset token
@@ -1101,19 +1162,22 @@ pub async fn reset_password(
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
     .ok_or_else(|| AppError::BadRequest("Invalid reset code".to_string()))?;
 
-    let is_used: bool = token_record.try_get("is_used")
-        .unwrap_or(false);
+    let is_used: bool = token_record.try_get("is_used").unwrap_or(false);
     if is_used {
-        return Err(AppError::BadRequest("Reset code has already been used".to_string()));
+        return Err(AppError::BadRequest(
+            "Reset code has already been used".to_string(),
+        ));
     }
 
-    let expires_at: chrono::DateTime<chrono::Utc> = token_record.try_get("expires_at")
+    let expires_at: chrono::DateTime<chrono::Utc> = token_record
+        .try_get("expires_at")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse expiry: {}", e)))?;
     if chrono::Utc::now() > expires_at {
         return Err(AppError::BadRequest("Reset code expired".to_string()));
     }
 
-    let token_id: String = token_record.try_get("id")
+    let token_id: String = token_record
+        .try_get("id")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse token id: {}", e)))?;
 
     // Hash new password
@@ -1137,6 +1201,3 @@ pub async fn reset_password(
         "message": "Password reset successful. You can now login with your new password."
     })))
 }
-
-
-
