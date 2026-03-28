@@ -1,10 +1,11 @@
 # Build stage
-FROM rust:1.93.1-bookworm as builder
+FROM rust:1.93.1-bookworm AS builder
 
 WORKDIR /app
 
 # Copy manifests and source
 COPY Cargo.toml .
+COPY Cargo.lock .
 COPY src ./src
 
 # Build resilience for flaky networks (common in remote CI/deploy builds)
@@ -14,7 +15,7 @@ ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse \
     SQLX_OFFLINE=true
 
 # Build the application
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -26,11 +27,16 @@ RUN apt-get update && \
 
 WORKDIR /app
 
+RUN groupadd --system sentinel && \
+    useradd --system --gid sentinel --create-home --home-dir /home/sentinel sentinel
+
 # Copy the binary from builder
-COPY --from=builder /app/target/release/server /app/server
+COPY --from=builder --chown=sentinel:sentinel /app/target/release/server /app/server
 
 EXPOSE 5000
 
 ENV RUST_LOG=info
+
+USER sentinel
 
 CMD ["/app/server"]

@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{PgPool, Row};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::broadcast;
@@ -78,12 +79,14 @@ fn vehicle_recency_minutes() -> i64 {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrackingWsAuthQuery {
     pub token: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct UpsertClientSiteRequest {
     pub name: String,
     pub address: Option<String>,
@@ -101,6 +104,7 @@ pub struct GeofenceVertex {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct UpsertGeofenceZoneRequest {
     pub zone_type: String,
     pub radius_km: Option<f64>,
@@ -110,6 +114,7 @@ pub struct UpsertGeofenceZoneRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct TrackPointRequest {
     pub entity_type: String,
     pub entity_id: String,
@@ -124,6 +129,7 @@ pub struct TrackPointRequest {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct GuardHistoryQuery {
     pub limit: Option<i64>,
     pub from: Option<String>,
@@ -132,8 +138,18 @@ pub struct GuardHistoryQuery {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ActiveGuardsQuery {
     pub window_minutes: Option<i64>,
+}
+
+fn active_ws_connections() -> &'static AtomicUsize {
+    static ACTIVE_WS_CONNECTIONS: OnceLock<AtomicUsize> = OnceLock::new();
+    ACTIVE_WS_CONNECTIONS.get_or_init(|| AtomicUsize::new(0))
+}
+
+pub fn active_websocket_connections() -> usize {
+    active_ws_connections().load(Ordering::Relaxed)
 }
 
 fn tracking_bus() -> &'static broadcast::Sender<String> {
@@ -939,19 +955,46 @@ async fn send_ws_snapshot(
     db: Arc<PgPool>,
     claims: utils::TokenClaims,
 ) -> Result<(), ()> {
-    let snapshot = fetch_map_snapshot(db.as_ref(), &claims)
-        .await
-        .map_err(|_| ())?;
+    let snapshot = match fetch_map_snapshot(db.as_ref(), &claims).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(
+                user_id = %claims.sub,
+                role = %claims.role,
+                error = %error,
+                "Failed to build tracking websocket snapshot"
+            );
+            return Err(());
+        }
+    };
+
     let payload = json!({ "type": "snapshot", "data": snapshot }).to_string();
 
-    socket.send(Message::Text(payload)).await.map_err(|_| ())
+    if let Err(error) = socket.send(Message::Text(payload)).await {
+        tracing::debug!(
+            user_id = %claims.sub,
+            error = %error,
+            "Failed to send tracking websocket snapshot"
+        );
+        return Err(());
+    }
+
+    Ok(())
 }
 
 async fn handle_tracking_ws(mut socket: WebSocket, db: Arc<PgPool>, claims: utils::TokenClaims) {
+    let active_connections = active_ws_connections().fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::info!(user_id = %claims.sub, role = %claims.role, active_connections, "Tracking websocket connected");
+
     if send_ws_snapshot(&mut socket, db.clone(), claims.clone())
         .await
         .is_err()
     {
+        tracing::warn!(
+            user_id = %claims.sub,
+            "Closing tracking websocket after initial snapshot failure"
+        );
+        active_ws_connections().fetch_sub(1, Ordering::Relaxed);
         return;
     }
 
@@ -961,29 +1004,45 @@ async fn handle_tracking_ws(mut socket: WebSocket, db: Arc<PgPool>, claims: util
         tokio::select! {
             recv_result = socket.recv() => {
                 match recv_result {
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_))) | None => {
+                        tracing::info!(user_id = %claims.sub, "Tracking websocket closed by client");
+                        break;
+                    }
                     Some(Ok(Message::Ping(payload))) => {
                         if socket.send(Message::Pong(payload)).await.is_err() {
+                            tracing::debug!(user_id = %claims.sub, "Tracking websocket pong send failed");
                             break;
                         }
                     }
                     Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
+                    Some(Err(error)) => {
+                        tracing::warn!(user_id = %claims.sub, error = %error, "Tracking websocket receive error");
+                        break;
+                    }
                 }
             }
             bus_result = rx.recv() => {
                 match bus_result {
                     Ok(_) => {
                         if send_ws_snapshot(&mut socket, db.clone(), claims.clone()).await.is_err() {
+                            tracing::debug!(user_id = %claims.sub, "Tracking websocket snapshot push failed");
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::warn!(user_id = %claims.sub, "Tracking event bus closed for websocket");
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::debug!(user_id = %claims.sub, skipped, "Tracking websocket lagged on event bus");
+                    }
                 }
             }
         }
     }
+
+    let active_remaining = active_ws_connections().fetch_sub(1, Ordering::Relaxed) - 1;
+    tracing::info!(user_id = %claims.sub, active_connections = active_remaining, "Tracking websocket disconnected");
 }
 
 pub async fn get_guard_history(
@@ -1880,12 +1939,21 @@ pub async fn tracking_ws(
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
     if query.token.trim().is_empty() {
+        tracing::warn!("Rejected tracking websocket upgrade due to missing token");
         return Err(AppError::Unauthorized(
             "Missing websocket token".to_string(),
         ));
     }
 
-    let claims = utils::verify_token(query.token.trim())?;
+    let claims = match utils::verify_token(query.token.trim()) {
+        Ok(claims) => claims,
+        Err(error) => {
+            tracing::warn!(error = %error, "Rejected tracking websocket upgrade due to invalid token");
+            return Err(error);
+        }
+    };
+
+    tracing::debug!(user_id = %claims.sub, role = %claims.role, "Tracking websocket upgrade accepted");
 
     Ok(ws.on_upgrade(move |socket| handle_tracking_ws(socket, db, claims)))
 }

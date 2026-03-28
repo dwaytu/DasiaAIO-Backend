@@ -66,6 +66,7 @@ pub struct User {
 // User creation request
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct CreateUserRequest {
     pub email: String,
     pub password: String,
@@ -249,34 +250,40 @@ pub struct Attendance {
 
 // Authentication requests
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoginRequest {
     pub identifier: String,
     pub password: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifyEmailRequest {
     pub email: String,
     pub code: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResendCodeRequest {
     pub email: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForgotPasswordRequest {
     pub email: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifyResetCodeRequest {
     pub email: String,
     pub code: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResetPasswordRequest {
     pub email: String,
     pub code: String,
@@ -285,6 +292,7 @@ pub struct ResetPasswordRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct RefreshTokenRequest {
     pub refresh_token: String,
 }

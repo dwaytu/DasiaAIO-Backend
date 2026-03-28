@@ -122,6 +122,36 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             AppError::DatabaseError(format!("Failed to add last_seen_at column: {}", e))
         })?;
 
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_accepted_at TIMESTAMP WITH TIME ZONE",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to add consent_accepted_at column: {}", e))
+    })?;
+
+    sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_version VARCHAR(50)")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to add consent_version column: {}", e))
+        })?;
+
+    sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_ip VARCHAR(64)")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to add consent_ip column: {}", e))
+        })?;
+
+    sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_user_agent TEXT")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to add consent_user_agent column: {}", e))
+        })?;
+
     // Operational tracking tables for real-time map monitoring.
     sqlx::query(
         r#"

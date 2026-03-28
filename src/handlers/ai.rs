@@ -17,11 +17,13 @@ use crate::{
 };
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplacementSuggestionsQuery {
     pub post_id: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClassifyIncidentRequest {
     pub title: Option<String>,
     pub description: String,
@@ -38,6 +40,7 @@ pub struct ClassifyIncidentResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SummarizeIncidentRequest {
     pub description: String,
 }

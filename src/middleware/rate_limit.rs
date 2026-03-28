@@ -1,9 +1,9 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderMap, Request},
+    http::{header, HeaderMap, HeaderValue, Method, Request},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -100,8 +100,63 @@ impl RateLimiter {
     }
 }
 
-fn resolve_requester(headers: &HeaderMap) -> String {
-    crate::utils::extract_requester(headers)
+fn resolve_user_id(headers: &HeaderMap) -> Option<String> {
+    if let Ok(token) = crate::utils::extract_bearer_token(headers) {
+        if let Ok(claims) = crate::utils::verify_token(&token) {
+            return Some(claims.sub);
+        }
+    }
+
+    None
+}
+
+fn cors_safe_error_response(origin: Option<HeaderValue>, error: AppError) -> Response {
+    let mut response = error.into_response();
+
+    if let Some(origin) = origin {
+        response
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+
+        response.headers_mut().append(
+            header::VARY,
+            HeaderValue::from_static(
+                "origin, access-control-request-method, access-control-request-headers",
+            ),
+        );
+    }
+
+    response
+}
+
+async fn enforce_bucket_limit(
+    origin: Option<HeaderValue>,
+    rate_limiter: &RateLimiter,
+    key: &str,
+    path: &str,
+    principal: &str,
+    scope: &str,
+    message: &str,
+) -> Option<Response> {
+    if let Some(retry_after) = rate_limiter.check_request(key).await {
+        tracing::warn!(
+            path = %path,
+            principal = %principal,
+            scope = %scope,
+            retry_after,
+            "rate limit exceeded"
+        );
+
+        return Some(cors_safe_error_response(
+            origin,
+            AppError::RateLimited(format!(
+                "{} Retry in {} second(s).",
+                message, retry_after
+            )),
+        ));
+    }
+
+    None
 }
 
 pub async fn auth_rate_limit(
@@ -109,21 +164,63 @@ pub async fn auth_rate_limit(
     request: Request<Body>,
     next: Next,
 ) -> AppResult<Response> {
-    let path = request.uri().path().to_string();
-    let requester = resolve_requester(request.headers());
-    let key = format!("auth:{}:{}", path, requester);
+    if request.method() == Method::OPTIONS {
+        return Ok(next.run(request).await);
+    }
 
-    if let Some(retry_after) = rate_limiter.check_request(&key).await {
-        tracing::warn!(
-            path = %path,
-            requester = %requester,
-            retry_after,
-            "rate limit exceeded on sensitive auth endpoint"
-        );
-        return Err(AppError::RateLimited(format!(
-            "Too many requests. Retry in {} second(s).",
-            retry_after
-        )));
+    let path = request.uri().path().to_string();
+    let request_origin = request.headers().get(header::ORIGIN).cloned();
+    let source_ip = crate::utils::extract_requester(request.headers());
+
+    if source_ip != "unknown-client" {
+        let key = format!("auth:ip:{}:{}", path, source_ip);
+        if let Some(response) = enforce_bucket_limit(
+            request_origin.clone(),
+            rate_limiter.as_ref(),
+            &key,
+            &path,
+            &source_ip,
+            "ip",
+            "Too many requests.",
+        )
+        .await
+        {
+            return Ok(response);
+        }
+    }
+
+    if let Some(user_id) = resolve_user_id(request.headers()) {
+        let key = format!("auth:user:{}:{}", path, user_id);
+        if let Some(response) = enforce_bucket_limit(
+            request_origin.clone(),
+            rate_limiter.as_ref(),
+            &key,
+            &path,
+            &user_id,
+            "user",
+            "Too many requests.",
+        )
+        .await
+        {
+            return Ok(response);
+        }
+    }
+
+    if source_ip == "unknown-client" {
+        let key = format!("auth:fallback:{}:{}", path, source_ip);
+        if let Some(response) = enforce_bucket_limit(
+            request_origin,
+            rate_limiter.as_ref(),
+            &key,
+            &path,
+            &source_ip,
+            "fallback",
+            "Too many requests.",
+        )
+        .await
+        {
+            return Ok(response);
+        }
     }
 
     Ok(next.run(request).await)
@@ -134,21 +231,67 @@ pub async fn api_rate_limit(
     request: Request<Body>,
     next: Next,
 ) -> AppResult<Response> {
-    let path = request.uri().path().to_string();
-    let requester = resolve_requester(request.headers());
-    let key = format!("api:{}", requester);
+    if request.method() == Method::OPTIONS {
+        return Ok(next.run(request).await);
+    }
 
-    if let Some(retry_after) = rate_limiter.check_request(&key).await {
-        tracing::warn!(
-            path = %path,
-            requester = %requester,
-            retry_after,
-            "global api rate limit exceeded"
-        );
-        return Err(AppError::RateLimited(format!(
-            "Too many API requests. Retry in {} second(s).",
-            retry_after
-        )));
+    if request.uri().path().starts_with("/api/health") {
+        return Ok(next.run(request).await);
+    }
+
+    let path = request.uri().path().to_string();
+    let request_origin = request.headers().get(header::ORIGIN).cloned();
+    let source_ip = crate::utils::extract_requester(request.headers());
+
+    if source_ip != "unknown-client" {
+        let key = format!("api:ip:{}:{}", source_ip, path);
+        if let Some(response) = enforce_bucket_limit(
+            request_origin.clone(),
+            rate_limiter.as_ref(),
+            &key,
+            &path,
+            &source_ip,
+            "ip",
+            "Too many API requests.",
+        )
+        .await
+        {
+            return Ok(response);
+        }
+    }
+
+    if let Some(user_id) = resolve_user_id(request.headers()) {
+        let key = format!("api:user:{}:{}", user_id, path);
+        if let Some(response) = enforce_bucket_limit(
+            request_origin.clone(),
+            rate_limiter.as_ref(),
+            &key,
+            &path,
+            &user_id,
+            "user",
+            "Too many API requests.",
+        )
+        .await
+        {
+            return Ok(response);
+        }
+    }
+
+    if source_ip == "unknown-client" {
+        let key = format!("api:fallback:{}:{}", source_ip, path);
+        if let Some(response) = enforce_bucket_limit(
+            request_origin,
+            rate_limiter.as_ref(),
+            &key,
+            &path,
+            &source_ip,
+            "fallback",
+            "Too many API requests.",
+        )
+        .await
+        {
+            return Ok(response);
+        }
     }
 
     Ok(next.run(request).await)
@@ -159,21 +302,63 @@ pub async fn expensive_endpoint_rate_limit(
     request: Request<Body>,
     next: Next,
 ) -> AppResult<Response> {
-    let path = request.uri().path().to_string();
-    let requester = resolve_requester(request.headers());
-    let key = format!("expensive:{}:{}", path, requester);
+    if request.method() == Method::OPTIONS {
+        return Ok(next.run(request).await);
+    }
 
-    if let Some(retry_after) = rate_limiter.check_request(&key).await {
-        tracing::warn!(
-            path = %path,
-            requester = %requester,
-            retry_after,
-            "expensive endpoint rate limit exceeded"
-        );
-        return Err(AppError::RateLimited(format!(
-            "Too many requests to this endpoint. Retry in {} second(s).",
-            retry_after
-        )));
+    let path = request.uri().path().to_string();
+    let request_origin = request.headers().get(header::ORIGIN).cloned();
+    let source_ip = crate::utils::extract_requester(request.headers());
+
+    if source_ip != "unknown-client" {
+        let key = format!("expensive:ip:{}:{}", path, source_ip);
+        if let Some(response) = enforce_bucket_limit(
+            request_origin.clone(),
+            rate_limiter.as_ref(),
+            &key,
+            &path,
+            &source_ip,
+            "ip",
+            "Too many requests to this endpoint.",
+        )
+        .await
+        {
+            return Ok(response);
+        }
+    }
+
+    if let Some(user_id) = resolve_user_id(request.headers()) {
+        let key = format!("expensive:user:{}:{}", path, user_id);
+        if let Some(response) = enforce_bucket_limit(
+            request_origin.clone(),
+            rate_limiter.as_ref(),
+            &key,
+            &path,
+            &user_id,
+            "user",
+            "Too many requests to this endpoint.",
+        )
+        .await
+        {
+            return Ok(response);
+        }
+    }
+
+    if source_ip == "unknown-client" {
+        let key = format!("expensive:fallback:{}:{}", path, source_ip);
+        if let Some(response) = enforce_bucket_limit(
+            request_origin,
+            rate_limiter.as_ref(),
+            &key,
+            &path,
+            &source_ip,
+            "fallback",
+            "Too many requests to this endpoint.",
+        )
+        .await
+        {
+            return Ok(response);
+        }
     }
 
     Ok(next.run(request).await)

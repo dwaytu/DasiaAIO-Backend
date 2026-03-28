@@ -270,12 +270,13 @@ async fn log_security_event(
     result: &str,
     reason: &str,
     source_ip: &str,
+    user_agent: Option<&str>,
     metadata: serde_json::Value,
 ) {
     if let Err(err) = sqlx::query(
         r#"INSERT INTO audit_logs (
-                id, actor_user_id, action_key, entity_type, entity_id, result, reason, source_ip, metadata
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+                id, actor_user_id, action_key, entity_type, entity_id, result, reason, source_ip, user_agent, metadata
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"#,
     )
     .bind(utils::generate_id())
     .bind(actor_user_id)
@@ -285,6 +286,7 @@ async fn log_security_event(
     .bind(result)
     .bind(reason)
     .bind(source_ip)
+    .bind(user_agent)
     .bind(metadata)
     .execute(db)
     .await
@@ -590,6 +592,7 @@ pub async fn login(
             "blocked",
             "Login blocked due to repeated failed attempts",
             &requester,
+            user_agent.as_deref(),
             json!({ "identifier": identifier, "retryAfterSeconds": remaining, "scope": "user" }),
         )
         .await;
@@ -607,6 +610,7 @@ pub async fn login(
             "blocked",
             "Login blocked due to repeated failed attempts",
             &requester,
+            user_agent.as_deref(),
             json!({ "identifier": identifier, "retryAfterSeconds": remaining, "scope": "ip" }),
         )
         .await;
@@ -618,7 +622,7 @@ pub async fn login(
 
     // Find user by email, username, or phone
     let user = sqlx::query(
-        r#"SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, COALESCE(approval_status, 'approved') AS approval_status, created_at, updated_at FROM users 
+        r#"SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, COALESCE(approval_status, 'approved') AS approval_status, consent_accepted_at, consent_version, created_at, updated_at FROM users 
            WHERE email = $1 OR username = $1 OR phone_number = $1"#
     )
     .bind(identifier)
@@ -636,6 +640,7 @@ pub async fn login(
             "failed",
             "Invalid credentials",
             &requester,
+            user_agent.as_deref(),
             json!({ "identifier": identifier, "userLocked": user_locked, "ipLocked": ip_locked }),
         )
         .await;
@@ -663,6 +668,7 @@ pub async fn login(
             "failed",
             "Email not verified",
             &requester,
+            user_agent.as_deref(),
             json!({ "identifier": identifier }),
         )
         .await;
@@ -682,6 +688,7 @@ pub async fn login(
             "failed",
             "Account pending approval",
             &requester,
+            user_agent.as_deref(),
             json!({ "identifier": identifier }),
         )
         .await;
@@ -705,6 +712,7 @@ pub async fn login(
             "failed",
             "Invalid credentials",
             &requester,
+            user_agent.as_deref(),
             json!({ "identifier": identifier, "userLocked": user_locked, "ipLocked": ip_locked }),
         )
         .await;
@@ -736,6 +744,10 @@ pub async fn login(
         user.try_get("license_expiry_date").ok();
     let address: Option<String> = user.try_get("address").ok();
     let profile_photo: Option<String> = user.try_get("profile_photo").ok();
+    let consent_accepted_at: Option<chrono::DateTime<chrono::Utc>> =
+        user.try_get("consent_accepted_at").ok();
+    let consent_version: Option<String> = user.try_get("consent_version").ok();
+    let legal_consent_accepted = consent_accepted_at.is_some();
 
     sqlx::query("UPDATE users SET last_seen_at = CURRENT_TIMESTAMP WHERE id = $1")
         .bind(&id)
@@ -746,8 +758,9 @@ pub async fn login(
     clear_login_failures(db.as_ref(), &[user_key, ip_key]).await?;
 
     // Generate JWT access + refresh tokens
-    let token = utils::generate_access_token(&id, &email, &role)?;
-    let refresh_token = utils::generate_refresh_token(&id, &email, &role)?;
+    let token = utils::generate_access_token(&id, &email, &role, legal_consent_accepted)?;
+    let refresh_token =
+        utils::generate_refresh_token(&id, &email, &role, legal_consent_accepted)?;
     let refresh_claims = utils::verify_refresh_token(&refresh_token)?;
 
     store_refresh_session(
@@ -767,6 +780,7 @@ pub async fn login(
         "success",
         "Login successful",
         &requester,
+        user_agent.as_deref(),
         json!({ "identifier": identifier }),
     )
     .await;
@@ -796,6 +810,9 @@ pub async fn login(
             "licenseExpiryDate": license_expiry_date,
             "address": address,
             "profilePhoto": profile_photo,
+            "consentAcceptedAt": consent_accepted_at,
+            "consentVersion": consent_version,
+            "legalConsentAccepted": legal_consent_accepted,
         }
     })))
 }
@@ -844,6 +861,7 @@ pub async fn refresh_token(
             "failed",
             "User is not active for token refresh",
             &requester,
+            user_agent.as_deref(),
             json!({ "jti": claims.jti }),
         )
         .await;
@@ -852,8 +870,18 @@ pub async fn refresh_token(
         ));
     }
 
-    let token = utils::generate_access_token(&claims.sub, &claims.email, &claims.role)?;
-    let refresh_token = utils::generate_refresh_token(&claims.sub, &claims.email, &claims.role)?;
+    let token = utils::generate_access_token(
+        &claims.sub,
+        &claims.email,
+        &claims.role,
+        claims.legal_consent_accepted,
+    )?;
+    let refresh_token = utils::generate_refresh_token(
+        &claims.sub,
+        &claims.email,
+        &claims.role,
+        claims.legal_consent_accepted,
+    )?;
     let new_claims = utils::verify_refresh_token(&refresh_token)?;
 
     rotate_refresh_session(
@@ -874,6 +902,7 @@ pub async fn refresh_token(
         "success",
         "Refresh token rotated successfully",
         &requester,
+        user_agent.as_deref(),
         json!({ "previousJti": claims.jti, "newJti": new_claims.jti }),
     )
     .await;
@@ -900,6 +929,7 @@ pub async fn logout(
     Json(payload): Json<RefreshTokenRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     let requester = utils::extract_requester(&headers);
+    let user_agent = extract_user_agent(&headers);
 
     if payload.refresh_token.trim().is_empty() {
         return Ok(Json(json!({ "message": "Logged out" })));
@@ -930,6 +960,7 @@ pub async fn logout(
                 "success",
                 "Refresh token revoked on logout",
                 &requester,
+                user_agent.as_deref(),
                 json!({ "jti": claims.jti }),
             )
             .await;
@@ -942,6 +973,7 @@ pub async fn logout(
                 "failed",
                 "Logout request included invalid refresh token",
                 &requester,
+                user_agent.as_deref(),
                 json!({}),
             )
             .await;

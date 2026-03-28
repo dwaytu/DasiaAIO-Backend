@@ -2,13 +2,33 @@ use axum::{body::Body, http::Request, middleware::Next, response::Response};
 
 use crate::{error::AppError, utils};
 
+fn is_legal_bootstrap_path(path: &str) -> bool {
+    path == "/api/logout"
+        || path == "/api/auth/logout"
+        || path == "/api/legal/consent"
+        || path == "/api/legal/consent/status"
+}
+
+fn enforce_legal_consent(path: &str, claims: &utils::TokenClaims) -> Result<(), AppError> {
+    if claims.legal_consent_accepted || is_legal_bootstrap_path(path) {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(
+        "Legal consent required. Please accept Terms of Agreement to continue.".to_string(),
+    ))
+}
+
 async fn authorize_permission(
     req: Request<Body>,
     next: Next,
     permission: &'static str,
 ) -> Result<Response, AppError> {
+    let path = req.uri().path().to_string();
     let token = utils::extract_bearer_token(req.headers())?;
     let claims = utils::verify_token(&token)?;
+
+    enforce_legal_consent(&path, &claims)?;
 
     if !utils::has_permission(&claims.role, permission) {
         return Err(AppError::Forbidden(format!(
@@ -21,8 +41,10 @@ async fn authorize_permission(
 }
 
 pub async fn require_authenticated(req: Request<Body>, next: Next) -> Result<Response, AppError> {
+    let path = req.uri().path().to_string();
     let token = utils::extract_bearer_token(req.headers())?;
-    let _claims = utils::verify_token(&token)?;
+    let claims = utils::verify_token(&token)?;
+    enforce_legal_consent(&path, &claims)?;
     Ok(next.run(req).await)
 }
 

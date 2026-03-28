@@ -53,6 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db::run_migrations(&db_pool).await?;
     tracing::info!("✓ Database migrations completed");
 
+    handlers::health::mark_started();
+
     let db = Arc::new(db_pool);
     let auth_rate_limiter = Arc::new(middleware::rate_limit::RateLimiter::from_env());
     let api_rate_limiter = Arc::new(middleware::rate_limit::RateLimiter::api_from_env());
@@ -343,6 +345,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(handlers::auth::logout).route_layer(axum_middleware::from_fn_with_state(
                 auth_rate_limiter.clone(),
                 middleware::rate_limit::auth_rate_limit,
+            )),
+        )
+        .route(
+            "/api/legal/consent",
+            post(handlers::legal::record_consent_acceptance).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_authenticated,
+            )),
+        )
+        .route(
+            "/api/legal/consent/status",
+            get(handlers::legal::get_consent_status).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_authenticated,
             )),
         )
         // User routes
@@ -1520,10 +1534,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Health check
         .route("/api/health", get(handlers::health::health_check))
         .route("/api/health/system", get(handlers::health::system_health))
-        .layer(cors_layer)
+        .route("/api/system/version", get(handlers::system::system_version))
         .layer(axum_middleware::from_fn_with_state(
             api_rate_limiter.clone(),
             middleware::rate_limit::api_rate_limit,
+        ))
+        .layer(axum_middleware::from_fn(
+            middleware::request_timeout::enforce_request_timeout,
         ))
         .layer(TraceLayer::new_for_http())
         .layer(axum_middleware::from_fn_with_state(
@@ -1531,6 +1548,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             middleware::presence::touch_last_seen,
         ))
         .layer(DefaultBodyLimit::max(1024 * 1024)) // 1MB limit
+        .layer(axum_middleware::from_fn(
+            middleware::security_headers::apply_security_headers,
+        ))
+        // Keep CORS as the outermost global layer so preflight and middleware errors
+        // still include CORS headers for browser clients.
+        .layer(cors_layer)
         .with_state(db);
 
     let listener =

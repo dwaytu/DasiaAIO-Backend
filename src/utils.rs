@@ -29,6 +29,8 @@ pub struct TokenClaims {
     pub sub: String, // user_id
     pub email: String,
     pub role: String,
+    #[serde(default)]
+    pub legal_consent_accepted: bool,
     pub exp: i64, // expiration time
     pub iat: i64, // issued at time
 }
@@ -38,6 +40,8 @@ pub struct RefreshTokenClaims {
     pub sub: String,
     pub email: String,
     pub role: String,
+    #[serde(default)]
+    pub legal_consent_accepted: bool,
     pub token_type: String,
     pub jti: String,
     pub exp: i64,
@@ -49,7 +53,12 @@ fn jwt_secret() -> String {
         .unwrap_or_else(|_| "your-secret-key-change-in-production".to_string())
 }
 
-pub fn generate_access_token(user_id: &str, email: &str, role: &str) -> AppResult<String> {
+pub fn generate_access_token(
+    user_id: &str,
+    email: &str,
+    role: &str,
+    legal_consent_accepted: bool,
+) -> AppResult<String> {
     let secret = jwt_secret();
     let expiry_hours = std::env::var("JWT_EXPIRY_HOURS")
         .ok()
@@ -61,6 +70,7 @@ pub fn generate_access_token(user_id: &str, email: &str, role: &str) -> AppResul
         sub: user_id.to_string(),
         email: email.to_string(),
         role: role.to_string(),
+        legal_consent_accepted,
         exp: (Utc::now() + Duration::hours(expiry_hours)).timestamp(),
         iat: Utc::now().timestamp(),
     };
@@ -73,11 +83,21 @@ pub fn generate_access_token(user_id: &str, email: &str, role: &str) -> AppResul
     .map_err(|e| AppError::InternalServerError(format!("Failed to generate token: {}", e)))
 }
 
-pub fn generate_token(user_id: &str, email: &str, role: &str) -> AppResult<String> {
-    generate_access_token(user_id, email, role)
+pub fn generate_token(
+    user_id: &str,
+    email: &str,
+    role: &str,
+    legal_consent_accepted: bool,
+) -> AppResult<String> {
+    generate_access_token(user_id, email, role, legal_consent_accepted)
 }
 
-pub fn generate_refresh_token(user_id: &str, email: &str, role: &str) -> AppResult<String> {
+pub fn generate_refresh_token(
+    user_id: &str,
+    email: &str,
+    role: &str,
+    legal_consent_accepted: bool,
+) -> AppResult<String> {
     let secret = jwt_secret();
     let refresh_hours = std::env::var("JWT_REFRESH_EXPIRY_HOURS")
         .ok()
@@ -89,6 +109,7 @@ pub fn generate_refresh_token(user_id: &str, email: &str, role: &str) -> AppResu
         sub: user_id.to_string(),
         email: email.to_string(),
         role: role.to_string(),
+        legal_consent_accepted,
         token_type: "refresh".to_string(),
         jti: uuid::Uuid::new_v4().to_string(),
         exp: (Utc::now() + Duration::hours(refresh_hours)).timestamp(),

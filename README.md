@@ -34,6 +34,9 @@ Production hardening note:
 	- `JWT_SECRET` must be set to a strong secret (32+ chars)
 	- `ADMIN_CODE` must not use default `122601`
 	- `CORS_ORIGINS` or `CORS_ORIGIN` must be configured
+- Security middleware now applies production headers (`X-Content-Type-Options`, `X-Frame-Options`, `Content-Security-Policy`, and HSTS in production).
+- Global request timeout middleware protects against long-hanging requests (`REQUEST_TIMEOUT_SECS`, default 30s).
+- Container runtime now uses least privilege (`USER sentinel`) and build reproducibility via `Cargo.lock` + `cargo build --locked` in `Dockerfile`.
 
 `ADMIN_CODE` remains for compatibility, while public registration flow is guard self-registration with approval.
 
@@ -81,6 +84,8 @@ cargo test
 Primary health endpoint:
 
 - `GET /api/health`
+- `GET /api/health/system`
+- `GET /api/system/version`
 
 ## Role Hierarchy
 
