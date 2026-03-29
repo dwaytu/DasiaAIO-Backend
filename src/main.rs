@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load environment variables
     dotenv::dotenv().ok();
     let config = config::Config::from_env()?;
+    let is_production = matches!(config.app_env.as_str(), "production" | "prod");
 
     // Initialize database pool
     let db_pool = db::init_db_pool(&config.database_url).await?;
@@ -88,7 +89,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cors_layer = if !parsed_cors_origins.is_empty() {
         let configured_origin_count = parsed_cors_origins.len();
         let mut effective_origins = parsed_cors_origins;
-        effective_origins.extend(local_dev_web_origins());
+        if !is_production {
+            effective_origins.extend(local_dev_web_origins());
+        }
         effective_origins.extend(native_wrapper_origins());
         tracing::info!(
             count = configured_origin_count,
@@ -114,31 +117,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if let Ok(origin) = std::env::var("CORS_ORIGIN") {
         tracing::info!("CORS restricted to origin: {}", origin);
         match origin.parse::<HeaderValue>() {
-            Ok(origin_header) => CorsLayer::new()
-                .allow_origin(AllowOrigin::list([
-                    origin_header,
-                    HeaderValue::from_static("http://localhost:5173"),
-                    HeaderValue::from_static("http://127.0.0.1:5173"),
-                    HeaderValue::from_static("capacitor://localhost"),
-                    HeaderValue::from_static("tauri://localhost"),
-                    HeaderValue::from_static("http://localhost"),
-                    HeaderValue::from_static("https://localhost"),
-                ]))
-                .allow_methods([
-                    Method::GET,
-                    Method::POST,
-                    Method::PUT,
-                    Method::PATCH,
-                    Method::DELETE,
-                    Method::OPTIONS,
-                ])
-                .allow_headers([
-                    header::AUTHORIZATION,
-                    header::CONTENT_TYPE,
-                    header::ACCEPT,
-                    header::ORIGIN,
-                ])
-                .max_age(std::time::Duration::from_secs(3600)),
+            Ok(origin_header) => {
+                let mut effective_origins = vec![origin_header];
+                if !is_production {
+                    effective_origins.extend(local_dev_web_origins());
+                }
+                effective_origins.extend(native_wrapper_origins());
+
+                CorsLayer::new()
+                    .allow_origin(AllowOrigin::list(effective_origins))
+                    .allow_methods([
+                        Method::GET,
+                        Method::POST,
+                        Method::PUT,
+                        Method::PATCH,
+                        Method::DELETE,
+                        Method::OPTIONS,
+                    ])
+                    .allow_headers([
+                        header::AUTHORIZATION,
+                        header::CONTENT_TYPE,
+                        header::ACCEPT,
+                        header::ORIGIN,
+                    ])
+                    .max_age(std::time::Duration::from_secs(3600))
+            }
             Err(_) => {
                 tracing::warn!("Invalid CORS_ORIGIN value. Falling back to localhost allow-list.");
                 CorsLayer::new()
@@ -153,9 +156,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         HeaderValue::from_static("https://localhost"),
                         HeaderValue::from_static("capacitor://localhost"),
                         HeaderValue::from_static("tauri://localhost"),
-                        HeaderValue::from_static("https://dasiasentinel.xyz"),
-                        HeaderValue::from_static("https://www.dasiasentinel.xyz"),
-                        HeaderValue::from_static("https://dasiaaio.up.railway.app"),
                     ]))
                     .allow_methods([
                         Method::GET,
@@ -188,9 +188,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 HeaderValue::from_static("https://localhost"),
                 HeaderValue::from_static("capacitor://localhost"),
                 HeaderValue::from_static("tauri://localhost"),
-                HeaderValue::from_static("https://dasiasentinel.xyz"),
-                HeaderValue::from_static("https://www.dasiasentinel.xyz"),
-                HeaderValue::from_static("https://dasiaaio.up.railway.app"),
             ]))
             .allow_methods([
                 Method::GET,

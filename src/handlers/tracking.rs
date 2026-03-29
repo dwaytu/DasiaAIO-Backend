@@ -81,7 +81,36 @@ fn vehicle_recency_minutes() -> i64 {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrackingWsAuthQuery {
-    pub token: String,
+    pub token: Option<String>,
+}
+
+fn extract_ws_token_from_protocols(headers: &HeaderMap) -> Option<String> {
+    let protocols = headers
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())?;
+
+    for protocol in protocols.split(',').map(|value| value.trim()) {
+        if let Some(token) = protocol.strip_prefix("bearer.") {
+            if !token.trim().is_empty() {
+                return Some(token.trim().to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn has_requested_ws_protocol(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get("sec-websocket-protocol")
+        .and_then(|value| value.to_str().ok())
+        .map(|protocols| {
+            protocols
+                .split(',')
+                .map(|value| value.trim())
+                .any(|value| value.eq_ignore_ascii_case(expected))
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1935,17 +1964,26 @@ pub async fn create_tracking_point(
 
 pub async fn tracking_ws(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Query(query): Query<TrackingWsAuthQuery>,
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
-    if query.token.trim().is_empty() {
-        tracing::warn!("Rejected tracking websocket upgrade due to missing token");
-        return Err(AppError::Unauthorized(
-            "Missing websocket token".to_string(),
-        ));
-    }
+    let protocol_token = extract_ws_token_from_protocols(&headers);
+    let query_token = query
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
 
-    let claims = match utils::verify_token(query.token.trim()) {
+    let token = protocol_token.or(query_token).ok_or_else(|| {
+        tracing::warn!("Rejected tracking websocket upgrade due to missing token");
+        AppError::Unauthorized(
+            "Missing websocket token".to_string(),
+        )
+    })?;
+
+    let claims = match utils::verify_token(token.trim()) {
         Ok(claims) => claims,
         Err(error) => {
             tracing::warn!(error = %error, "Rejected tracking websocket upgrade due to invalid token");
@@ -1953,7 +1991,20 @@ pub async fn tracking_ws(
         }
     };
 
+    if !claims.legal_consent_accepted {
+        tracing::warn!(user_id = %claims.sub, "Rejected tracking websocket upgrade due to missing legal consent");
+        return Err(AppError::Forbidden(
+            "Legal consent required. Please accept Terms of Agreement to continue.".to_string(),
+        ));
+    }
+
     tracing::debug!(user_id = %claims.sub, role = %claims.role, "Tracking websocket upgrade accepted");
 
-    Ok(ws.on_upgrade(move |socket| handle_tracking_ws(socket, db, claims)))
+    let ws_upgrade = if has_requested_ws_protocol(&headers, "sentinel-tracking-v1") {
+        ws.protocols(["sentinel-tracking-v1"])
+    } else {
+        ws
+    };
+
+    Ok(ws_upgrade.on_upgrade(move |socket| handle_tracking_ws(socket, db, claims)))
 }

@@ -1202,7 +1202,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         CREATE TABLE IF NOT EXISTS password_reset_tokens (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             user_id VARCHAR(36) NOT NULL,
-            token VARCHAR(6) NOT NULL UNIQUE,
+            token VARCHAR(128) NOT NULL UNIQUE,
             expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
             is_used BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -1218,6 +1218,17 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             e
         ))
     })?;
+
+    // Expand token column to support hashed reset codes in upgraded databases.
+    sqlx::query("ALTER TABLE password_reset_tokens ALTER COLUMN token TYPE VARCHAR(128)")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!(
+                "Failed to widen password_reset_tokens.token column: {}",
+                e
+            ))
+        })?;
 
     // Create distributed login-attempt lockout table.
     sqlx::query(
