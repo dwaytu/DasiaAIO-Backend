@@ -2,6 +2,10 @@ use axum::{body::Body, http::Request, middleware::Next, response::Response};
 
 use crate::{error::AppError, utils};
 
+fn log_denied_access(path: &str, role: &str, reason: &str) {
+    tracing::warn!(path = %path, role = %role, reason = %reason, "authorization denied");
+}
+
 fn is_legal_bootstrap_path(path: &str) -> bool {
     path == "/api/logout"
         || path == "/api/auth/logout"
@@ -31,6 +35,11 @@ async fn authorize_permission(
     enforce_legal_consent(&path, &claims)?;
 
     if !utils::has_permission(&claims.role, permission) {
+        log_denied_access(
+            &path,
+            &utils::normalize_role(&claims.role),
+            &format!("missing permission {}", permission),
+        );
         return Err(AppError::Forbidden(format!(
             "Missing required permission: {}",
             permission
@@ -45,6 +54,40 @@ pub async fn require_authenticated(req: Request<Body>, next: Next) -> Result<Res
     let token = utils::extract_bearer_token(req.headers())?;
     let claims = utils::verify_token(&token)?;
     enforce_legal_consent(&path, &claims)?;
+    Ok(next.run(req).await)
+}
+
+pub async fn require_superadmin(req: Request<Body>, next: Next) -> Result<Response, AppError> {
+    let path = req.uri().path().to_string();
+    let token = utils::extract_bearer_token(req.headers())?;
+    let claims = utils::verify_token(&token)?;
+    enforce_legal_consent(&path, &claims)?;
+
+    let role = utils::normalize_role(&claims.role);
+    if role != "superadmin" {
+        log_denied_access(&path, &role, "superadmin role required");
+        return Err(AppError::Forbidden(
+            "This endpoint is restricted to superadmin accounts".to_string(),
+        ));
+    }
+
+    Ok(next.run(req).await)
+}
+
+pub async fn require_tracking_access(req: Request<Body>, next: Next) -> Result<Response, AppError> {
+    let path = req.uri().path().to_string();
+    let token = utils::extract_bearer_token(req.headers())?;
+    let claims = utils::verify_token(&token)?;
+    enforce_legal_consent(&path, &claims)?;
+
+    let role = utils::normalize_role(&claims.role);
+    if role != "supervisor" && role != "guard" {
+        log_denied_access(&path, &role, "tracking scope requires supervisor or guard role");
+        return Err(AppError::Forbidden(
+            "Tracking endpoints are limited to supervisor and guard roles".to_string(),
+        ));
+    }
+
     Ok(next.run(req).await)
 }
 

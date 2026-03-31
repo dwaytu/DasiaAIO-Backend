@@ -1227,31 +1227,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/audit-logs",
             get(handlers::audit::get_audit_logs).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_authenticated,
+                middleware::authz::require_superadmin,
             )),
         )
         .route(
             "/api/audit/logs",
             get(handlers::audit::get_audit_logs).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_authenticated,
+                middleware::authz::require_superadmin,
             )),
         )
         .route(
             "/api/audit/logs/filter",
             get(handlers::audit::get_audit_logs_filtered).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_authenticated,
+                middleware::authz::require_superadmin,
             )),
         )
         .route(
             "/api/audit/user-activity/:id",
             get(handlers::audit::get_user_activity).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_authenticated,
+                middleware::authz::require_superadmin,
             )),
         )
         .route(
             "/api/audit/anomalies",
             get(handlers::audit::get_audit_anomalies).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_authenticated,
+                middleware::authz::require_superadmin,
             )),
         )
         // Analytics routes
@@ -1354,21 +1354,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/tracking/map-data",
             get(handlers::tracking::get_map_data).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_authenticated,
+                middleware::authz::require_tracking_access,
             )),
         )
         .route("/api/tracking/ws", get(handlers::tracking::tracking_ws))
         .route(
             "/api/tracking/client-sites",
             get(handlers::tracking::get_client_sites).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_authenticated,
+                middleware::authz::require_tracking_access,
             )),
         )
         .route(
             "/api/tracking/client-sites",
             post(handlers::tracking::create_client_site)
                 .route_layer(axum_middleware::from_fn(
-                    middleware::authz::require_authenticated,
+                    middleware::authz::require_tracking_access,
                 ))
                 .route_layer(axum_middleware::from_fn_with_state(
                     db.clone(),
@@ -1379,7 +1379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/tracking/client-sites/:id",
             put(handlers::tracking::update_client_site)
                 .route_layer(axum_middleware::from_fn(
-                    middleware::authz::require_authenticated,
+                    middleware::authz::require_tracking_access,
                 ))
                 .route_layer(axum_middleware::from_fn_with_state(
                     db.clone(),
@@ -1390,7 +1390,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/tracking/client-sites/:id",
             delete(handlers::tracking::delete_client_site)
                 .route_layer(axum_middleware::from_fn(
-                    middleware::authz::require_authenticated,
+                    middleware::authz::require_tracking_access,
                 ))
                 .route_layer(axum_middleware::from_fn_with_state(
                     db.clone(),
@@ -1400,20 +1400,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/tracking/geofences",
             get(handlers::tracking::get_geofence_zones).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_authenticated,
+                middleware::authz::require_tracking_access,
             )),
         )
         .route(
             "/api/tracking/client-sites/:id/geofences",
             get(handlers::tracking::get_site_geofences).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_authenticated,
+                middleware::authz::require_tracking_access,
             )),
         )
         .route(
             "/api/tracking/client-sites/:id/geofences",
             post(handlers::tracking::create_site_geofence)
                 .route_layer(axum_middleware::from_fn(
-                    middleware::authz::require_authenticated,
+                    middleware::authz::require_tracking_access,
                 ))
                 .route_layer(axum_middleware::from_fn_with_state(
                     db.clone(),
@@ -1424,7 +1424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/tracking/geofences/:id",
             put(handlers::tracking::update_geofence_zone)
                 .route_layer(axum_middleware::from_fn(
-                    middleware::authz::require_authenticated,
+                    middleware::authz::require_tracking_access,
                 ))
                 .route_layer(axum_middleware::from_fn_with_state(
                     db.clone(),
@@ -1435,7 +1435,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/tracking/geofences/:id",
             delete(handlers::tracking::delete_geofence_zone)
                 .route_layer(axum_middleware::from_fn(
-                    middleware::authz::require_authenticated,
+                    middleware::authz::require_tracking_access,
                 ))
                 .route_layer(axum_middleware::from_fn_with_state(
                     db.clone(),
@@ -1446,7 +1446,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/tracking/heartbeat",
             post(handlers::tracking::guard_heartbeat)
                 .route_layer(axum_middleware::from_fn(
-                    middleware::authz::require_authenticated,
+                    middleware::authz::require_tracking_access,
                 ))
                 .route_layer(axum_middleware::from_fn_with_state(
                     db.clone(),
@@ -1457,7 +1457,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/tracking/points",
             post(handlers::tracking::create_tracking_point)
                 .route_layer(axum_middleware::from_fn(
-                    middleware::authz::require_authenticated,
+                    middleware::authz::require_tracking_access,
                 ))
                 .route_layer(axum_middleware::from_fn_with_state(
                     db.clone(),
@@ -1467,26 +1467,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/tracking/guard-history/:id",
             get(handlers::tracking::get_guard_history).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_authenticated,
+                middleware::authz::require_tracking_access,
             )),
         )
         .route(
             "/api/tracking/guard-path/:id",
             get(handlers::tracking::get_guard_path).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_authenticated,
+                middleware::authz::require_tracking_access,
             )),
         )
         .route(
             "/api/tracking/active-guards",
             get(handlers::tracking::get_active_guards).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_authenticated,
+                middleware::authz::require_tracking_access,
             )),
         )
         .route(
             "/api/tracking/proximity-alerts/check",
             post(handlers::tracking::check_shift_proximity_alerts)
                 .route_layer(axum_middleware::from_fn(
-                    middleware::authz::require_authenticated,
+                    middleware::authz::require_tracking_access,
                 ))
                 .route_layer(axum_middleware::from_fn_with_state(
                     db.clone(),
@@ -1540,6 +1540,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             middleware::request_timeout::enforce_request_timeout,
         ))
         .layer(TraceLayer::new_for_http())
+        .layer(axum_middleware::from_fn_with_state(
+            db.clone(),
+            middleware::audit::audit_authz_failures,
+        ))
         .layer(axum_middleware::from_fn_with_state(
             db.clone(),
             middleware::presence::touch_last_seen,

@@ -76,8 +76,7 @@ pub async fn get_audit_logs(
     headers: HeaderMap,
     Query(params): Query<AuditLogQuery>,
 ) -> AppResult<Json<AuditLogListResponse>> {
-    // Only admins and superadmins should see audit logs
-    utils::require_min_role(&headers, "admin")?;
+    utils::require_min_role(&headers, "superadmin")?;
 
     let page = params.page.unwrap_or(1).max(1);
     let page_size = params.page_size.unwrap_or(25).clamp(1, 100);
@@ -153,7 +152,7 @@ pub async fn get_user_activity(
     Path(user_id): Path<String>,
     Query(params): Query<UserActivityQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    utils::require_min_role(&headers, "admin")?;
+    utils::require_min_role(&headers, "superadmin")?;
 
     let window_hours = params.window_hours.unwrap_or(72).clamp(1, 720);
     let limit = params.limit.unwrap_or(300).clamp(20, 1500);
@@ -248,7 +247,7 @@ pub async fn get_audit_anomalies(
     headers: HeaderMap,
     Query(params): Query<AuditAnomalyQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    utils::require_min_role(&headers, "admin")?;
+    utils::require_min_role(&headers, "superadmin")?;
 
     let window_hours = params.window_hours.unwrap_or(24).clamp(1, 168);
 
