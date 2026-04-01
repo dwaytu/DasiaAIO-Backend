@@ -372,14 +372,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/users/pending-approvals",
             get(handlers::users::get_pending_guard_approvals).route_layer(
-                axum_middleware::from_fn(middleware::authz::require_manage_users),
+                axum_middleware::from_fn(middleware::authz::require_guard_approval_management),
             ),
         )
         .route(
             "/api/users/:id/approval",
             put(handlers::users::update_guard_approval_status)
                 .route_layer(axum_middleware::from_fn(
-                    middleware::authz::require_manage_users,
+                    middleware::authz::require_guard_approval_management,
                 ))
                 .route_layer(axum_middleware::from_fn_with_state(
                     db.clone(),

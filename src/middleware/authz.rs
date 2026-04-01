@@ -95,6 +95,13 @@ pub async fn require_manage_users(req: Request<Body>, next: Next) -> Result<Resp
     authorize_permission(req, next, "create_user").await
 }
 
+pub async fn require_guard_approval_management(
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    authorize_permission(req, next, "approve_guard_registration").await
+}
+
 pub async fn require_firearm_management(
     req: Request<Body>,
     next: Next,
