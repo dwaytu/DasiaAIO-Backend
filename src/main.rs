@@ -868,7 +868,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/guard-firearm-permits/:guard_id",
             get(handlers::permits::get_guard_permits).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_firearm_management,
+                middleware::authz::require_authenticated,
             )),
         )
         // Firearm maintenance routes (Requirement 3)
