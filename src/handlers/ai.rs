@@ -66,6 +66,8 @@ fn confidence_from_severity(severity: &str) -> f64 {
     }
 }
 
+
+
 fn suggested_actions_from_severity(severity: &str) -> Vec<String> {
     match severity.to_lowercase().as_str() {
         "critical" => vec![
@@ -164,15 +166,20 @@ pub async fn classify_incident(
         normalized_description.to_string()
     };
 
-    let severity = incident_ai_classifier::classify_incident(&merged_text);
-    let confidence = confidence_from_severity(&severity);
-    let explanation = explanation_from_context(&merged_text, &severity);
-    let suggested_actions = suggested_actions_from_severity(&severity);
+    let result = incident_ai_classifier::classify_incident_smart(&merged_text).await;
+    let explanation = format!(
+        "Severity '{}' classified via {} with {:.0}% confidence based on incident wording and {} contextual token(s).",
+        result.severity,
+        result.source,
+        result.confidence * 100.0,
+        merged_text.split_whitespace().filter(|t| t.len() >= 5).count()
+    );
+    let suggested_actions = suggested_actions_from_severity(&result.severity);
 
     Ok(Json(ClassifyIncidentResponse {
-        risk_level: severity.clone(),
-        severity,
-        confidence,
+        risk_level: result.severity.clone(),
+        severity: result.severity,
+        confidence: result.confidence,
         explanation,
         suggested_actions,
     }))

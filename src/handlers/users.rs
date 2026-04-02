@@ -194,7 +194,7 @@ pub async fn get_guards(
                   license_number, license_issued_date, license_expiry_date, address,
                   profile_photo, verified, last_seen_at, created_at, updated_at
            FROM users
-           WHERE LOWER(role) IN ('guard', 'user')
+           WHERE LOWER(role) = 'guard'
              AND COALESCE(approval_status, 'approved') = 'approved'
            ORDER BY full_name ASC"#,
     )

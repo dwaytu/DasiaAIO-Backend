@@ -15,6 +15,7 @@ pub mod merit;
 pub mod missions;
 pub mod notifications;
 pub mod permits;
+pub mod shift_swap;
 pub mod support_tickets;
 pub mod system;
 pub mod tracking;

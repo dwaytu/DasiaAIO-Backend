@@ -48,9 +48,18 @@ pub struct RefreshTokenClaims {
     pub iat: i64,
 }
 
-fn jwt_secret() -> String {
-    std::env::var("JWT_SECRET")
-        .unwrap_or_else(|_| "your-secret-key-change-in-production".to_string())
+fn jwt_secret() -> AppResult<String> {
+    let secret = std::env::var("JWT_SECRET")
+        .map(|value| value.trim().to_string())
+        .map_err(|_| AppError::InternalServerError("JWT_SECRET must be set".to_string()))?;
+
+    if secret.is_empty() {
+        return Err(AppError::InternalServerError(
+            "JWT_SECRET must not be empty".to_string(),
+        ));
+    }
+
+    Ok(secret)
 }
 
 pub fn generate_access_token(
@@ -59,7 +68,7 @@ pub fn generate_access_token(
     role: &str,
     legal_consent_accepted: bool,
 ) -> AppResult<String> {
-    let secret = jwt_secret();
+    let secret = jwt_secret()?;
     let expiry_hours = std::env::var("JWT_EXPIRY_HOURS")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
@@ -98,7 +107,7 @@ pub fn generate_refresh_token(
     role: &str,
     legal_consent_accepted: bool,
 ) -> AppResult<String> {
-    let secret = jwt_secret();
+    let secret = jwt_secret()?;
     let refresh_hours = std::env::var("JWT_REFRESH_EXPIRY_HOURS")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
@@ -125,7 +134,7 @@ pub fn generate_refresh_token(
 }
 
 pub fn verify_token(token: &str) -> AppResult<TokenClaims> {
-    let secret = jwt_secret();
+    let secret = jwt_secret()?;
 
     decode::<TokenClaims>(
         token,
@@ -137,7 +146,7 @@ pub fn verify_token(token: &str) -> AppResult<TokenClaims> {
 }
 
 pub fn verify_refresh_token(token: &str) -> AppResult<RefreshTokenClaims> {
-    let secret = jwt_secret();
+    let secret = jwt_secret()?;
 
     let claims = decode::<RefreshTokenClaims>(
         token,
@@ -198,12 +207,7 @@ pub fn extract_requester(headers: &HeaderMap) -> String {
 }
 
 pub fn normalize_role(role: &str) -> String {
-    let normalized = role.to_lowercase();
-    if normalized == "user" {
-        "guard".to_string()
-    } else {
-        normalized
-    }
+    role.trim().to_lowercase()
 }
 
 pub fn role_rank(role: &str) -> Option<u8> {

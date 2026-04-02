@@ -1,14 +1,18 @@
 use crate::error::{AppError, AppResult};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
-pub async fn init_db_pool(database_url: &str) -> AppResult<PgPool> {
+pub async fn init_db_pool(
+    database_url: &str,
+    max_connections: u32,
+    acquire_timeout_secs: u32,
+) -> AppResult<PgPool> {
     const MAX_RETRIES: u32 = 10;
     const RETRY_DELAY_SECS: u64 = 5;
 
     for attempt in 1..=MAX_RETRIES {
         match PgPoolOptions::new()
-            .max_connections(10)
-            .acquire_timeout(std::time::Duration::from_secs(30))
+            .max_connections(max_connections)
+            .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs as u64))
             .connect(database_url)
             .await
         {
@@ -868,6 +872,44 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         AppError::DatabaseError(format!("Failed to create guard_availability table: {}", e))
     })?;
 
+    // Create guard_shift_swaps table
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS guard_shift_swaps (
+            id VARCHAR(36) PRIMARY KEY,
+            requester_id VARCHAR(36) NOT NULL,
+            target_id VARCHAR(36) NOT NULL,
+            shift_id VARCHAR(36) NOT NULL,
+            reason TEXT,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            responded_at TIMESTAMP WITH TIME ZONE,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (requester_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (target_id) REFERENCES users(id) ON DELETE CASCADE,
+            CONSTRAINT guard_shift_swaps_status_check CHECK (status IN ('pending', 'accepted', 'declined'))
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create guard_shift_swaps table: {}", e))
+    })?;
+
+    for swap_index in &[
+        "CREATE INDEX IF NOT EXISTS idx_shift_swaps_requester ON guard_shift_swaps(requester_id)",
+        "CREATE INDEX IF NOT EXISTS idx_shift_swaps_target ON guard_shift_swaps(target_id)",
+        "CREATE INDEX IF NOT EXISTS idx_shift_swaps_status ON guard_shift_swaps(status)",
+    ] {
+        sqlx::query(swap_index)
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                AppError::DatabaseError(format!("Failed to create shift swap index: {}", e))
+            })?;
+    }
+
     // Create guard_merit_scores table
     sqlx::query(
         r#"
@@ -1341,6 +1383,34 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             .await
             .map_err(|e| AppError::DatabaseError(format!("Failed to create index: {}", e)))?;
     }
+
+    // Create push_subscriptions table for web push notifications
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS push_subscriptions (
+            id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            endpoint TEXT NOT NULL,
+            p256dh TEXT NOT NULL,
+            auth TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT push_subscriptions_user_endpoint_unique UNIQUE (user_id, endpoint)
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create push_subscriptions table: {}", e))
+    })?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user_id ON push_subscriptions(user_id)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create push_subscriptions index: {}", e))
+    })?;
 
     Ok(())
 }

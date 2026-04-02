@@ -29,11 +29,10 @@ pub async fn audit_authz_failures(
     let response = next.run(req).await;
 
     let status_code = response.status().as_u16();
-    let is_write = matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
     let is_authz_failure = status_code == 401 || status_code == 403;
     let is_api_request = path.starts_with("/api/");
 
-    if !is_write && is_api_request && is_authz_failure {
+    if is_api_request && is_authz_failure {
         let action_key = format!("AUTHZ_DENIED {} {}", method, path);
 
         if let Err(err) = sqlx::query(

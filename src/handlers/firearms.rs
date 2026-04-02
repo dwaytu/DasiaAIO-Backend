@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -51,15 +51,32 @@ pub async fn add_firearm(
     ))
 }
 
-pub async fn get_all_firearms(State(db): State<Arc<PgPool>>) -> AppResult<Json<Vec<Firearm>>> {
+pub async fn get_all_firearms(
+    State(db): State<Arc<PgPool>>,
+    Query(pagination): Query<utils::PaginationQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    let (page, page_size, offset) = utils::resolve_pagination(pagination, 50, 200);
+
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM firearms")
+        .fetch_one(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+
     let firearms = sqlx::query_as::<_, Firearm>(
-        "SELECT id, name, serial_number, model, caliber, status, created_at, updated_at FROM firearms"
+        "SELECT id, name, serial_number, model, caliber, status, created_at, updated_at FROM firearms ORDER BY created_at DESC LIMIT $1 OFFSET $2"
     )
+    .bind(page_size)
+    .bind(offset)
     .fetch_all(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
-    Ok(Json(firearms))
+    Ok(Json(json!({
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+        "firearms": firearms
+    })))
 }
 
 pub async fn get_firearm_by_id(

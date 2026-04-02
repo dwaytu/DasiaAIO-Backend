@@ -1,3 +1,4 @@
+pub mod geofence_alert_service;
 pub mod guard_prediction_service;
 pub mod incident_ai_classifier;
 pub mod incident_summary_service;

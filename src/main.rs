@@ -47,7 +47,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let is_production = matches!(config.app_env.as_str(), "production" | "prod");
 
     // Initialize database pool
-    let db_pool = db::init_db_pool(&config.database_url).await?;
+    let db_pool = db::init_db_pool(
+        &config.database_url,
+        config.db_pool_max_connections,
+        config.db_pool_acquire_timeout_secs,
+    )
+    .await?;
     tracing::info!("✓ Connected to PostgreSQL");
 
     // Run migrations
@@ -801,6 +806,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     middleware::audit::audit_write_requests,
                 )),
         )
+        .route(
+            "/api/notifications/push-subscribe",
+            post(handlers::notifications::push_subscribe)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_authenticated,
+                )),
+        )
         // Mission assignment routes (Integrated Workflow)
         .route(
             "/api/missions/assign",
@@ -818,6 +830,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(handlers::missions::get_missions).route_layer(axum_middleware::from_fn(
                 middleware::authz::require_mission_management,
             )),
+        )
+        // Guard shift swap routes
+        .route(
+            "/api/shifts/swap-request",
+            post(handlers::shift_swap::create_swap_request).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_authenticated),
+            ),
+        )
+        .route(
+            "/api/shifts/swap-requests",
+            get(handlers::shift_swap::list_swap_requests).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_authenticated),
+            ),
+        )
+        .route(
+            "/api/shifts/swap-requests/:id/respond",
+            axum::routing::patch(handlers::shift_swap::respond_to_swap).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_authenticated),
+            ),
         )
         // Guard permits routes
         .route(
@@ -1555,7 +1586,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Keep CORS as the outermost global layer so preflight and middleware errors
         // still include CORS headers for browser clients.
         .layer(cors_layer)
-        .with_state(db);
+        .with_state(db.clone());
+
+    // Spawn geofence proactive-alert background task.
+    let geofence_pool = db.clone();
+    tokio::spawn(async move {
+        services::geofence_alert_service::run_geofence_alert_loop(geofence_pool).await;
+    });
 
     let listener =
         tokio::net::TcpListener::bind(format!("{}:{}", config.server_host, config.server_port))

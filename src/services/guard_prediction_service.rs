@@ -185,9 +185,22 @@ pub async fn calculate_absence_risk(
 
     let recent_leave_requests = leave_unavailable + leave_tickets;
 
-    let raw_score = (previous_absences as f64 * 0.5)
-        + (late_checkins as f64 * 0.3)
-        + (recent_leave_requests as f64 * 0.2);
+    let w_absences = std::env::var("ABSENCE_WEIGHT_ABSENCES")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.5);
+    let w_late = std::env::var("ABSENCE_WEIGHT_LATE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.3);
+    let w_leave = std::env::var("ABSENCE_WEIGHT_LEAVE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.2);
+
+    let raw_score = (previous_absences as f64 * w_absences)
+        + (late_checkins as f64 * w_late)
+        + (recent_leave_requests as f64 * w_leave);
 
     let risk_level = if raw_score < 1.0 {
         "LOW"
@@ -205,7 +218,7 @@ pub async fn calculate_absence_risk(
         previous_absences,
         late_checkins,
         recent_leave_requests,
-        formula: "AbsenceRisk = (previous_absences * 0.5) + (late_checkins * 0.3) + (recent_leave_requests * 0.2)".to_string(),
+        formula: format!("AbsenceRisk = (previous_absences * {w_absences}) + (late_checkins * {w_late}) + (recent_leave_requests * {w_leave})"),
         calculated_at: Utc::now(),
     })
 }

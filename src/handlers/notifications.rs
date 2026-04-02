@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use serde::Deserialize;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -13,6 +14,13 @@ use crate::{
     models::{CreateNotificationRequest, Notification},
     utils,
 };
+
+#[derive(Deserialize)]
+pub struct PushSubscribeRequest {
+    #[serde(rename = "userId")]
+    pub user_id: String,
+    pub subscription: serde_json::Value,
+}
 
 // Get all notifications for a user
 pub async fn get_user_notifications(
@@ -188,4 +196,59 @@ pub async fn delete_notification(
     Ok(Json(json!({
         "message": "Notification deleted successfully"
     })))
+}
+
+// Store a WebPush subscription for a user
+pub async fn push_subscribe(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Json(payload): Json<PushSubscribeRequest>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let _claims = utils::require_self_or_min_role(&headers, &payload.user_id, "guard")?;
+
+    let endpoint = payload
+        .subscription
+        .get("endpoint")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("subscription.endpoint is required".to_string()))?
+        .to_string();
+
+    let p256dh = payload
+        .subscription
+        .pointer("/keys/p256dh")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("subscription.keys.p256dh is required".to_string()))?
+        .to_string();
+
+    let auth = payload
+        .subscription
+        .pointer("/keys/auth")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("subscription.keys.auth is required".to_string()))?
+        .to_string();
+
+    let id = uuid::Uuid::new_v4().to_string();
+
+    // Upsert — update keys if the same user+endpoint re-subscribes
+    sqlx::query(
+        "INSERT INTO push_subscriptions (id, user_id, endpoint, p256dh, auth)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (user_id, endpoint) DO UPDATE
+         SET p256dh = EXCLUDED.p256dh,
+             auth   = EXCLUDED.auth,
+             updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(&id)
+    .bind(&payload.user_id)
+    .bind(&endpoint)
+    .bind(&p256dh)
+    .bind(&auth)
+    .execute(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to save push subscription: {}", e)))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "message": "Push subscription saved" })),
+    ))
 }
