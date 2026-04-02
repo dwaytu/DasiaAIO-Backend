@@ -8,16 +8,16 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Cloudyrowdyyy/DasiaAIO-Backend.git"
+    "url": "git+https://github.com/dwaytu/DasiaAIO-Backend.git"
   },
   "keywords": [],
   "author": "",
   "license": "UNLICENSED",
   "type": "commonjs",
   "bugs": {
-    "url": "https://github.com/Cloudyrowdyyy/DasiaAIO-Backend/issues"
+    "url": "https://github.com/dwaytu/DasiaAIO-Backend/issues"
   },
-  "homepage": "https://github.com/Cloudyrowdyyy/DasiaAIO-Backend#readme",
+  "homepage": "https://github.com/dwaytu/DasiaAIO-Backend#readme",
   "dependencies": {
     "bcryptjs": "^3.0.3",
     "pg": "^8.18.0"

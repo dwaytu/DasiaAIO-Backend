@@ -18,15 +18,15 @@ pub async fn system_version() -> Json<serde_json::Value> {
 
     let web_download = env_or_default(
         "WEB_DOWNLOAD_URL",
-        "https://github.com/Cloudyrowdyyy/Capstone-Main/releases/latest",
+        "https://github.com/dwaytu/Capstone-Main/releases/latest",
     );
     let desktop_download = env_or_default(
         "DESKTOP_DOWNLOAD_URL",
-        "https://github.com/Cloudyrowdyyy/Capstone-Main/releases/latest",
+        "https://github.com/dwaytu/Capstone-Main/releases/latest",
     );
     let mobile_download = env_or_default(
         "MOBILE_DOWNLOAD_URL",
-        "https://github.com/Cloudyrowdyyy/Capstone-Main/releases/latest",
+        "https://github.com/dwaytu/Capstone-Main/releases/latest",
     );
 
     Json(json!({
