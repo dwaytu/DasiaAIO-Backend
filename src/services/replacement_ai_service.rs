@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+﻿use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::json;
 use sqlx::{FromRow, PgPool};
@@ -217,7 +217,7 @@ pub async fn suggest_replacement(
         LEFT JOIN guard_availability ga ON ga.guard_id = u.id
         LEFT JOIN latest_guard_position lgp ON lgp.guard_id = u.id
         LEFT JOIN guard_conflicts gc ON gc.guard_id = u.id
-        WHERE u.role IN ('guard', 'user')
+        WHERE u.role IN ('guard')
           AND u.verified = true
         ORDER BY COALESCE(gms.overall_score, 0) DESC, guard_name ASC
         "#,
@@ -301,3 +301,4 @@ pub async fn suggest_replacement(
 
     Ok(top_three)
 }
+

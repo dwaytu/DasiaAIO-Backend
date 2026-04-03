@@ -1,4 +1,4 @@
-use axum::{
+﻿use axum::{
     extract::ws::{Message, WebSocket},
     extract::State,
     extract::{Path, Query, WebSocketUpgrade},
@@ -617,7 +617,7 @@ async fn evaluate_and_send_proximity_alerts(db: &PgPool) -> AppResult<(usize, us
                SELECT tp.latitude, tp.longitude, tp.recorded_at
                FROM tracking_points tp
                WHERE tp.entity_id = s.guard_id
-                 AND tp.entity_type IN ('guard', 'user')
+                 AND tp.entity_type IN ('guard')
                ORDER BY tp.recorded_at DESC
                LIMIT 1
            ) last_tp ON true
@@ -760,7 +760,7 @@ async fn fetch_map_snapshot(
         sqlx::query(
                         r#"SELECT id, entity_type, entity_id, user_id, label, status, latitude, longitude, heading, speed_kph, accuracy_meters, recorded_at
                              FROM tracking_points
-                             WHERE entity_type IN ('guard', 'user')
+                             WHERE entity_type IN ('guard')
                                  AND entity_id = $1
                                  AND recorded_at >= (CURRENT_TIMESTAMP - ($2 || ' minutes')::interval)
                                  AND accuracy_meters IS NOT NULL
@@ -796,7 +796,7 @@ async fn fetch_map_snapshot(
                                          ) AS rn
                                      FROM tracking_points
                                      WHERE (
-                                         entity_type IN ('guard', 'user')
+                                         entity_type IN ('guard')
                                          AND recorded_at >= (CURRENT_TIMESTAMP - ($1 || ' minutes')::interval)
                                          AND accuracy_meters IS NOT NULL
                                          AND accuracy_meters <= $2
@@ -1101,7 +1101,7 @@ pub async fn get_guard_history(
                SELECT id, entity_type, entity_id, user_id, label, status, latitude, longitude,
                       heading, speed_kph, accuracy_meters, recorded_at
                FROM tracking_points
-               WHERE entity_type IN ('guard', 'user')
+               WHERE entity_type IN ('guard')
                  AND entity_id = $1
                  AND ($2::timestamptz IS NULL OR recorded_at >= $2)
                  AND ($3::timestamptz IS NULL OR recorded_at <= $3)
@@ -1177,7 +1177,7 @@ pub async fn get_guard_path(
            FROM (
                SELECT latitude, longitude, speed_kph, status, recorded_at
                FROM tracking_points
-               WHERE entity_type IN ('guard', 'user')
+               WHERE entity_type IN ('guard')
                  AND entity_id = $1
                  AND ($2::timestamptz IS NULL OR recorded_at >= $2)
                  AND ($3::timestamptz IS NULL OR recorded_at <= $3)
@@ -1264,7 +1264,7 @@ pub async fn get_active_guards(
                        tp.recorded_at,
                        ROW_NUMBER() OVER (PARTITION BY tp.entity_id ORDER BY tp.recorded_at DESC) AS rn
                    FROM tracking_points tp
-                   WHERE tp.entity_type IN ('guard', 'user')
+                   WHERE tp.entity_type IN ('guard')
                      AND tp.entity_id = $1
                      AND tp.recorded_at >= (CURRENT_TIMESTAMP - ($2 || ' minutes')::interval)
                      AND tp.accuracy_meters IS NOT NULL
@@ -1312,7 +1312,7 @@ pub async fn get_active_guards(
                        tp.recorded_at,
                        ROW_NUMBER() OVER (PARTITION BY tp.entity_id ORDER BY tp.recorded_at DESC) AS rn
                    FROM tracking_points tp
-                   WHERE tp.entity_type IN ('guard', 'user')
+                   WHERE tp.entity_type IN ('guard')
                      AND tp.recorded_at >= (CURRENT_TIMESTAMP - ($1 || ' minutes')::interval)
                      AND tp.accuracy_meters IS NOT NULL
                      AND tp.accuracy_meters <= $2
@@ -2020,3 +2020,4 @@ pub async fn tracking_ws(
 
     Ok(ws_upgrade.on_upgrade(move |socket| handle_tracking_ws(socket, db, claims)))
 }
+

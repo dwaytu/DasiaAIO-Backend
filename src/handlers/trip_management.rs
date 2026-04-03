@@ -1,4 +1,4 @@
-use axum::{
+﻿use axum::{
     extract::{Path, State},
     http::HeaderMap,
     Json,
@@ -268,7 +268,7 @@ pub async fn get_driver_assignments(
                 COUNT(t.id) as total_trips
          FROM users u
          LEFT JOIN trips t ON u.id = t.driver_id
-         WHERE u.role IN ('guard', 'user') AND u.verified = true
+         WHERE u.role IN ('guard') AND u.verified = true
          GROUP BY u.id, u.full_name
          ORDER BY active_trips DESC"
     )
@@ -292,3 +292,4 @@ pub struct AssignDriverRequest {
 pub struct UpdateTripStatusRequest {
     pub status: String,
 }
+

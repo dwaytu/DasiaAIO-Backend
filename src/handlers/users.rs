@@ -1,4 +1,4 @@
-use axum::{
+﻿use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
@@ -220,7 +220,7 @@ pub async fn get_pending_guard_approvals(
             created_at
         FROM users
         WHERE COALESCE(approval_status, 'approved') = 'pending'
-          AND LOWER(role) IN ('guard', 'user')
+          AND LOWER(role) IN ('guard')
         ORDER BY created_at ASC"#,
     )
     .fetch_all(db.as_ref())
@@ -259,7 +259,7 @@ pub async fn update_guard_approval_status(
                approval_date = CURRENT_TIMESTAMP,
                updated_at = CURRENT_TIMESTAMP
            WHERE id = $3
-             AND LOWER(role) IN ('guard', 'user')
+             AND LOWER(role) IN ('guard')
            RETURNING id, email, username, full_name, COALESCE(approval_status, 'approved') AS approval_status"#,
     )
     .bind(new_status)
@@ -560,3 +560,4 @@ pub async fn delete_profile_photo(
         "message": "Profile photo removed successfully"
     })))
 }
+

@@ -44,14 +44,27 @@ async fn persist_absence_prediction(
         "formula": prediction.formula,
         "riskLevel": prediction.risk_level,
     });
+    let w_absences = std::env::var("ABSENCE_WEIGHT_ABSENCES")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.5);
+    let w_late = std::env::var("ABSENCE_WEIGHT_LATE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.3);
+    let w_leave = std::env::var("ABSENCE_WEIGHT_LEAVE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.2);
+
     let contributing_factors = json!({
         "previousAbsences": prediction.previous_absences,
         "lateCheckins": prediction.late_checkins,
         "recentLeaveRequests": prediction.recent_leave_requests,
         "weights": {
-            "previousAbsences": 0.5,
-            "lateCheckins": 0.3,
-            "recentLeaveRequests": 0.2
+            "previousAbsences": w_absences,
+            "lateCheckins": w_late,
+            "recentLeaveRequests": w_leave
         }
     });
 

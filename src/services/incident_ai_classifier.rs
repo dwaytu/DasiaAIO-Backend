@@ -1,5 +1,10 @@
 use reqwest;
 
+const DEFAULT_GROQ_API_BASE: &str = "https://api.groq.com/openai/v1";
+const DEFAULT_GROQ_MODEL: &str = "llama-3.1-8b-instant";
+const DEFAULT_OPENAI_API_BASE: &str = "https://api.openai.com/v1";
+const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
+
 /// Result from the incident classifier — carries the severity, confidence,
 /// and how many keyword signals were matched (for non-LLM fallback).
 #[derive(Debug, Clone)]
@@ -38,25 +43,93 @@ pub fn classify_incident(description: &str) -> String {
     classify_incident_keywords(description).severity
 }
 
+struct LlmConfig {
+    api_key: String,
+    api_base: String,
+    model: String,
+    provider: String,
+}
+
+fn resolve_llm_config() -> Result<LlmConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let provider = std::env::var("AI_PROVIDER")
+        .unwrap_or_else(|_| "groq".to_string())
+        .trim()
+        .to_lowercase();
+
+    let ai_key = std::env::var("AI_API_KEY").unwrap_or_default();
+    let groq_key = std::env::var("GROQ_API_KEY").unwrap_or_default();
+    let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+
+    let api_key = if !ai_key.trim().is_empty() {
+        ai_key
+    } else if provider == "groq" && !groq_key.trim().is_empty() {
+        groq_key
+    } else if provider == "openai" && !openai_key.trim().is_empty() {
+        openai_key
+    } else if !groq_key.trim().is_empty() {
+        groq_key
+    } else if !openai_key.trim().is_empty() {
+        openai_key
+    } else {
+        return Err(
+            "No AI API key configured. Set AI_API_KEY or GROQ_API_KEY (recommended) or OPENAI_API_KEY"
+                .into(),
+        );
+    };
+
+    let api_base = std::env::var("AI_API_BASE_URL").unwrap_or_else(|_| {
+        if provider == "openai" {
+            DEFAULT_OPENAI_API_BASE.to_string()
+        } else {
+            DEFAULT_GROQ_API_BASE.to_string()
+        }
+    });
+
+    let model = std::env::var("AI_MODEL").unwrap_or_else(|_| {
+        if provider == "openai" {
+            DEFAULT_OPENAI_MODEL.to_string()
+        } else {
+            DEFAULT_GROQ_MODEL.to_string()
+        }
+    });
+
+    Ok(LlmConfig {
+        api_key,
+        api_base,
+        model,
+        provider,
+    })
+}
+
+fn llm_confidence_from_output(raw_output: &str, severity: &str) -> f64 {
+    let normalized = raw_output.trim().to_uppercase();
+    let exact = normalized == severity;
+    let contains_only_expected = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+        .iter()
+        .any(|label| normalized == *label || normalized == format!("{}.", label));
+
+    if exact || contains_only_expected {
+        return 0.90;
+    }
+
+    if normalized.contains(severity) {
+        return 0.82;
+    }
+
+    0.74
+}
+
 async fn call_llm_classifier(
     description: &str,
 ) -> Result<ClassificationResult, Box<dyn std::error::Error + Send + Sync>> {
-    let api_key = std::env::var("AI_API_KEY").unwrap_or_default();
-    if api_key.is_empty() {
-        return Err("AI_API_KEY is not configured".into());
-    }
-
-    let api_base = std::env::var("AI_API_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-    let model =
-        std::env::var("AI_MODEL").unwrap_or_else(|_| "gpt-3.5-turbo".to_string());
+    let config = resolve_llm_config()?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
         .build()?;
 
     let body = serde_json::json!({
-        "model": model,
+        "model": config.model,
         "messages": [
             { "role": "system", "content": AI_CLASSIFY_PROMPT },
             { "role": "user", "content": description }
@@ -66,8 +139,8 @@ async fn call_llm_classifier(
     });
 
     let response = client
-        .post(format!("{}/chat/completions", api_base))
-        .bearer_auth(&api_key)
+        .post(format!("{}/chat/completions", config.api_base))
+        .bearer_auth(&config.api_key)
         .json(&body)
         .send()
         .await?;
@@ -95,10 +168,12 @@ async fn call_llm_classifier(
             classify_incident_keywords(description).severity
         });
 
+    let confidence = llm_confidence_from_output(&raw, &severity);
+
     Ok(ClassificationResult {
         severity,
-        confidence: 0.85,
-        source: "llm".to_string(),
+        confidence,
+        source: format!("llm:{}", config.provider),
     })
 }
 

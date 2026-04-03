@@ -1,4 +1,4 @@
-use axum::{extract::State, http::HeaderMap, Json};
+﻿use axum::{extract::State, http::HeaderMap, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
@@ -79,7 +79,7 @@ pub async fn get_analytics(
 
     // Overview stats
     let total_guards =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE role IN ('guard', 'user')")
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE role IN ('guard')")
             .fetch_one(db.as_ref())
             .await
             .unwrap_or(0);
@@ -309,7 +309,7 @@ pub async fn get_guard_reliability(
             SELECT id,
                    COALESCE(NULLIF(full_name, ''), username) AS guard_name
             FROM users
-            WHERE role IN ('guard', 'user')
+            WHERE role IN ('guard')
         ), attendance AS (
             SELECT
                 s.guard_id,
@@ -436,3 +436,4 @@ pub struct UpdateMissionStatusRequest {
     pub mission_id: String,
     pub status: String,
 }
+

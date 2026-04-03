@@ -1,4 +1,4 @@
-use axum::{
+﻿use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     Json,
@@ -119,7 +119,7 @@ pub async fn assign_mission(
 
     let guards = sqlx::query_as::<_, GuardRow>(
         "SELECT id, full_name, username FROM users 
-         WHERE role IN ('guard', 'user') 
+         WHERE role IN ('guard') 
          AND verified = true 
          LIMIT $1",
     )
@@ -343,3 +343,4 @@ pub async fn get_missions(
         "missions": missions
     })))
 }
+

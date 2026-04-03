@@ -56,14 +56,33 @@ pub struct SummarizeIncidentResponse {
     pub key_phrases: Vec<String>,
 }
 
-fn confidence_from_severity(severity: &str) -> f64 {
-    match severity.to_lowercase().as_str() {
-        "critical" => 0.94,
-        "high" => 0.88,
-        "medium" => 0.79,
-        "low" => 0.71,
-        _ => 0.65,
-    }
+fn summarize_confidence(risk_level: &str, summary: &str, key_phrases: &[String]) -> f64 {
+    let severity_tokens: &[&str] = match risk_level.to_lowercase().as_str() {
+        "critical" => &["critical", "weapon", "hostage", "active", "violence"],
+        "high" => &["high", "threat", "intruder", "breach", "assault"],
+        "medium" => &["medium", "warning", "delay", "trespass", "suspicious"],
+        _ => &["low", "minor", "lost", "noise"],
+    };
+
+    let summary_lc = summary.to_lowercase();
+    let phrase_lc: Vec<String> = key_phrases.iter().map(|item| item.to_lowercase()).collect();
+
+    let summary_signal_count = severity_tokens
+        .iter()
+        .filter(|token| summary_lc.contains(**token))
+        .count() as f64;
+
+    let phrase_signal_count = phrase_lc
+        .iter()
+        .filter(|phrase| severity_tokens.iter().any(|token| phrase.contains(token)))
+        .count() as f64;
+
+    let phrase_density = (key_phrases.len() as f64 / 8.0).min(1.0);
+    let summary_density = (summary.split_whitespace().count() as f64 / 40.0).min(1.0);
+    let severity_signal = ((summary_signal_count + phrase_signal_count) / 5.0).min(1.0);
+
+    let score = 0.45 + (phrase_density * 0.20) + (summary_density * 0.10) + (severity_signal * 0.25);
+    score.clamp(0.55, 0.95)
 }
 
 
@@ -194,7 +213,7 @@ pub async fn summarize_incident(
     let summary = incident_summary_service::summarize_incident(&payload.description);
     let key_phrases = incident_summary_service::extract_key_phrases(&payload.description);
     let risk_level = risk_level_from_summary(&summary, &key_phrases);
-    let confidence = confidence_from_severity(&risk_level);
+    let confidence = summarize_confidence(&risk_level, &summary, &key_phrases);
     let explanation = format!(
         "Summary confidence is based on extracted terms and sentence consistency ({} key phrase(s)).",
         key_phrases.len()

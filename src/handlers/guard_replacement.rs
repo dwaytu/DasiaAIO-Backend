@@ -1,4 +1,4 @@
-use axum::{
+﻿use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
@@ -250,7 +250,7 @@ pub async fn detect_no_shows(
              FROM users u
              LEFT JOIN guard_availability ga ON u.id = ga.guard_id
              WHERE u.id != $1 
-             AND u.role IN ('guard', 'user') 
+             AND u.role IN ('guard') 
              AND u.verified = true
              AND (ga.available IS NULL OR ga.available = true)
              AND NOT EXISTS (
@@ -719,3 +719,4 @@ pub async fn delete_shift(
         "message": "Shift deleted successfully"
     })))
 }
+

@@ -1,4 +1,4 @@
-use axum::{extract::State, http::HeaderMap, Json};
+﻿use axum::{extract::State, http::HeaderMap, Json};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::json;
@@ -225,7 +225,7 @@ pub async fn get_predictive_alerts(
     let guard_capacity = sqlx::query_as::<_, GuardCapacityRow>(
         r#"
         SELECT
-            (SELECT COUNT(*) FROM users WHERE role IN ('guard', 'user'))::BIGINT AS total_guards,
+            (SELECT COUNT(*) FROM users WHERE role IN ('guard'))::BIGINT AS total_guards,
             (SELECT COUNT(DISTINCT guard_id) FROM shifts WHERE DATE(start_time) = CURRENT_DATE + INTERVAL '1 day' AND status IN ('scheduled', 'in_progress'))::BIGINT AS scheduled_tomorrow,
             (SELECT COUNT(DISTINCT guard_id) FROM shifts WHERE DATE(start_time) = CURRENT_DATE AND status IN ('scheduled', 'in_progress'))::BIGINT AS committed_today
         "#,
@@ -286,3 +286,4 @@ pub async fn get_predictive_alerts(
 
     Ok(Json(alerts))
 }
+

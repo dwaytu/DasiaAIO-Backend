@@ -1,4 +1,4 @@
-use axum::{
+﻿use axum::{
     extract::{Path, State},
     http::HeaderMap,
     http::StatusCode,
@@ -279,7 +279,7 @@ pub async fn get_ranked_guards(
                 CAST(gms.average_client_rating AS FLOAT8)
          FROM guard_merit_scores gms
          JOIN users u ON gms.guard_id = u.id
-         WHERE u.role IN ('guard', 'user')
+         WHERE u.role IN ('guard')
          ORDER BY gms.overall_score DESC, u.full_name"
     )
     .fetch_all(db.as_ref())
@@ -403,7 +403,7 @@ pub async fn get_overtime_candidates(
         "SELECT gms.guard_id, u.full_name, CAST(gms.overall_score AS FLOAT8), gms.rank
          FROM guard_merit_scores gms
          JOIN users u ON gms.guard_id = u.id
-         WHERE u.role IN ('guard', 'user') AND gms.rank IN ('Gold', 'Silver')
+         WHERE u.role IN ('guard') AND gms.rank IN ('Gold', 'Silver')
          ORDER BY gms.overall_score DESC
          LIMIT 20",
     )
@@ -423,3 +423,4 @@ pub async fn get_overtime_candidates(
         }).collect::<Vec<_>>()
     })))
 }
+
