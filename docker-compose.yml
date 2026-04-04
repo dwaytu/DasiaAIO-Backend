@@ -33,6 +33,7 @@ services:
       GMAIL_USER: ${GMAIL_USER}
       GMAIL_PASSWORD: ${GMAIL_PASSWORD}
       RUST_LOG: info
+      RESEND_API_KEY: dev-key-for-local-testing
     depends_on:
       postgres:
         condition: service_healthy

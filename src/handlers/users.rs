@@ -92,7 +92,7 @@ pub async fn create_user_by_actor(
         ));
     }
 
-    utils::validate_gmail(&payload.email)?;
+    utils::validate_email(&payload.email)?;
 
     let existing = sqlx::query("SELECT id FROM users WHERE email = $1 OR username = $2")
         .bind(&payload.email)

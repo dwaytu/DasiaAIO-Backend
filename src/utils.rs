@@ -382,15 +382,6 @@ pub fn hash_token(token: &str) -> String {
     digest.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-pub fn validate_gmail(email: &str) -> AppResult<()> {
-    if !email.ends_with("@gmail.com") {
-        return Err(AppError::ValidationError(
-            "You must use a Gmail account (email must end with @gmail.com)".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 pub fn validate_email(email: &str) -> AppResult<()> {
     let email_regex = Regex::new(
         r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"

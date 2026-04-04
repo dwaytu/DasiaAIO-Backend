@@ -344,9 +344,8 @@ pub async fn register(
         ));
     }
 
-    // Validate Gmail and password strength
+    // Validate email and password strength
     utils::validate_email(&payload.email)?;
-    utils::validate_gmail(&payload.email)?;
     utils::validate_password_strength(&payload.password)?;
 
     // Validate role
@@ -456,7 +455,7 @@ pub async fn register(
     Ok((
         StatusCode::CREATED,
         Json(json!({
-            "message": "Registration submitted. Check your Gmail for confirmation code, then wait for supervisor/admin approval.",
+            "message": "Registration submitted. Check your email for confirmation code, then wait for supervisor/admin approval.",
             "userId": user_id,
             "email": payload.email,
             "requiresVerification": true
