@@ -6,6 +6,13 @@ fn log_denied_access(path: &str, role: &str, reason: &str) {
     tracing::warn!(path = %path, role = %role, reason = %reason, "authorization denied");
 }
 
+pub fn has_tracking_access_role(role: &str) -> bool {
+    matches!(
+        utils::normalize_role(role).as_str(),
+        "superadmin" | "admin" | "supervisor" | "guard"
+    )
+}
+
 fn is_legal_bootstrap_path(path: &str) -> bool {
     path == "/api/logout"
         || path == "/api/auth/logout"
@@ -81,10 +88,14 @@ pub async fn require_tracking_access(req: Request<Body>, next: Next) -> Result<R
     enforce_legal_consent(&path, &claims)?;
 
     let role = utils::normalize_role(&claims.role);
-    if role != "supervisor" && role != "guard" {
-        log_denied_access(&path, &role, "tracking scope requires supervisor or guard role");
+    if !has_tracking_access_role(&role) {
+        log_denied_access(
+            &path,
+            &role,
+            "tracking scope requires an operational role",
+        );
         return Err(AppError::Forbidden(
-            "Tracking endpoints are limited to supervisor and guard roles".to_string(),
+            "Tracking endpoints are limited to authenticated operational roles".to_string(),
         ));
     }
 
@@ -158,4 +169,17 @@ pub async fn require_merit_view(req: Request<Body>, next: Next) -> Result<Respon
 
 pub async fn require_merit_manage(req: Request<Body>, next: Next) -> Result<Response, AppError> {
     authorize_permission(req, next, "manage_merit").await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_tracking_access_role;
+
+    #[test]
+    fn tracking_access_includes_all_operational_roles() {
+        assert!(has_tracking_access_role("superadmin"));
+        assert!(has_tracking_access_role("admin"));
+        assert!(has_tracking_access_role("supervisor"));
+        assert!(has_tracking_access_role("guard"));
+    }
 }

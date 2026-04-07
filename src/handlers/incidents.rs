@@ -98,10 +98,21 @@ pub async fn get_incidents(
             })?;
 
         let incidents = sqlx::query_as::<_, Incident>(
-            r#"SELECT id, title, description, location, reported_by, status, priority, created_at, updated_at
-               FROM incidents
+            r#"SELECT
+                   i.id,
+                   i.title,
+                   i.description,
+                   i.location,
+                   i.reported_by,
+                   COALESCE(NULLIF(u.full_name, ''), u.username) AS reported_by_name,
+                   i.status,
+                   i.priority,
+                   i.created_at,
+                   i.updated_at
+               FROM incidents i
+               LEFT JOIN users u ON u.id = i.reported_by
                WHERE reported_by = $1
-               ORDER BY created_at DESC
+               ORDER BY i.created_at DESC
                LIMIT $2 OFFSET $3"#,
         )
         .bind(&claims.sub)
@@ -121,9 +132,20 @@ pub async fn get_incidents(
             })?;
 
         let incidents = sqlx::query_as::<_, Incident>(
-            r#"SELECT id, title, description, location, reported_by, status, priority, created_at, updated_at
-               FROM incidents
-               ORDER BY created_at DESC
+            r#"SELECT
+                   i.id,
+                   i.title,
+                   i.description,
+                   i.location,
+                   i.reported_by,
+                   COALESCE(NULLIF(u.full_name, ''), u.username) AS reported_by_name,
+                   i.status,
+                   i.priority,
+                   i.created_at,
+                   i.updated_at
+               FROM incidents i
+               LEFT JOIN users u ON u.id = i.reported_by
+               ORDER BY i.created_at DESC
                LIMIT $1 OFFSET $2"#,
         )
         .bind(page_size)
@@ -166,18 +188,29 @@ pub async fn get_active_incidents(
                 })?;
 
                 let incidents = sqlx::query_as::<_, Incident>(
-                        r#"SELECT id, title, description, location, reported_by, status, priority, created_at, updated_at
-                             FROM incidents
-                             WHERE status IN ('open', 'investigating')
-                                 AND reported_by = $1
+                        r#"SELECT
+                               i.id,
+                               i.title,
+                               i.description,
+                               i.location,
+                               i.reported_by,
+                               COALESCE(NULLIF(u.full_name, ''), u.username) AS reported_by_name,
+                               i.status,
+                               i.priority,
+                               i.created_at,
+                               i.updated_at
+                             FROM incidents i
+                             LEFT JOIN users u ON u.id = i.reported_by
+                             WHERE i.status IN ('open', 'investigating')
+                                 AND i.reported_by = $1
                              ORDER BY
-                                 CASE priority
+                                 CASE i.priority
                                      WHEN 'critical' THEN 4
                                      WHEN 'high' THEN 3
                                      WHEN 'medium' THEN 2
                                      ELSE 1
                                  END DESC,
-                                 created_at DESC
+                                 i.created_at DESC
                              LIMIT $2 OFFSET $3"#,
                 )
                 .bind(&claims.sub)
@@ -199,17 +232,28 @@ pub async fn get_active_incidents(
                 })?;
 
                 let incidents = sqlx::query_as::<_, Incident>(
-                        r#"SELECT id, title, description, location, reported_by, status, priority, created_at, updated_at
-                             FROM incidents
-                             WHERE status IN ('open', 'investigating')
+                        r#"SELECT
+                               i.id,
+                               i.title,
+                               i.description,
+                               i.location,
+                               i.reported_by,
+                               COALESCE(NULLIF(u.full_name, ''), u.username) AS reported_by_name,
+                               i.status,
+                               i.priority,
+                               i.created_at,
+                               i.updated_at
+                             FROM incidents i
+                             LEFT JOIN users u ON u.id = i.reported_by
+                             WHERE i.status IN ('open', 'investigating')
                              ORDER BY
-                                 CASE priority
+                                 CASE i.priority
                                      WHEN 'critical' THEN 4
                                      WHEN 'high' THEN 3
                                      WHEN 'medium' THEN 2
                                      ELSE 1
                                  END DESC,
-                                 created_at DESC
+                                 i.created_at DESC
                              LIMIT $1 OFFSET $2"#,
                 )
                 .bind(page_size)

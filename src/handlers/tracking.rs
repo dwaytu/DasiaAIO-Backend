@@ -1999,14 +1999,14 @@ pub async fn tracking_ws(
     }
 
     let role = utils::normalize_role(&claims.role);
-    if role != "supervisor" && role != "guard" {
+    if !crate::middleware::authz::has_tracking_access_role(&role) {
         tracing::warn!(
             user_id = %claims.sub,
             role = %role,
             "Rejected tracking websocket upgrade due to unauthorized role"
         );
         return Err(AppError::Forbidden(
-            "Tracking endpoints are limited to supervisor and guard roles".to_string(),
+            "Tracking endpoints are limited to authenticated operational roles".to_string(),
         ));
     }
 

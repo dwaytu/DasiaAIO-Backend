@@ -474,6 +474,7 @@ pub struct Incident {
     pub description: String,
     pub location: String,
     pub reported_by: String,
+    pub reported_by_name: Option<String>,
     pub status: String,
     pub priority: String,
     pub created_at: DateTime<Utc>,
