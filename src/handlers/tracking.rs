@@ -1807,7 +1807,9 @@ pub async fn guard_heartbeat(
 
     let sample_accuracy = payload.accuracy_meters.unwrap_or(f64::INFINITY);
     let required_accuracy = required_accuracy_meters();
-    if sample_accuracy > required_accuracy {
+    let is_ip_based_approximate = payload.accuracy_meters.is_some() && sample_accuracy > 5000.0;
+
+    if !is_ip_based_approximate && sample_accuracy > required_accuracy {
         return Ok((
             StatusCode::ACCEPTED,
             Json(json!({
@@ -1825,6 +1827,11 @@ pub async fn guard_heartbeat(
     } else {
         Some(claims.email.as_str())
     };
+    let heartbeat_status = if is_ip_based_approximate {
+        Some("approximate")
+    } else {
+        payload.status.as_deref().or(Some("active"))
+    };
 
     sqlx::query(
         r#"INSERT INTO tracking_points (
@@ -1836,7 +1843,7 @@ pub async fn guard_heartbeat(
     .bind(&claims.sub)
     .bind(&claims.sub)
     .bind(guard_label)
-    .bind(payload.status.as_deref().or(Some("active")))
+    .bind(heartbeat_status)
     .bind(payload.latitude)
     .bind(payload.longitude)
     .bind(payload.heading)
@@ -1859,6 +1866,8 @@ pub async fn guard_heartbeat(
         StatusCode::CREATED,
         Json(json!({
             "message": "Location heartbeat recorded",
+            "accepted": true,
+            "approximate": is_ip_based_approximate,
             "trackingId": tracking_id,
             "geofenceEvents": geofence_events,
         })),
