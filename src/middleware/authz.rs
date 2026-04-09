@@ -141,6 +141,10 @@ pub async fn require_mission_management(
     authorize_permission(req, next, "manage_missions").await
 }
 
+pub async fn require_mdr_management(req: Request<Body>, next: Next) -> Result<Response, AppError> {
+    authorize_permission(req, next, "manage_mdr").await
+}
+
 pub async fn require_schedule_management(
     req: Request<Body>,
     next: Next,

@@ -117,6 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 header::CONTENT_TYPE,
                 header::ACCEPT,
                 header::ORIGIN,
+                header::UPGRADE,
+                header::CONNECTION,
+                header::SEC_WEBSOCKET_PROTOCOL,
             ])
             .max_age(std::time::Duration::from_secs(3600))
     } else if let Ok(origin) = std::env::var("CORS_ORIGIN") {
@@ -144,6 +147,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         header::CONTENT_TYPE,
                         header::ACCEPT,
                         header::ORIGIN,
+                        header::UPGRADE,
+                        header::CONNECTION,
+                        header::SEC_WEBSOCKET_PROTOCOL,
                     ])
                     .max_age(std::time::Duration::from_secs(3600))
             }
@@ -175,6 +181,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         header::CONTENT_TYPE,
                         header::ACCEPT,
                         header::ORIGIN,
+                        header::UPGRADE,
+                        header::CONNECTION,
+                        header::SEC_WEBSOCKET_PROTOCOL,
                     ])
                     .max_age(std::time::Duration::from_secs(3600))
             }
@@ -207,6 +216,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 header::CONTENT_TYPE,
                 header::ACCEPT,
                 header::ORIGIN,
+                header::UPGRADE,
+                header::CONNECTION,
+                header::SEC_WEBSOCKET_PROTOCOL,
             ])
             .max_age(std::time::Duration::from_secs(3600))
     };
@@ -1518,6 +1530,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(handlers::tracking::check_shift_proximity_alerts)
                 .route_layer(axum_middleware::from_fn(
                     middleware::authz::require_tracking_access,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        // MDR integration routes
+        .route(
+            "/api/clients",
+            get(handlers::clients::get_all_clients).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_mdr_management,
+            )),
+        )
+        .route(
+            "/api/clients/:id",
+            get(handlers::clients::get_client_by_id).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_mdr_management,
+            )),
+        )
+        .route(
+            "/api/guard-assignments",
+            get(handlers::guard_assignments::get_all_guard_assignments).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_mdr_management),
+            ),
+        )
+        .route(
+            "/api/guard-assignments/by-client/:id",
+            get(handlers::guard_assignments::get_assignments_by_client).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_mdr_management),
+            ),
+        )
+        .route(
+            "/api/guard-status-transitions",
+            get(handlers::guard_assignments::get_guard_status_transitions).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_mdr_management),
+            ),
+        )
+        // MDR import routes
+        .route(
+            "/api/mdr/import",
+            post(handlers::mdr::import_mdr)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_mdr_management,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/mdr/batches",
+            get(handlers::mdr::get_batches).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_mdr_management,
+            )),
+        )
+        .route(
+            "/api/mdr/batches/:id",
+            get(handlers::mdr::get_batch_by_id).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_mdr_management,
+            )),
+        )
+        .route(
+            "/api/mdr/batches/:id/review",
+            get(handlers::mdr::get_batch_review).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_mdr_management,
+            )),
+        )
+        .route(
+            "/api/mdr/staging/:id/resolve",
+            patch(handlers::mdr::resolve_staging_row)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_mdr_management,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/mdr/batches/:id/commit",
+            post(handlers::mdr::commit_batch)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_superadmin,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/mdr/batches/:id/reject",
+            post(handlers::mdr::reject_batch)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_superadmin,
                 ))
                 .route_layer(axum_middleware::from_fn_with_state(
                     db.clone(),

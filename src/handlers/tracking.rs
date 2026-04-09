@@ -30,7 +30,7 @@ const MAX_GEOFENCE_RADIUS_KM: f64 = 25.0;
 
 fn tracking_accuracy_mode() -> String {
     std::env::var("TRACKING_ACCURACY_MODE")
-        .unwrap_or_else(|_| "strict".to_string())
+        .unwrap_or_else(|_| "balanced".to_string())
         .to_lowercase()
 }
 

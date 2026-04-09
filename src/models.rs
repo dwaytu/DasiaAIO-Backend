@@ -968,3 +968,122 @@ mod option_date_format {
         }
     }
 }
+
+// ═══ MDR Integration Models ═══
+
+// Client entity (first-class business client)
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Client {
+    pub id: String,
+    pub name: String,
+    pub address: Option<String>,
+    pub phone: Option<String>,
+    pub client_number: Option<i32>,
+    pub branch: Option<String>,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// Guard assignment (guard-to-client posting)
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct GuardAssignment {
+    pub id: String,
+    pub guard_id: String,
+    pub client_id: String,
+    pub client_site_id: Option<String>,
+    pub post_label: Option<String>,
+    pub guard_number: Option<i32>,
+    pub assignment_start: Option<DateTime<Utc>>,
+    pub assignment_end: Option<DateTime<Utc>>,
+    pub status: String,
+    pub mdr_batch_id: Option<String>,
+    pub mdr_row_ref: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// Guard status transition (pull-out history)
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct GuardStatusTransition {
+    pub id: String,
+    pub guard_id: String,
+    pub transition_type: String,
+    pub reason: Option<String>,
+    pub previous_client_id: Option<String>,
+    pub effective_date: Option<DateTime<Utc>>,
+    pub mdr_batch_id: Option<String>,
+    pub mdr_row_ref: Option<String>,
+    pub recorded_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+// Equipment (non-firearm gear)
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Equipment {
+    pub id: String,
+    pub equipment_type: String,
+    pub description: Option<String>,
+    pub serial_number: Option<String>,
+    pub assigned_to_client_id: Option<String>,
+    pub assigned_to_guard_id: Option<String>,
+    pub quantity: i32,
+    pub status: String,
+    pub mdr_batch_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// MDR import batch audit trail
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct MdrImportBatch {
+    pub id: String,
+    pub filename: String,
+    pub report_month: String,
+    pub branch: Option<String>,
+    pub uploaded_by: String,
+    pub status: String,
+    pub total_rows: Option<i32>,
+    pub matched_rows: Option<i32>,
+    pub new_rows: Option<i32>,
+    pub ambiguous_rows: Option<i32>,
+    pub error_rows: Option<i32>,
+    pub committed_at: Option<DateTime<Utc>>,
+    pub committed_by: Option<String>,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+// MDR staging row (raw parsed Excel data)
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct MdrStagingRow {
+    pub id: String,
+    pub batch_id: String,
+    pub sheet_name: String,
+    pub row_number: i32,
+    pub section: Option<String>,
+    pub client_number: Option<i32>,
+    pub client_name: Option<String>,
+    pub client_address: Option<String>,
+    pub guard_number: Option<i32>,
+    pub guard_name: Option<String>,
+    pub contact_number: Option<String>,
+    pub license_number: Option<String>,
+    pub license_expiry: Option<String>,
+    pub firearm_kind: Option<String>,
+    pub firearm_make: Option<String>,
+    pub caliber: Option<String>,
+    pub serial_number: Option<String>,
+    pub firearm_validity: Option<String>,
+    pub actual_ammo: Option<String>,
+    pub ammo_count: Option<String>,
+    pub lic_reg_name: Option<String>,
+    pub pullout_status: Option<String>,
+    pub fa_remarks: Option<String>,
+    pub match_status: String,
+    pub matched_guard_id: Option<String>,
+    pub matched_firearm_id: Option<String>,
+    pub matched_client_id: Option<String>,
+    pub validation_errors: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+}
