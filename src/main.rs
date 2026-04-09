@@ -1665,6 +1665,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     middleware::audit::audit_write_requests,
                 )),
         )
+        // Feedback routes
+        .route(
+            "/api/feedback",
+            post(handlers::feedback::submit_feedback).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_authenticated,
+            )),
+        )
+        .route(
+            "/api/feedback",
+            get(handlers::feedback::list_feedback).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_superadmin,
+            )),
+        )
+        .route(
+            "/api/feedback/status",
+            get(handlers::feedback::get_feedback_status).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_authenticated,
+            )),
+        )
         // Health check
         .route("/api/health", get(handlers::health::health_check))
         .route("/api/health/system", get(handlers::health::system_health))

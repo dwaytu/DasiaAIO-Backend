@@ -5,6 +5,7 @@ pub mod armored_cars;
 pub mod audit;
 pub mod auth;
 pub mod clients;
+pub mod feedback;
 pub mod firearm_allocation;
 pub mod firearm_maintenance;
 pub mod firearms;

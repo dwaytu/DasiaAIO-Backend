@@ -299,6 +299,7 @@ pub fn can_create_role(actor_role: &str, target_role: &str) -> bool {
     match actor.as_str() {
         "superadmin" => matches!(target.as_str(), "admin" | "supervisor" | "guard"),
         "admin" => matches!(target.as_str(), "supervisor" | "guard"),
+        "supervisor" => matches!(target.as_str(), "guard"),
         _ => false,
     }
 }
