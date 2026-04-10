@@ -1400,6 +1400,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 middleware::authz::require_tracking_access,
             )),
         )
+        .route(
+            "/api/tracking/consent",
+            get(handlers::tracking::get_tracking_consent_status).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_tracking_access),
+            ),
+        )
+        .route(
+            "/api/tracking/consent/grant",
+            post(handlers::tracking::grant_tracking_consent)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_tracking_access,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/tracking/consent/revoke",
+            post(handlers::tracking::revoke_tracking_consent)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_tracking_access,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
         .route("/api/tracking/ws", get(handlers::tracking::tracking_ws))
         .route(
             "/api/tracking/client-sites",

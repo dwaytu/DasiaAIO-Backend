@@ -156,6 +156,75 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             AppError::DatabaseError(format!("Failed to add consent_user_agent column: {}", e))
         })?;
 
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS location_tracking_consent BOOLEAN NOT NULL DEFAULT false",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to add location_tracking_consent column: {}",
+            e
+        ))
+    })?;
+
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS location_tracking_consent_granted_at TIMESTAMP WITH TIME ZONE",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to add location_tracking_consent_granted_at column: {}",
+            e
+        ))
+    })?;
+
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS location_tracking_consent_revoked_at TIMESTAMP WITH TIME ZONE",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to add location_tracking_consent_revoked_at column: {}",
+            e
+        ))
+    })?;
+
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS location_tracking_consent_updated_at TIMESTAMP WITH TIME ZONE",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to add location_tracking_consent_updated_at column: {}",
+            e
+        ))
+    })?;
+
+    sqlx::query(
+        r#"UPDATE users
+           SET location_tracking_consent_updated_at = COALESCE(
+               location_tracking_consent_updated_at,
+               location_tracking_consent_granted_at,
+               location_tracking_consent_revoked_at,
+               updated_at,
+               created_at,
+               CURRENT_TIMESTAMP
+           )
+           WHERE location_tracking_consent_updated_at IS NULL"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to backfill location_tracking_consent_updated_at values: {}",
+            e
+        ))
+    })?;
+
     // Operational tracking tables for real-time map monitoring.
     sqlx::query(
         r#"

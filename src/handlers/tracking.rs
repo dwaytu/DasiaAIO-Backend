@@ -25,6 +25,8 @@ const PRE_SHIFT_ALERT_WINDOW_MINUTES: i64 = 60;
 const PROXIMITY_ALERT_DEDUPE_MINUTES: i64 = 45;
 const GEOFENCE_EVENT_DEDUPE_MINUTES: i64 = 5;
 const ACTIVE_GUARD_WINDOW_MINUTES: i64 = 15;
+const DEFAULT_STALE_GUARD_WINDOW_MINUTES: i64 = 120;
+const DEFAULT_GUARD_RETENTION_WINDOW_MINUTES: i64 = 1440;
 const MOVING_SPEED_THRESHOLD_KPH: f64 = 2.0;
 const MAX_GEOFENCE_RADIUS_KM: f64 = 25.0;
 
@@ -78,10 +80,219 @@ fn vehicle_recency_minutes() -> i64 {
     }
 }
 
+fn stale_guard_window_minutes(active_window_minutes: i64) -> i64 {
+    let configured = parse_env_i64("TRACKING_STALE_GUARD_WINDOW_MINUTES")
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_STALE_GUARD_WINDOW_MINUTES);
+
+    configured.max(active_window_minutes + 1)
+}
+
+fn guard_retention_window_minutes(stale_window_minutes: i64) -> i64 {
+    parse_env_i64("TRACKING_GUARD_RETENTION_MINUTES")
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_GUARD_RETENTION_WINDOW_MINUTES)
+        .max(stale_window_minutes)
+}
+
+fn classify_guard_presence_at(
+    now: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
+    active_window_minutes: i64,
+    stale_window_minutes: i64,
+) -> &'static str {
+    let safe_stale_window = stale_window_minutes.max(active_window_minutes + 1);
+    let age_minutes = (now - recorded_at).num_minutes().max(0);
+
+    if age_minutes <= active_window_minutes {
+        "active"
+    } else if age_minutes <= safe_stale_window {
+        "stale"
+    } else {
+        "offline"
+    }
+}
+
+fn derive_tracking_source(status: Option<&str>, accuracy_meters: Option<f64>) -> String {
+    let normalized_status = status.unwrap_or_default().trim().to_lowercase();
+
+    if matches!(normalized_status.as_str(), "approximate" | "gps" | "network") {
+        return normalized_status;
+    }
+
+    if accuracy_meters.is_some_and(|accuracy| accuracy > 5000.0) {
+        return "approximate".to_string();
+    }
+
+    if accuracy_meters.is_some() {
+        "gps".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn derive_schedule_status(raw_status: Option<&str>) -> String {
+    raw_status
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .map(|status| status.to_lowercase())
+        .unwrap_or_else(|| "unscheduled".to_string())
+}
+
+#[derive(Debug, Clone)]
+struct LocationTrackingConsentState {
+    granted: bool,
+    granted_at: Option<DateTime<Utc>>,
+    revoked_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+fn extract_user_agent(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn tracking_consent_required_payload(legal_consent_accepted: bool) -> serde_json::Value {
+    json!({
+        "error": "Location tracking consent is required before sending heartbeat data.",
+        "code": "tracking_consent_required",
+        "status": 403,
+        "legalConsentAccepted": legal_consent_accepted,
+        "locationTrackingConsent": false,
+    })
+}
+
+async fn get_location_tracking_consent_state(
+    db: &PgPool,
+    user_id: &str,
+) -> AppResult<LocationTrackingConsentState> {
+    let row = sqlx::query(
+        r#"SELECT
+               COALESCE(location_tracking_consent, false) AS location_tracking_consent,
+               location_tracking_consent_granted_at,
+               location_tracking_consent_revoked_at,
+               location_tracking_consent_updated_at
+           FROM users
+           WHERE id = $1"#,
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to fetch tracking consent state: {}", e)))?;
+
+    let row = row.ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    let granted: bool = row.try_get("location_tracking_consent").map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to parse location_tracking_consent value: {}",
+            e
+        ))
+    })?;
+
+    let granted_at = row
+        .try_get("location_tracking_consent_granted_at")
+        .map_err(|e| {
+            AppError::DatabaseError(format!(
+                "Failed to parse location_tracking_consent_granted_at value: {}",
+                e
+            ))
+        })?;
+
+    let revoked_at = row
+        .try_get("location_tracking_consent_revoked_at")
+        .map_err(|e| {
+            AppError::DatabaseError(format!(
+                "Failed to parse location_tracking_consent_revoked_at value: {}",
+                e
+            ))
+        })?;
+
+    let updated_at = row
+        .try_get("location_tracking_consent_updated_at")
+        .map_err(|e| {
+            AppError::DatabaseError(format!(
+                "Failed to parse location_tracking_consent_updated_at value: {}",
+                e
+            ))
+        })?;
+
+    Ok(LocationTrackingConsentState {
+        granted,
+        granted_at,
+        revoked_at,
+        updated_at,
+    })
+}
+
+async fn record_tracking_consent_audit(
+    db: &PgPool,
+    actor_user_id: &str,
+    action_key: &str,
+    source_ip: &str,
+    user_agent: Option<&str>,
+    metadata: serde_json::Value,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"INSERT INTO audit_logs (
+               id,
+               actor_user_id,
+               action_key,
+               entity_type,
+               entity_id,
+               result,
+               reason,
+               source_ip,
+               user_agent,
+               metadata
+           ) VALUES ($1, $2, $3, 'tracking_consent', $4, 'success', $5, $6, $7, $8)"#,
+    )
+    .bind(utils::generate_id())
+    .bind(actor_user_id)
+    .bind(action_key)
+    .bind(actor_user_id)
+    .bind("User updated own location tracking consent")
+    .bind(source_ip)
+    .bind(user_agent)
+    .bind(metadata)
+    .execute(db)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to create tracking consent audit log entry: {}",
+            e
+        ))
+    })?;
+
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrackingWsAuthQuery {
     pub token: Option<String>,
+}
+
+fn extract_ws_token_from_query(query: &TrackingWsAuthQuery) -> Option<String> {
+    query
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+fn reject_query_string_ws_token(query: &TrackingWsAuthQuery) -> AppResult<()> {
+    if extract_ws_token_from_query(query).is_some() {
+        tracing::warn!("Rejected tracking websocket upgrade due to query-string token auth attempt");
+        return Err(AppError::Unauthorized(
+            "Query-string websocket tokens are not allowed. Use Sec-WebSocket-Protocol with bearer.<token>.".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn extract_ws_token_from_protocols(headers: &HeaderMap) -> Option<String> {
@@ -742,9 +953,11 @@ async fn fetch_map_snapshot(
     claims: &utils::TokenClaims,
 ) -> AppResult<serde_json::Value> {
     let role = utils::normalize_role(&claims.role);
-    let required_accuracy = required_accuracy_meters();
-    let person_recency = person_recency_minutes();
+    let active_guard_window_minutes = ACTIVE_GUARD_WINDOW_MINUTES;
+    let stale_guard_window_minutes = stale_guard_window_minutes(active_guard_window_minutes);
+    let guard_retention_minutes = guard_retention_window_minutes(stale_guard_window_minutes);
     let vehicle_recency = vehicle_recency_minutes();
+    let snapshot_time = Utc::now();
 
     let client_sites = sqlx::query(
         r#"SELECT id, name, address, latitude, longitude, is_active
@@ -758,63 +971,177 @@ async fn fetch_map_snapshot(
 
     let tracking_points = if role == "guard" {
         sqlx::query(
-                        r#"SELECT id, entity_type, entity_id, user_id, label, status, latitude, longitude, heading, speed_kph, accuracy_meters, recorded_at
-                             FROM tracking_points
-                             WHERE entity_type IN ('guard')
-                                 AND entity_id = $1
-                                 AND recorded_at >= (CURRENT_TIMESTAMP - ($2 || ' minutes')::interval)
-                                 AND accuracy_meters IS NOT NULL
-                                 AND accuracy_meters <= $3
-                             ORDER BY recorded_at DESC
-                             LIMIT 1"#,
+            r#"WITH latest AS (
+                   SELECT
+                       tp.id,
+                       tp.entity_type,
+                       tp.entity_id,
+                       tp.user_id,
+                       tp.label,
+                       tp.status,
+                       tp.latitude,
+                       tp.longitude,
+                       tp.heading,
+                       tp.speed_kph,
+                       tp.accuracy_meters,
+                       tp.recorded_at,
+                       ROW_NUMBER() OVER (PARTITION BY tp.entity_id ORDER BY tp.recorded_at DESC) AS rn
+                   FROM tracking_points tp
+                   WHERE tp.entity_type IN ('guard')
+                     AND tp.entity_id = $1
+                     AND tp.recorded_at >= (CURRENT_TIMESTAMP - ($2 || ' minutes')::interval)
+               ),
+               selected AS (
+                   SELECT
+                       id,
+                       entity_type,
+                       entity_id,
+                       user_id,
+                       label,
+                       status,
+                       latitude,
+                       longitude,
+                       heading,
+                       speed_kph,
+                       accuracy_meters,
+                       recorded_at
+                   FROM latest
+                   WHERE rn = 1
+               )
+               SELECT
+                   selected.id,
+                   selected.entity_type,
+                   selected.entity_id,
+                   selected.user_id,
+                   selected.label,
+                   selected.status,
+                   selected.latitude,
+                   selected.longitude,
+                   selected.heading,
+                   selected.speed_kph,
+                   selected.accuracy_meters,
+                   selected.recorded_at,
+                   shift_ctx.shift_id,
+                   shift_ctx.shift_status,
+                   shift_ctx.shift_start_time,
+                   shift_ctx.shift_end_time,
+                   shift_ctx.shift_client_site
+               FROM selected
+               LEFT JOIN LATERAL (
+                   SELECT
+                       s.id AS shift_id,
+                       s.status AS shift_status,
+                       s.start_time AS shift_start_time,
+                       s.end_time AS shift_end_time,
+                       s.client_site AS shift_client_site
+                   FROM shifts s
+                   WHERE s.guard_id = selected.entity_id
+                     AND s.end_time >= (CURRENT_TIMESTAMP - INTERVAL '12 hours')
+                   ORDER BY
+                       CASE
+                           WHEN CURRENT_TIMESTAMP BETWEEN s.start_time AND s.end_time THEN 0
+                           WHEN s.start_time > CURRENT_TIMESTAMP THEN 1
+                           ELSE 2
+                       END,
+                       ABS(EXTRACT(EPOCH FROM (s.start_time - CURRENT_TIMESTAMP))) ASC
+                   LIMIT 1
+               ) shift_ctx ON true"#,
         )
         .bind(&claims.sub)
-        .bind(person_recency.to_string())
-        .bind(required_accuracy)
+        .bind(guard_retention_minutes.to_string())
         .fetch_all(db)
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to fetch guard tracking points: {}", e)))?
     } else {
         sqlx::query(
-                        r#"WITH ranked_points AS (
-                                     SELECT
-                                         id,
-                                         entity_type,
-                                         entity_id,
-                                         user_id,
-                                         label,
-                                         status,
-                                         latitude,
-                                         longitude,
-                                         heading,
-                                         speed_kph,
-                                         accuracy_meters,
-                                         recorded_at,
-                                         ROW_NUMBER() OVER (
-                                             PARTITION BY entity_type, entity_id
-                                             ORDER BY recorded_at DESC
-                                         ) AS rn
-                                     FROM tracking_points
-                                     WHERE (
-                                         entity_type IN ('guard')
-                                         AND recorded_at >= (CURRENT_TIMESTAMP - ($1 || ' minutes')::interval)
-                                         AND accuracy_meters IS NOT NULL
-                                         AND accuracy_meters <= $2
-                                     )
-                                     OR (
-                                         entity_type = 'vehicle'
-                                         AND recorded_at >= (CURRENT_TIMESTAMP - ($3 || ' minutes')::interval)
-                                     )
-                             )
-                             SELECT
-                                 id, entity_type, entity_id, user_id, label, status, latitude, longitude, heading, speed_kph, accuracy_meters, recorded_at
-                             FROM ranked_points
-                             WHERE rn = 1
-                             ORDER BY entity_type, entity_id
+            r#"WITH ranked_points AS (
+                   SELECT
+                       id,
+                       entity_type,
+                       entity_id,
+                       user_id,
+                       label,
+                       status,
+                       latitude,
+                       longitude,
+                       heading,
+                       speed_kph,
+                       accuracy_meters,
+                       recorded_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY entity_type, entity_id
+                           ORDER BY recorded_at DESC
+                       ) AS rn
+                   FROM tracking_points
+                   WHERE (
+                       entity_type IN ('guard')
+                       AND recorded_at >= (CURRENT_TIMESTAMP - ($1 || ' minutes')::interval)
+                   )
+                   OR (
+                       entity_type = 'vehicle'
+                       AND recorded_at >= (CURRENT_TIMESTAMP - ($2 || ' minutes')::interval)
+                   )
+               ),
+               selected AS (
+                   SELECT
+                       id,
+                       entity_type,
+                       entity_id,
+                       user_id,
+                       label,
+                       status,
+                       latitude,
+                       longitude,
+                       heading,
+                       speed_kph,
+                       accuracy_meters,
+                       recorded_at
+                   FROM ranked_points
+                   WHERE rn = 1
+               )
+               SELECT
+                   selected.id,
+                   selected.entity_type,
+                   selected.entity_id,
+                   selected.user_id,
+                   selected.label,
+                   selected.status,
+                   selected.latitude,
+                   selected.longitude,
+                   selected.heading,
+                   selected.speed_kph,
+                   selected.accuracy_meters,
+                   selected.recorded_at,
+                   shift_ctx.shift_id,
+                   shift_ctx.shift_status,
+                   shift_ctx.shift_start_time,
+                   shift_ctx.shift_end_time,
+                   shift_ctx.shift_client_site
+               FROM selected
+               LEFT JOIN LATERAL (
+                   SELECT
+                       s.id AS shift_id,
+                       s.status AS shift_status,
+                       s.start_time AS shift_start_time,
+                       s.end_time AS shift_end_time,
+                       s.client_site AS shift_client_site
+                   FROM shifts s
+                   WHERE selected.entity_type = 'guard'
+                     AND s.guard_id = selected.entity_id
+                     AND s.end_time >= (CURRENT_TIMESTAMP - INTERVAL '12 hours')
+                   ORDER BY
+                       CASE
+                           WHEN CURRENT_TIMESTAMP BETWEEN s.start_time AND s.end_time THEN 0
+                           WHEN s.start_time > CURRENT_TIMESTAMP THEN 1
+                           ELSE 2
+                       END,
+                       ABS(EXTRACT(EPOCH FROM (s.start_time - CURRENT_TIMESTAMP))) ASC
+                   LIMIT 1
+               ) shift_ctx ON true
+               ORDER BY selected.entity_type, selected.entity_id
                LIMIT 300"#,
         )
-        .bind(person_recency.to_string())
-        .bind(required_accuracy)
+        .bind(guard_retention_minutes.to_string())
         .bind(vehicle_recency.to_string())
         .fetch_all(db)
         .await
@@ -885,6 +1212,9 @@ async fn fetch_map_snapshot(
     let points_payload: Vec<serde_json::Value> = tracking_points
         .into_iter()
         .map(|row| {
+            let entity_type = row
+                .try_get::<String, _>("entity_type")
+                .unwrap_or_default();
             let recorded_at = row
                 .try_get::<chrono::DateTime<chrono::Utc>, _>("recorded_at")
                 .ok();
@@ -892,10 +1222,44 @@ async fn fetch_map_snapshot(
                 .try_get::<Option<String>, _>("status")
                 .unwrap_or(None);
             let speed_kph = row.try_get::<Option<f64>, _>("speed_kph").unwrap_or(None);
+            let accuracy_meters = row
+                .try_get::<Option<f64>, _>("accuracy_meters")
+                .unwrap_or(None);
+            let raw_shift_status = row
+                .try_get::<Option<String>, _>("shift_status")
+                .unwrap_or(None);
+            let schedule_start_time = row
+                .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("shift_start_time")
+                .unwrap_or(None)
+                .map(|value| value.to_rfc3339());
+            let schedule_end_time = row
+                .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("shift_end_time")
+                .unwrap_or(None)
+                .map(|value| value.to_rfc3339());
+            let source = derive_tracking_source(status.as_deref(), accuracy_meters);
+            let approximate = source == "approximate";
+
+            let heartbeat_status = recorded_at
+                .map(|recorded| {
+                    if entity_type == "guard" {
+                        classify_guard_presence_at(
+                            snapshot_time,
+                            recorded,
+                            active_guard_window_minutes,
+                            stale_guard_window_minutes,
+                        )
+                        .to_string()
+                    } else if (snapshot_time - recorded).num_minutes().max(0) > vehicle_recency {
+                        "offline".to_string()
+                    } else {
+                        "active".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "offline".to_string());
 
             json!({
                 "id": row.try_get::<String, _>("id").unwrap_or_default(),
-                "entityType": row.try_get::<String, _>("entity_type").unwrap_or_default(),
+                "entityType": entity_type,
                 "entityId": row.try_get::<String, _>("entity_id").unwrap_or_default(),
                 "userId": row.try_get::<Option<String>, _>("user_id").unwrap_or(None),
                 "label": row.try_get::<Option<String>, _>("label").unwrap_or(None),
@@ -904,13 +1268,24 @@ async fn fetch_map_snapshot(
                 "longitude": row.try_get::<f64, _>("longitude").unwrap_or(0.0),
                 "heading": row.try_get::<Option<f64>, _>("heading").unwrap_or(None),
                 "speedKph": speed_kph,
-                "accuracyMeters": row.try_get::<Option<f64>, _>("accuracy_meters").unwrap_or(None),
+                "accuracyMeters": accuracy_meters,
+                "source": source,
+                "approximate": approximate,
                 "movementStatus": recorded_at
                     .map(|recorded| derive_movement_status(status.as_deref(), speed_kph, recorded).to_string())
                     .unwrap_or_else(|| "offline".to_string()),
+                "heartbeatStatus": heartbeat_status,
+                "scheduleStatus": derive_schedule_status(raw_shift_status.as_deref()),
+                "scheduleShiftId": row.try_get::<Option<String>, _>("shift_id").unwrap_or(None),
+                "scheduleClientSite": row.try_get::<Option<String>, _>("shift_client_site").unwrap_or(None),
+                "scheduleStartTime": schedule_start_time,
+                "scheduleEndTime": schedule_end_time,
                 "recordedAt": recorded_at
                     .map(|d| d.to_rfc3339())
                     .unwrap_or_default(),
+                "ageSeconds": recorded_at
+                    .map(|recorded| (snapshot_time - recorded).num_seconds().max(0))
+                    .unwrap_or(0),
             })
         })
         .collect();
@@ -976,6 +1351,12 @@ async fn fetch_map_snapshot(
         "geofenceZones": geofence_zone_payload,
         "trackingPoints": points_payload,
         "geofenceAlerts": geofence_payload,
+        "trackingWindows": {
+            "activeGuardMinutes": active_guard_window_minutes,
+            "staleGuardMinutes": stale_guard_window_minutes,
+            "guardRetentionMinutes": guard_retention_minutes,
+            "vehicleRecencyMinutes": vehicle_recency,
+        },
     }))
 }
 
@@ -1245,7 +1626,9 @@ pub async fn get_active_guards(
         .unwrap_or(ACTIVE_GUARD_WINDOW_MINUTES)
         .clamp(3, 120);
 
-    let required_accuracy = required_accuracy_meters();
+    let stale_window_minutes = stale_guard_window_minutes(window_minutes);
+    let retention_window_minutes = guard_retention_window_minutes(stale_window_minutes);
+    let snapshot_time = Utc::now();
 
     let rows = if role == "guard" {
         sqlx::query(
@@ -1267,31 +1650,67 @@ pub async fn get_active_guards(
                    WHERE tp.entity_type IN ('guard')
                      AND tp.entity_id = $1
                      AND tp.recorded_at >= (CURRENT_TIMESTAMP - ($2 || ' minutes')::interval)
-                     AND tp.accuracy_meters IS NOT NULL
-                     AND tp.accuracy_meters <= $3
+               ),
+               selected AS (
+                   SELECT
+                       id,
+                       entity_id,
+                       user_id,
+                       label,
+                       status,
+                       latitude,
+                       longitude,
+                       heading,
+                       speed_kph,
+                       accuracy_meters,
+                       recorded_at
+                   FROM latest
+                   WHERE rn = 1
                )
                SELECT
-                   latest.id,
-                   latest.entity_id,
-                   latest.user_id,
-                   latest.label,
-                   latest.status,
-                   latest.latitude,
-                   latest.longitude,
-                   latest.heading,
-                   latest.speed_kph,
-                   latest.accuracy_meters,
-                   latest.recorded_at,
+                   selected.id,
+                   selected.entity_id,
+                   selected.user_id,
+                   selected.label,
+                   selected.status,
+                   selected.latitude,
+                   selected.longitude,
+                   selected.heading,
+                   selected.speed_kph,
+                   selected.accuracy_meters,
+                   selected.recorded_at,
                    COALESCE(NULLIF(u.full_name, ''), u.username) AS guard_name,
-                   u.role AS guard_role
-               FROM latest
-               LEFT JOIN users u ON u.id = latest.entity_id
-               WHERE latest.rn = 1
-               ORDER BY latest.recorded_at DESC"#,
+                   u.role AS guard_role,
+                   shift_ctx.shift_id,
+                   shift_ctx.shift_status,
+                   shift_ctx.shift_start_time,
+                   shift_ctx.shift_end_time,
+                   shift_ctx.shift_client_site
+               FROM selected
+               LEFT JOIN users u ON u.id = selected.entity_id
+               LEFT JOIN LATERAL (
+                   SELECT
+                       s.id AS shift_id,
+                       s.status AS shift_status,
+                       s.start_time AS shift_start_time,
+                       s.end_time AS shift_end_time,
+                       s.client_site AS shift_client_site
+                   FROM shifts s
+                   WHERE s.guard_id = selected.entity_id
+                     AND s.end_time >= (CURRENT_TIMESTAMP - INTERVAL '12 hours')
+                   ORDER BY
+                       CASE
+                           WHEN CURRENT_TIMESTAMP BETWEEN s.start_time AND s.end_time THEN 0
+                           WHEN s.start_time > CURRENT_TIMESTAMP THEN 1
+                           ELSE 2
+                       END,
+                       ABS(EXTRACT(EPOCH FROM (s.start_time - CURRENT_TIMESTAMP))) ASC
+                   LIMIT 1
+               ) shift_ctx ON true
+               ORDER BY selected.recorded_at DESC"#,
         )
         .bind(&claims.sub)
-        .bind(window_minutes.to_string())
-        .bind(required_accuracy)
+        .bind(retention_window_minutes.to_string())
         .fetch_all(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to fetch active guard: {}", e)))?
@@ -1314,43 +1733,113 @@ pub async fn get_active_guards(
                    FROM tracking_points tp
                    WHERE tp.entity_type IN ('guard')
                      AND tp.recorded_at >= (CURRENT_TIMESTAMP - ($1 || ' minutes')::interval)
-                     AND tp.accuracy_meters IS NOT NULL
-                     AND tp.accuracy_meters <= $2
+               ),
+               selected AS (
+                   SELECT
+                       id,
+                       entity_id,
+                       user_id,
+                       label,
+                       status,
+                       latitude,
+                       longitude,
+                       heading,
+                       speed_kph,
+                       accuracy_meters,
+                       recorded_at
+                   FROM latest
+                   WHERE rn = 1
                )
                SELECT
-                   latest.id,
-                   latest.entity_id,
-                   latest.user_id,
-                   latest.label,
-                   latest.status,
-                   latest.latitude,
-                   latest.longitude,
-                   latest.heading,
-                   latest.speed_kph,
-                   latest.accuracy_meters,
-                   latest.recorded_at,
+                   selected.id,
+                   selected.entity_id,
+                   selected.user_id,
+                   selected.label,
+                   selected.status,
+                   selected.latitude,
+                   selected.longitude,
+                   selected.heading,
+                   selected.speed_kph,
+                   selected.accuracy_meters,
+                   selected.recorded_at,
                    COALESCE(NULLIF(u.full_name, ''), u.username) AS guard_name,
-                   u.role AS guard_role
-               FROM latest
-               LEFT JOIN users u ON u.id = latest.entity_id
-               WHERE latest.rn = 1
-               ORDER BY latest.recorded_at DESC"#,
+                   u.role AS guard_role,
+                   shift_ctx.shift_id,
+                   shift_ctx.shift_status,
+                   shift_ctx.shift_start_time,
+                   shift_ctx.shift_end_time,
+                   shift_ctx.shift_client_site
+               FROM selected
+               LEFT JOIN users u ON u.id = selected.entity_id
+               LEFT JOIN LATERAL (
+                   SELECT
+                       s.id AS shift_id,
+                       s.status AS shift_status,
+                       s.start_time AS shift_start_time,
+                       s.end_time AS shift_end_time,
+                       s.client_site AS shift_client_site
+                   FROM shifts s
+                   WHERE s.guard_id = selected.entity_id
+                     AND s.end_time >= (CURRENT_TIMESTAMP - INTERVAL '12 hours')
+                   ORDER BY
+                       CASE
+                           WHEN CURRENT_TIMESTAMP BETWEEN s.start_time AND s.end_time THEN 0
+                           WHEN s.start_time > CURRENT_TIMESTAMP THEN 1
+                           ELSE 2
+                       END,
+                       ABS(EXTRACT(EPOCH FROM (s.start_time - CURRENT_TIMESTAMP))) ASC
+                   LIMIT 1
+               ) shift_ctx ON true
+               ORDER BY selected.recorded_at DESC"#,
         )
-        .bind(window_minutes.to_string())
-        .bind(required_accuracy)
+        .bind(retention_window_minutes.to_string())
         .fetch_all(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to fetch active guards: {}", e)))?
     };
+
+    let mut active_count = 0usize;
+    let mut stale_count = 0usize;
+    let mut offline_count = 0usize;
 
     let guards: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|row| {
             let recorded_at = row
                 .try_get::<chrono::DateTime<chrono::Utc>, _>("recorded_at")
-                .unwrap_or_else(|_| Utc::now());
+                .unwrap_or(snapshot_time);
             let status = row.try_get::<Option<String>, _>("status").unwrap_or(None);
             let speed_kph = row.try_get::<Option<f64>, _>("speed_kph").unwrap_or(None);
+            let accuracy_meters = row
+                .try_get::<Option<f64>, _>("accuracy_meters")
+                .unwrap_or(None);
+            let source = derive_tracking_source(status.as_deref(), accuracy_meters);
+            let approximate = source == "approximate";
+            let heartbeat_status = classify_guard_presence_at(
+                snapshot_time,
+                recorded_at,
+                window_minutes,
+                stale_window_minutes,
+            );
+
+            match heartbeat_status {
+                "active" => active_count += 1,
+                "stale" => stale_count += 1,
+                _ => offline_count += 1,
+            }
+
+            let raw_shift_status = row
+                .try_get::<Option<String>, _>("shift_status")
+                .unwrap_or(None);
+
+            let shift_start_time = row
+                .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("shift_start_time")
+                .unwrap_or(None)
+                .map(|value| value.to_rfc3339());
+            let shift_end_time = row
+                .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("shift_end_time")
+                .unwrap_or(None)
+                .map(|value| value.to_rfc3339());
 
             json!({
                 "id": row.try_get::<String, _>("id").unwrap_or_default(),
@@ -1365,16 +1854,31 @@ pub async fn get_active_guards(
                 "longitude": row.try_get::<f64, _>("longitude").unwrap_or(0.0),
                 "heading": row.try_get::<Option<f64>, _>("heading").unwrap_or(None),
                 "speedKph": speed_kph,
-                "accuracyMeters": row.try_get::<Option<f64>, _>("accuracy_meters").unwrap_or(None),
+                "accuracyMeters": accuracy_meters,
+                "source": source,
+                "approximate": approximate,
                 "recordedAt": recorded_at.to_rfc3339(),
-                "ageSeconds": (Utc::now() - recorded_at).num_seconds().max(0),
+                "ageSeconds": (snapshot_time - recorded_at).num_seconds().max(0),
+                "heartbeatStatus": heartbeat_status,
+                "scheduleStatus": derive_schedule_status(raw_shift_status.as_deref()),
+                "scheduleShiftId": row.try_get::<Option<String>, _>("shift_id").unwrap_or(None),
+                "scheduleClientSite": row
+                    .try_get::<Option<String>, _>("shift_client_site")
+                    .unwrap_or(None),
+                "scheduleStartTime": shift_start_time,
+                "scheduleEndTime": shift_end_time,
             })
         })
         .collect();
 
     Ok(Json(json!({
         "windowMinutes": window_minutes,
-        "activeCount": guards.len(),
+        "staleWindowMinutes": stale_window_minutes,
+        "retentionWindowMinutes": retention_window_minutes,
+        "activeCount": active_count,
+        "staleCount": stale_count,
+        "offlineCount": offline_count,
+        "totalCount": guards.len(),
         "guards": guards,
     })))
 }
@@ -1395,6 +1899,208 @@ pub async fn get_map_data(
     let snapshot = fetch_map_snapshot(db.as_ref(), &claims).await?;
 
     Ok(Json(snapshot))
+}
+
+pub async fn get_tracking_consent_status(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+) -> AppResult<Json<serde_json::Value>> {
+    let token = utils::extract_bearer_token(&headers)?;
+    let claims = utils::verify_token(&token)?;
+
+    let consent_state = get_location_tracking_consent_state(db.as_ref(), &claims.sub).await?;
+
+    Ok(Json(json!({
+        "legalConsentAccepted": claims.legal_consent_accepted,
+        "locationTrackingConsent": consent_state.granted,
+        "locationTrackingConsentGrantedAt": consent_state.granted_at,
+        "locationTrackingConsentRevokedAt": consent_state.revoked_at,
+        "locationTrackingConsentUpdatedAt": consent_state.updated_at,
+    })))
+}
+
+pub async fn grant_tracking_consent(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+) -> AppResult<Json<serde_json::Value>> {
+    let token = utils::extract_bearer_token(&headers)?;
+    let claims = utils::verify_token(&token)?;
+
+    if !claims.legal_consent_accepted {
+        return Err(AppError::Forbidden(
+            "Legal consent required. Please accept Terms of Agreement to continue.".to_string(),
+        ));
+    }
+
+    let previous_state = get_location_tracking_consent_state(db.as_ref(), &claims.sub).await?;
+    let source_ip = utils::extract_requester(&headers);
+    let user_agent = extract_user_agent(&headers);
+
+    let updated_row = sqlx::query(
+        r#"UPDATE users
+           SET location_tracking_consent = true,
+               location_tracking_consent_granted_at = CURRENT_TIMESTAMP,
+               location_tracking_consent_revoked_at = NULL,
+               location_tracking_consent_updated_at = CURRENT_TIMESTAMP,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1
+           RETURNING
+               location_tracking_consent,
+               location_tracking_consent_granted_at,
+               location_tracking_consent_revoked_at,
+               location_tracking_consent_updated_at"#,
+    )
+    .bind(&claims.sub)
+    .fetch_optional(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to grant tracking consent: {}", e)))?;
+
+    let updated_row =
+        updated_row.ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    let granted_at: Option<chrono::DateTime<chrono::Utc>> = updated_row
+        .try_get("location_tracking_consent_granted_at")
+        .map_err(|e| {
+            AppError::DatabaseError(format!(
+                "Failed to parse location_tracking_consent_granted_at value: {}",
+                e
+            ))
+        })?;
+    let updated_at: Option<chrono::DateTime<chrono::Utc>> = updated_row
+        .try_get("location_tracking_consent_updated_at")
+        .map_err(|e| {
+            AppError::DatabaseError(format!(
+                "Failed to parse location_tracking_consent_updated_at value: {}",
+                e
+            ))
+        })?;
+
+    record_tracking_consent_audit(
+        db.as_ref(),
+        &claims.sub,
+        "TRACKING_CONSENT_GRANTED",
+        &source_ip,
+        user_agent.as_deref(),
+        json!({
+            "previous": {
+                "granted": previous_state.granted,
+                "grantedAt": previous_state.granted_at,
+                "revokedAt": previous_state.revoked_at,
+                "updatedAt": previous_state.updated_at,
+            },
+            "current": {
+                "granted": true,
+                "grantedAt": granted_at,
+                "revokedAt": serde_json::Value::Null,
+                "updatedAt": updated_at,
+            }
+        }),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "message": "Location tracking consent granted",
+        "legalConsentAccepted": true,
+        "locationTrackingConsent": true,
+        "locationTrackingConsentGrantedAt": granted_at,
+        "locationTrackingConsentUpdatedAt": updated_at,
+    })))
+}
+
+pub async fn revoke_tracking_consent(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+) -> AppResult<Json<serde_json::Value>> {
+    let token = utils::extract_bearer_token(&headers)?;
+    let claims = utils::verify_token(&token)?;
+
+    if !claims.legal_consent_accepted {
+        return Err(AppError::Forbidden(
+            "Legal consent required. Please accept Terms of Agreement to continue.".to_string(),
+        ));
+    }
+
+    let previous_state = get_location_tracking_consent_state(db.as_ref(), &claims.sub).await?;
+    let source_ip = utils::extract_requester(&headers);
+    let user_agent = extract_user_agent(&headers);
+
+    let updated_row = sqlx::query(
+        r#"UPDATE users
+           SET location_tracking_consent = false,
+               location_tracking_consent_revoked_at = CURRENT_TIMESTAMP,
+               location_tracking_consent_updated_at = CURRENT_TIMESTAMP,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1
+           RETURNING
+               location_tracking_consent,
+               location_tracking_consent_granted_at,
+               location_tracking_consent_revoked_at,
+               location_tracking_consent_updated_at"#,
+    )
+    .bind(&claims.sub)
+    .fetch_optional(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to revoke tracking consent: {}", e)))?;
+
+    let updated_row =
+        updated_row.ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+
+    let granted_at: Option<chrono::DateTime<chrono::Utc>> = updated_row
+        .try_get("location_tracking_consent_granted_at")
+        .map_err(|e| {
+            AppError::DatabaseError(format!(
+                "Failed to parse location_tracking_consent_granted_at value: {}",
+                e
+            ))
+        })?;
+    let revoked_at: Option<chrono::DateTime<chrono::Utc>> = updated_row
+        .try_get("location_tracking_consent_revoked_at")
+        .map_err(|e| {
+            AppError::DatabaseError(format!(
+                "Failed to parse location_tracking_consent_revoked_at value: {}",
+                e
+            ))
+        })?;
+    let updated_at: Option<chrono::DateTime<chrono::Utc>> = updated_row
+        .try_get("location_tracking_consent_updated_at")
+        .map_err(|e| {
+            AppError::DatabaseError(format!(
+                "Failed to parse location_tracking_consent_updated_at value: {}",
+                e
+            ))
+        })?;
+
+    record_tracking_consent_audit(
+        db.as_ref(),
+        &claims.sub,
+        "TRACKING_CONSENT_REVOKED",
+        &source_ip,
+        user_agent.as_deref(),
+        json!({
+            "previous": {
+                "granted": previous_state.granted,
+                "grantedAt": previous_state.granted_at,
+                "revokedAt": previous_state.revoked_at,
+                "updatedAt": previous_state.updated_at,
+            },
+            "current": {
+                "granted": false,
+                "grantedAt": granted_at,
+                "revokedAt": revoked_at,
+                "updatedAt": updated_at,
+            }
+        }),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "message": "Location tracking consent revoked",
+        "legalConsentAccepted": true,
+        "locationTrackingConsent": false,
+        "locationTrackingConsentGrantedAt": granted_at,
+        "locationTrackingConsentRevokedAt": revoked_at,
+        "locationTrackingConsentUpdatedAt": updated_at,
+    })))
 }
 
 pub async fn check_shift_proximity_alerts(
@@ -1796,7 +2502,30 @@ pub async fn guard_heartbeat(
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let token = utils::extract_bearer_token(&headers)?;
     let claims = utils::verify_token(&token)?;
+
+    if !claims.legal_consent_accepted {
+        return Err(AppError::Forbidden(
+            "Legal consent required. Please accept Terms of Agreement to continue.".to_string(),
+        ));
+    }
+
+    let consent_state = get_location_tracking_consent_state(db.as_ref(), &claims.sub).await?;
+    if !consent_state.granted {
+        return Ok((
+            StatusCode::FORBIDDEN,
+            Json(tracking_consent_required_payload(true)),
+        ));
+    }
+
     let actor_role = utils::normalize_role(&claims.role);
+
+    // Only guard and supervisor roles are allowed to send heartbeats
+    if actor_role != "guard" && actor_role != "supervisor" {
+        return Err(AppError::Forbidden(
+            "Only guard and supervisor roles may send location heartbeats.".to_string(),
+        ));
+    }
+
     let entity_type = if actor_role == "guard" {
         "guard"
     } else {
@@ -1977,18 +2706,14 @@ pub async fn tracking_ws(
     Query(query): Query<TrackingWsAuthQuery>,
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
-    let protocol_token = extract_ws_token_from_protocols(&headers);
-    let query_token = query
-        .token
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string());
+    reject_query_string_ws_token(&query)?;
 
-    let token = protocol_token.or(query_token).ok_or_else(|| {
+    let protocol_token = extract_ws_token_from_protocols(&headers);
+
+    let token = protocol_token.ok_or_else(|| {
         tracing::warn!("Rejected tracking websocket upgrade due to missing token");
         AppError::Unauthorized(
-            "Missing websocket token".to_string(),
+            "Missing websocket token in Sec-WebSocket-Protocol header".to_string(),
         )
     })?;
 
@@ -2028,5 +2753,69 @@ pub async fn tracking_ws(
     };
 
     Ok(ws_upgrade.on_upgrade(move |socket| handle_tracking_ws(socket, db, claims)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        classify_guard_presence_at, derive_schedule_status, derive_tracking_source,
+        reject_query_string_ws_token, TrackingWsAuthQuery,
+    };
+    use chrono::{Duration, Utc};
+
+    use crate::error::AppError;
+
+    #[test]
+    fn classify_guard_presence_distinguishes_active_stale_and_offline() {
+        let now = Utc::now();
+
+        let active = classify_guard_presence_at(now, now - Duration::minutes(3), 15, 120);
+        let stale = classify_guard_presence_at(now, now - Duration::minutes(30), 15, 120);
+        let offline = classify_guard_presence_at(now, now - Duration::minutes(180), 15, 120);
+
+        assert_eq!(active, "active");
+        assert_eq!(stale, "stale");
+        assert_eq!(offline, "offline");
+    }
+
+    #[test]
+    fn derive_tracking_source_flags_approximate_and_gps() {
+        assert_eq!(
+            derive_tracking_source(Some("approximate"), Some(8000.0)),
+            "approximate"
+        );
+        assert_eq!(
+            derive_tracking_source(Some("active"), Some(15.0)),
+            "gps"
+        );
+        assert_eq!(
+            derive_tracking_source(Some("active"), Some(9000.0)),
+            "approximate"
+        );
+        assert_eq!(derive_tracking_source(None, None), "unknown");
+    }
+
+    #[test]
+    fn derive_schedule_status_defaults_when_unavailable() {
+        assert_eq!(derive_schedule_status(None), "unscheduled");
+        assert_eq!(derive_schedule_status(Some("  ")), "unscheduled");
+        assert_eq!(derive_schedule_status(Some("in_progress")), "in_progress");
+    }
+
+    #[test]
+    fn websocket_query_token_auth_is_explicitly_rejected() {
+        let query = TrackingWsAuthQuery {
+            token: Some("query-token".to_string()),
+        };
+
+        let result = reject_query_string_ws_token(&query);
+        assert!(matches!(result, Err(AppError::Unauthorized(_))));
+    }
+
+    #[test]
+    fn websocket_query_token_check_allows_missing_token() {
+        let query = TrackingWsAuthQuery { token: None };
+        assert!(reject_query_string_ws_token(&query).is_ok());
+    }
 }
 
