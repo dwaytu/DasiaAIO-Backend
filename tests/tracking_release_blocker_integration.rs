@@ -38,6 +38,11 @@ fn jwt_secret() -> String {
     env::var("JWT_SECRET").unwrap_or_else(|_| "your-secret-key-change-in-production".to_string())
 }
 
+fn test_user_id() -> String {
+    // users.id and related foreign keys are constrained to VARCHAR(36)
+    Uuid::new_v4().to_string()
+}
+
 fn build_token(role: &str, subject: &str, legal_consent_accepted: bool) -> String {
     let now = Utc::now();
     let claims = Claims {
@@ -230,7 +235,7 @@ async fn unscheduled_guard_heartbeat_is_accepted() -> Result<(), Box<dyn std::er
         return Ok(());
     };
 
-    let guard_id = format!("itest-unscheduled-heartbeat-{}", Uuid::new_v4());
+    let guard_id = test_user_id();
     upsert_test_user(&pool, &guard_id, "guard", true, false).await?;
 
     let guard_token = build_token("guard", &guard_id, true);
@@ -287,8 +292,8 @@ async fn unscheduled_guard_appears_in_map_data() -> Result<(), Box<dyn std::erro
         return Ok(());
     };
 
-    let supervisor_id = format!("itest-map-supervisor-{}", Uuid::new_v4());
-    let guard_id = format!("itest-map-guard-{}", Uuid::new_v4());
+    let supervisor_id = test_user_id();
+    let guard_id = test_user_id();
 
     upsert_test_user(&pool, &supervisor_id, "supervisor", true, true).await?;
     upsert_test_user(&pool, &guard_id, "guard", true, true).await?;
@@ -345,9 +350,9 @@ async fn stale_and_offline_classification_use_heartbeat_age() -> Result<(), Box<
         return Ok(());
     };
 
-    let supervisor_id = format!("itest-active-supervisor-{}", Uuid::new_v4());
-    let stale_guard_id = format!("itest-stale-guard-{}", Uuid::new_v4());
-    let offline_guard_id = format!("itest-offline-guard-{}", Uuid::new_v4());
+    let supervisor_id = test_user_id();
+    let stale_guard_id = test_user_id();
+    let offline_guard_id = test_user_id();
 
     upsert_test_user(&pool, &supervisor_id, "supervisor", true, true).await?;
     upsert_test_user(&pool, &stale_guard_id, "guard", true, true).await?;
@@ -411,7 +416,7 @@ async fn heartbeat_is_rejected_when_server_location_consent_is_missing(
         return Ok(());
     };
 
-    let guard_id = format!("itest-consent-missing-{}", Uuid::new_v4());
+    let guard_id = test_user_id();
     upsert_test_user(&pool, &guard_id, "guard", true, false).await?;
 
     let guard_token = build_token("guard", &guard_id, true);
@@ -453,7 +458,7 @@ async fn websocket_query_token_auth_is_rejected() -> Result<(), Box<dyn std::err
         return Ok(());
     };
 
-    let supervisor_id = format!("itest-ws-supervisor-{}", Uuid::new_v4());
+    let supervisor_id = test_user_id();
     upsert_test_user(&pool, &supervisor_id, "supervisor", true, true).await?;
 
     let supervisor_token = build_token("supervisor", &supervisor_id, true);
@@ -498,7 +503,7 @@ async fn supervisor_heartbeat_is_accepted_with_consent() -> Result<(), Box<dyn s
         return Ok(());
     };
 
-    let supervisor_id = format!("itest-sup-heartbeat-{}", Uuid::new_v4());
+    let supervisor_id = test_user_id();
     upsert_test_user(&pool, &supervisor_id, "supervisor", true, true).await?;
 
     let supervisor_token = build_token("supervisor", &supervisor_id, true);
@@ -536,7 +541,7 @@ async fn admin_heartbeat_is_rejected() -> Result<(), Box<dyn std::error::Error>>
         return Ok(());
     };
 
-    let admin_id = format!("itest-admin-heartbeat-{}", Uuid::new_v4());
+    let admin_id = test_user_id();
     upsert_test_user(&pool, &admin_id, "admin", true, true).await?;
 
     let admin_token = build_token("admin", &admin_id, true);
@@ -574,7 +579,7 @@ async fn superadmin_heartbeat_is_rejected() -> Result<(), Box<dyn std::error::Er
         return Ok(());
     };
 
-    let sa_id = format!("itest-sa-heartbeat-{}", Uuid::new_v4());
+    let sa_id = test_user_id();
     upsert_test_user(&pool, &sa_id, "superadmin", true, true).await?;
 
     let sa_token = build_token("superadmin", &sa_id, true);
