@@ -60,6 +60,7 @@ pub async fn require_authenticated(req: Request<Body>, next: Next) -> Result<Res
     let path = req.uri().path().to_string();
     let token = utils::extract_bearer_token(req.headers())?;
     let claims = utils::verify_token(&token)?;
+    let _validated_role = utils::normalize_authenticated_role(&claims.role)?;
     enforce_legal_consent(&path, &claims)?;
     Ok(next.run(req).await)
 }
@@ -185,5 +186,12 @@ mod tests {
         assert!(has_tracking_access_role("admin"));
         assert!(has_tracking_access_role("supervisor"));
         assert!(has_tracking_access_role("guard"));
+    }
+
+    #[test]
+    fn tracking_access_rejects_legacy_and_unknown_roles() {
+        assert!(!has_tracking_access_role("user"));
+        assert!(!has_tracking_access_role("guest"));
+        assert!(!has_tracking_access_role("   "));
     }
 }

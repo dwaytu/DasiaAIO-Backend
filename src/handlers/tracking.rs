@@ -440,6 +440,46 @@ fn is_guard_entity(entity_type: &str) -> bool {
     matches!(entity_type, "guard" | "user")
 }
 
+fn enforce_person_tracking_producer_scope(
+    actor_role: &str,
+    actor_user_id: &str,
+    entity_type: &str,
+    entity_id: &str,
+) -> AppResult<()> {
+    if actor_role != "guard" && actor_role != "supervisor" {
+        return Err(AppError::Forbidden(
+            "Only guard and supervisor roles may submit guard/user tracking points.".to_string(),
+        ));
+    }
+
+    if actor_role == "guard" {
+        if entity_type != "guard" || entity_id != actor_user_id {
+            return Err(AppError::Forbidden(
+                "Guards can only submit their own guard tracking points".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    if entity_type != "user" || entity_id != actor_user_id {
+        return Err(AppError::Forbidden(
+            "Supervisors can only submit their own user tracking points".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn enforce_vehicle_tracking_producer_scope(actor_role: &str) -> AppResult<()> {
+    if actor_role == "guard" {
+        return Err(AppError::Forbidden(
+            "Guards are not allowed to submit vehicle tracking points".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn derive_movement_status(
     status: Option<&str>,
     speed_kph: Option<f64>,
@@ -2612,6 +2652,7 @@ pub async fn create_tracking_point(
     let claims = utils::verify_token(&token)?;
     let actor_role = utils::normalize_role(&claims.role);
     let entity_type = payload.entity_type.trim().to_lowercase();
+    let entity_id = payload.entity_id.trim();
 
     if !matches!(entity_type.as_str(), "guard" | "vehicle" | "user") {
         return Err(AppError::BadRequest(
@@ -2619,11 +2660,33 @@ pub async fn create_tracking_point(
         ));
     }
 
-    if payload.entity_id.trim().is_empty() {
+    if entity_id.is_empty() {
         return Err(AppError::BadRequest("entityId is required".to_string()));
     }
 
-    if matches!(entity_type.as_str(), "guard" | "user") {
+    if entity_type == "vehicle" {
+        enforce_vehicle_tracking_producer_scope(&actor_role)?;
+    }
+
+    if is_guard_entity(&entity_type) {
+        if !claims.legal_consent_accepted {
+            return Err(AppError::Forbidden(
+                "Legal consent required. Please accept Terms of Agreement to continue.".to_string(),
+            ));
+        }
+
+        let consent_state = get_location_tracking_consent_state(db.as_ref(), &claims.sub).await?;
+        if !consent_state.granted {
+            return Ok((
+                StatusCode::FORBIDDEN,
+                Json(tracking_consent_required_payload(
+                    claims.legal_consent_accepted,
+                )),
+            ));
+        }
+
+        enforce_person_tracking_producer_scope(&actor_role, &claims.sub, &entity_type, entity_id)?;
+
         let sample_accuracy = payload.accuracy_meters.unwrap_or(f64::INFINITY);
         let required_accuracy = required_accuracy_meters();
         if sample_accuracy > required_accuracy {
@@ -2641,17 +2704,9 @@ pub async fn create_tracking_point(
 
     validate_coordinates(payload.latitude, payload.longitude)?;
 
-    if actor_role == "guard" {
-        if entity_type != "guard" || payload.entity_id != claims.sub {
-            return Err(AppError::Forbidden(
-                "Guards can only submit their own guard tracking points".to_string(),
-            ));
-        }
-    }
-
     let tracking_id = utils::generate_id();
     let tracked_user_id = if is_guard_entity(&entity_type) {
-        Some(payload.entity_id.trim())
+        Some(entity_id)
     } else {
         None
     };
@@ -2663,7 +2718,7 @@ pub async fn create_tracking_point(
     )
     .bind(&tracking_id)
     .bind(&entity_type)
-    .bind(payload.entity_id.trim())
+    .bind(entity_id)
     .bind(tracked_user_id)
     .bind(payload.label.as_deref())
     .bind(payload.status.as_deref())
@@ -2680,7 +2735,7 @@ pub async fn create_tracking_point(
     let geofence_events = evaluate_geofence_transitions(
         db.as_ref(),
         &entity_type,
-        payload.entity_id.trim(),
+        entity_id,
         payload.label.as_deref(),
     )
     .await?;
@@ -2759,6 +2814,7 @@ pub async fn tracking_ws(
 mod tests {
     use super::{
         classify_guard_presence_at, derive_schedule_status, derive_tracking_source,
+        enforce_person_tracking_producer_scope, enforce_vehicle_tracking_producer_scope,
         reject_query_string_ws_token, TrackingWsAuthQuery,
     };
     use chrono::{Duration, Utc};
@@ -2816,6 +2872,70 @@ mod tests {
     fn websocket_query_token_check_allows_missing_token() {
         let query = TrackingWsAuthQuery { token: None };
         assert!(reject_query_string_ws_token(&query).is_ok());
+    }
+
+    #[test]
+    fn person_tracking_producer_scope_rejects_admin_for_guard_user_entities() {
+        let result = enforce_person_tracking_producer_scope("admin", "admin-1", "guard", "admin-1");
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
+    }
+
+    #[test]
+    fn person_tracking_producer_scope_enforces_guard_self_guard_entity() {
+        assert!(
+            enforce_person_tracking_producer_scope("guard", "guard-1", "guard", "guard-1")
+                .is_ok()
+        );
+
+        let wrong_entity_type =
+            enforce_person_tracking_producer_scope("guard", "guard-1", "user", "guard-1");
+        assert!(matches!(wrong_entity_type, Err(AppError::Forbidden(_))));
+
+        let wrong_entity_id =
+            enforce_person_tracking_producer_scope("guard", "guard-1", "guard", "guard-2");
+        assert!(matches!(wrong_entity_id, Err(AppError::Forbidden(_))));
+    }
+
+    #[test]
+    fn person_tracking_producer_scope_enforces_supervisor_self_user_entity() {
+        assert!(
+            enforce_person_tracking_producer_scope(
+                "supervisor",
+                "supervisor-1",
+                "user",
+                "supervisor-1"
+            )
+            .is_ok()
+        );
+
+        let wrong_entity_type = enforce_person_tracking_producer_scope(
+            "supervisor",
+            "supervisor-1",
+            "guard",
+            "supervisor-1",
+        );
+        assert!(matches!(wrong_entity_type, Err(AppError::Forbidden(_))));
+
+        let wrong_entity_id = enforce_person_tracking_producer_scope(
+            "supervisor",
+            "supervisor-1",
+            "user",
+            "supervisor-2",
+        );
+        assert!(matches!(wrong_entity_id, Err(AppError::Forbidden(_))));
+    }
+
+    #[test]
+    fn vehicle_tracking_producer_scope_rejects_guard_role() {
+        let result = enforce_vehicle_tracking_producer_scope("guard");
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
+    }
+
+    #[test]
+    fn vehicle_tracking_producer_scope_allows_non_guard_operational_roles() {
+        assert!(enforce_vehicle_tracking_producer_scope("supervisor").is_ok());
+        assert!(enforce_vehicle_tracking_producer_scope("admin").is_ok());
+        assert!(enforce_vehicle_tracking_producer_scope("superadmin").is_ok());
     }
 }
 

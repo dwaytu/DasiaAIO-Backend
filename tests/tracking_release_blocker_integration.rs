@@ -453,6 +453,128 @@ async fn heartbeat_is_rejected_when_server_location_consent_is_missing(
 }
 
 #[tokio::test]
+async fn tracking_points_for_guard_entity_require_server_location_consent(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((base_url, client, pool)) = setup_context().await? else {
+        return Ok(());
+    };
+
+    let guard_id = test_user_id();
+    upsert_test_user(&pool, &guard_id, "guard", true, false).await?;
+
+    let guard_token = build_token("guard", &guard_id, true);
+
+    let response = client
+        .post(format!("{}/api/tracking/points", base_url))
+        .header("Authorization", format!("Bearer {}", guard_token))
+        .json(&json!({
+            "entityType": "guard",
+            "entityId": guard_id,
+            "status": "active",
+            "latitude": 7.071,
+            "longitude": 125.611,
+            "accuracyMeters": 8.0
+        }))
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body = response_json(response).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "expected tracking point write to be blocked when consent is missing, body: {}",
+        body
+    );
+    assert_eq!(
+        body.get("code").and_then(Value::as_str),
+        Some("tracking_consent_required")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tracking_points_reject_admin_guard_user_producer_writes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((base_url, client, pool)) = setup_context().await? else {
+        return Ok(());
+    };
+
+    let admin_id = test_user_id();
+    upsert_test_user(&pool, &admin_id, "admin", true, true).await?;
+
+    let admin_token = build_token("admin", &admin_id, true);
+
+    let response = client
+        .post(format!("{}/api/tracking/points", base_url))
+        .header("Authorization", format!("Bearer {}", admin_token))
+        .json(&json!({
+            "entityType": "user",
+            "entityId": admin_id,
+            "status": "active",
+            "latitude": 7.071,
+            "longitude": 125.611,
+            "accuracyMeters": 8.0
+        }))
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body = response_json(response).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "expected admin guard/user producer write to be rejected, body: {}",
+        body
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tracking_points_reject_guard_vehicle_producer_writes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((base_url, client, pool)) = setup_context().await? else {
+        return Ok(());
+    };
+
+    let guard_id = test_user_id();
+    upsert_test_user(&pool, &guard_id, "guard", true, true).await?;
+
+    let guard_token = build_token("guard", &guard_id, true);
+    let vehicle_id = format!("vehicle-{}", Uuid::new_v4());
+
+    let response = client
+        .post(format!("{}/api/tracking/points", base_url))
+        .header("Authorization", format!("Bearer {}", guard_token))
+        .json(&json!({
+            "entityType": "vehicle",
+            "entityId": vehicle_id,
+            "status": "active",
+            "latitude": 7.071,
+            "longitude": 125.611,
+            "accuracyMeters": 8.0
+        }))
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body = response_json(response).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "expected guard vehicle producer write to be rejected, body: {}",
+        body
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn websocket_query_token_auth_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let Some((base_url, client, pool)) = setup_context().await? else {
         return Ok(());

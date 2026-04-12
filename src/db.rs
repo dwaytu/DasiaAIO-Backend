@@ -54,7 +54,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             email VARCHAR(255) NOT NULL UNIQUE,
             username VARCHAR(255) NOT NULL UNIQUE,
             password VARCHAR(255) NOT NULL,
-            role VARCHAR(50) NOT NULL DEFAULT 'user',
+            role VARCHAR(50) NOT NULL DEFAULT 'guard',
             full_name VARCHAR(255) NOT NULL,
             phone_number VARCHAR(20) NOT NULL,
             license_number VARCHAR(50),
@@ -69,6 +69,29 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .execute(pool)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create users table: {}", e)))?;
+
+    // Prevent fresh legacy role generation by enforcing canonical role default.
+    sqlx::query("ALTER TABLE users ALTER COLUMN role SET DEFAULT 'guard'")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to set users.role default to guard: {}", e))
+        })?;
+
+    // Migrate legacy stored aliases to canonical role values.
+    sqlx::query(
+        r#"UPDATE users
+           SET role = 'guard'
+           WHERE LOWER(BTRIM(role)) = 'user'"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to migrate legacy users.role aliases to guard: {}",
+            e
+        ))
+    })?;
 
     // Backfill profile_photo column for databases created before this migration
     sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_photo TEXT")

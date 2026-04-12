@@ -136,19 +136,23 @@ pub fn generate_refresh_token(
 pub fn verify_token(token: &str) -> AppResult<TokenClaims> {
     let secret = jwt_secret()?;
 
-    decode::<TokenClaims>(
+    let mut claims = decode::<TokenClaims>(
         token,
         &DecodingKey::from_secret(secret.as_ref()),
         &Validation::default(),
     )
     .map(|data| data.claims)
-    .map_err(|e| AppError::Unauthorized(format!("Invalid or expired token: {}", e)))
+    .map_err(|e| AppError::Unauthorized(format!("Invalid or expired token: {}", e)))?;
+
+    claims.role = normalize_authenticated_role(&claims.role)?;
+
+    Ok(claims)
 }
 
 pub fn verify_refresh_token(token: &str) -> AppResult<RefreshTokenClaims> {
     let secret = jwt_secret()?;
 
-    let claims = decode::<RefreshTokenClaims>(
+    let mut claims = decode::<RefreshTokenClaims>(
         token,
         &DecodingKey::from_secret(secret.as_ref()),
         &Validation::default(),
@@ -161,6 +165,8 @@ pub fn verify_refresh_token(token: &str) -> AppResult<RefreshTokenClaims> {
             "Invalid refresh token type".to_string(),
         ));
     }
+
+    claims.role = normalize_authenticated_role(&claims.role)?;
 
     Ok(claims)
 }
@@ -208,6 +214,17 @@ pub fn extract_requester(headers: &HeaderMap) -> String {
 
 pub fn normalize_role(role: &str) -> String {
     role.trim().to_lowercase()
+}
+
+pub fn normalize_authenticated_role(role: &str) -> AppResult<String> {
+    let normalized = normalize_role(role);
+
+    match normalized.as_str() {
+        "guard" | "supervisor" | "admin" | "superadmin" => Ok(normalized),
+        // Explicit compatibility alias for legacy claims; all other unknown roles are rejected.
+        "user" => Ok("guard".to_string()),
+        _ => Err(AppError::Unauthorized("Unsupported token role".to_string())),
+    }
 }
 
 pub fn role_rank(role: &str) -> Option<u8> {
@@ -486,5 +503,115 @@ pub async fn send_confirmation_email(api_key: &str, to_email: &str, code: &str) 
             "Email API error {}: {}",
             status, error_text
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_authenticated_role, verify_refresh_token, verify_token, RefreshTokenClaims, TokenClaims};
+    use crate::error::AppError;
+    use chrono::{Duration, Utc};
+    use jsonwebtoken::{encode, EncodingKey, Header};
+
+    fn set_test_jwt_secret() {
+        std::env::set_var("JWT_SECRET", "sentinel-test-jwt-secret");
+    }
+
+    fn issue_access_token_with_role(role: &str) -> String {
+        set_test_jwt_secret();
+        let now = Utc::now();
+        let claims = TokenClaims {
+            sub: "test-user-id".to_string(),
+            email: "test@example.com".to_string(),
+            role: role.to_string(),
+            legal_consent_accepted: true,
+            exp: (now + Duration::hours(2)).timestamp(),
+            iat: now.timestamp(),
+        };
+
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret("sentinel-test-jwt-secret".as_bytes()),
+        )
+        .expect("access token creation should succeed")
+    }
+
+    fn issue_refresh_token_with_role(role: &str) -> String {
+        set_test_jwt_secret();
+        let now = Utc::now();
+        let claims = RefreshTokenClaims {
+            sub: "test-user-id".to_string(),
+            email: "test@example.com".to_string(),
+            role: role.to_string(),
+            legal_consent_accepted: true,
+            token_type: "refresh".to_string(),
+            jti: "test-jti".to_string(),
+            exp: (now + Duration::hours(24)).timestamp(),
+            iat: now.timestamp(),
+        };
+
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret("sentinel-test-jwt-secret".as_bytes()),
+        )
+        .expect("refresh token creation should succeed")
+    }
+
+    #[test]
+    fn verify_token_rejects_unknown_or_malformed_roles() {
+        let token = issue_access_token_with_role("  malformed-role  ");
+        let error = verify_token(&token).expect_err("malformed role must be rejected");
+
+        match error {
+            AppError::Unauthorized(message) => {
+                assert!(message.contains("Unsupported token role"));
+            }
+            other => panic!("expected unauthorized error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_refresh_token_rejects_unknown_or_malformed_roles() {
+        let token = issue_refresh_token_with_role("  malformed-role  ");
+        let error = verify_refresh_token(&token)
+            .expect_err("malformed role must be rejected for refresh tokens");
+
+        match error {
+            AppError::Unauthorized(message) => {
+                assert!(message.contains("Unsupported token role"));
+            }
+            other => panic!("expected unauthorized error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_token_maps_legacy_user_role_claims_to_guard() {
+        let token = issue_access_token_with_role("user");
+        let claims = verify_token(&token).expect("legacy user role should map to guard");
+
+        assert_eq!(claims.role, "guard");
+    }
+
+    #[test]
+    fn verify_refresh_token_maps_legacy_user_role_claims_to_guard() {
+        let token = issue_refresh_token_with_role("user");
+        let claims = verify_refresh_token(&token)
+            .expect("legacy user role should map to guard for refresh tokens");
+
+        assert_eq!(claims.role, "guard");
+    }
+
+    #[test]
+    fn normalize_authenticated_role_accepts_operational_roles() {
+        assert_eq!(
+            normalize_authenticated_role("  SUPERVISOR ").expect("role should be accepted"),
+            "supervisor"
+        );
+        assert_eq!(
+            normalize_authenticated_role("admin").expect("role should be accepted"),
+            "admin"
+        );
     }
 }

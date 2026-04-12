@@ -85,6 +85,12 @@ fn extract_user_agent(headers: &HeaderMap) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn canonicalize_login_role(raw_role: &str) -> AppResult<String> {
+    utils::normalize_authenticated_role(raw_role).map_err(|_| {
+        AppError::Forbidden("Account role is not allowed for authentication".to_string())
+    })
+}
+
 async fn get_lockout_seconds_remaining(db: &PgPool, key: &str) -> AppResult<Option<i64>> {
     let remaining = sqlx::query_scalar::<_, i64>(
         r#"SELECT GREATEST(1, EXTRACT(EPOCH FROM (locked_until - NOW()))::BIGINT)
@@ -763,9 +769,10 @@ pub async fn login(
     let username: String = user
         .try_get("username")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse username: {}", e)))?;
-    let role: String = user
+    let persisted_role: String = user
         .try_get("role")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse role: {}", e)))?;
+    let role = canonicalize_login_role(&persisted_role)?;
     let full_name: Option<String> = user.try_get("full_name").ok();
     let phone_number: Option<String> = user.try_get("phone_number").ok();
     let license_number: Option<String> = user.try_get("license_number").ok();
@@ -1331,4 +1338,38 @@ pub async fn reset_password(
     Ok(Json(json!({
         "message": "Password reset successful. You can now login with your new password."
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonicalize_login_role;
+
+    use crate::error::AppError;
+
+    #[test]
+    fn canonicalize_login_role_maps_legacy_user_to_guard() {
+        let role = canonicalize_login_role("user").expect("legacy user role should map to guard");
+        assert_eq!(role, "guard");
+    }
+
+    #[test]
+    fn canonicalize_login_role_rejects_unknown_role() {
+        let result = canonicalize_login_role("guest");
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
+    }
+
+    #[test]
+    fn canonicalize_login_role_accepts_operational_roles() {
+        let superadmin =
+            canonicalize_login_role("SUPERADMIN").expect("superadmin should remain allowed");
+        let admin = canonicalize_login_role("admin").expect("admin should remain allowed");
+        let supervisor =
+            canonicalize_login_role("supervisor").expect("supervisor should remain allowed");
+        let guard = canonicalize_login_role("guard").expect("guard should remain allowed");
+
+        assert_eq!(superadmin, "superadmin");
+        assert_eq!(admin, "admin");
+        assert_eq!(supervisor, "supervisor");
+        assert_eq!(guard, "guard");
+    }
 }
