@@ -1,19 +1,32 @@
 use chrono::{Duration, Utc};
-use jsonwebtoken::{encode, EncodingKey, Header};
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use reqwest::{Client, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::env;
 use uuid::Uuid;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     sub: String,
     email: String,
     role: String,
     legal_consent_accepted: bool,
+    exp: i64,
+    iat: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RefreshClaims {
+    sub: String,
+    email: String,
+    role: String,
+    legal_consent_accepted: bool,
+    token_type: String,
+    jti: String,
     exp: i64,
     iat: i64,
 }
@@ -60,6 +73,93 @@ fn build_token(role: &str, subject: &str, legal_consent_accepted: bool) -> Strin
         &EncodingKey::from_secret(jwt_secret().as_bytes()),
     )
     .expect("token generation should succeed")
+}
+
+fn build_refresh_token(role: &str, subject: &str, legal_consent_accepted: bool) -> String {
+    let now = Utc::now();
+    let claims = RefreshClaims {
+        sub: subject.to_string(),
+        email: format!("{}@integration.local", subject),
+        role: role.to_string(),
+        legal_consent_accepted,
+        token_type: "refresh".to_string(),
+        jti: Uuid::new_v4().to_string(),
+        exp: (now + Duration::hours(24)).timestamp(),
+        iat: now.timestamp(),
+    };
+
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(jwt_secret().as_bytes()),
+    )
+    .expect("refresh token generation should succeed")
+}
+
+fn decode_access_token(token: &str) -> Claims {
+    decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(jwt_secret().as_bytes()),
+        &Validation::default(),
+    )
+    .expect("access token should decode")
+    .claims
+}
+
+fn decode_refresh_token(token: &str) -> RefreshClaims {
+    decode::<RefreshClaims>(
+        token,
+        &DecodingKey::from_secret(jwt_secret().as_bytes()),
+        &Validation::default(),
+    )
+    .expect("refresh token should decode")
+    .claims
+}
+
+fn hash_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+async fn seed_refresh_session(
+    pool: &PgPool,
+    user_id: &str,
+    refresh_token: &str,
+    source_ip: &str,
+    user_agent: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let refresh_claims = decode_refresh_token(refresh_token);
+    let expires_at = chrono::DateTime::<Utc>::from_timestamp(refresh_claims.exp, 0).ok_or_else(
+        || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid refresh token expiry",
+            )
+        },
+    )?;
+
+    sqlx::query(
+        r#"INSERT INTO refresh_token_sessions (
+               jti,
+               user_id,
+               token_hash,
+               issued_at,
+               expires_at,
+               source_ip,
+               user_agent
+           ) VALUES ($1, $2, $3, NOW(), $4, $5, $6)"#,
+    )
+    .bind(&refresh_claims.jti)
+    .bind(user_id)
+    .bind(hash_token(refresh_token))
+    .bind(expires_at)
+    .bind(source_ip)
+    .bind(user_agent)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 async fn setup_context() -> Result<Option<(String, Client, PgPool)>, Box<dyn std::error::Error>> {
@@ -281,6 +381,187 @@ async fn unscheduled_guard_heartbeat_is_accepted() -> Result<(), Box<dyn std::er
     assert_eq!(
         heartbeat_body.get("accepted").and_then(Value::as_bool),
         Some(true)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_uses_current_consent_state_from_database() -> Result<(), Box<dyn std::error::Error>> {
+    let Some((base_url, client, pool)) = setup_context().await? else {
+        return Ok(());
+    };
+
+    let guard_id = test_user_id();
+    upsert_test_user(&pool, &guard_id, "guard", false, false).await?;
+
+    let stale_refresh_token = build_refresh_token("guard", &guard_id, false);
+    seed_refresh_session(
+        &pool,
+        &guard_id,
+        &stale_refresh_token,
+        "127.0.0.1",
+        Some("itest-refresh"),
+    )
+    .await?;
+
+    sqlx::query(
+        r#"UPDATE users
+           SET consent_accepted_at = CURRENT_TIMESTAMP,
+               consent_version = 'itest-refresh-v1',
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1"#,
+    )
+    .bind(&guard_id)
+    .execute(&pool)
+    .await?;
+
+    let refresh_response = client
+        .post(format!("{}/api/refresh", base_url))
+        .json(&json!({ "refreshToken": stale_refresh_token }))
+        .send()
+        .await?;
+
+    let refresh_status = refresh_response.status();
+    let refresh_body = response_json(refresh_response).await;
+
+    assert_eq!(
+        refresh_status,
+        StatusCode::OK,
+        "expected refresh to succeed after consent update, body: {}",
+        refresh_body
+    );
+
+    let refreshed_access_token = refresh_body
+        .get("token")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let refreshed_refresh_token = refresh_body
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    assert!(
+        !refreshed_access_token.is_empty(),
+        "refresh response must include access token"
+    );
+    assert!(
+        !refreshed_refresh_token.is_empty(),
+        "refresh response must include rotated refresh token"
+    );
+
+    let access_claims = decode_access_token(&refreshed_access_token);
+    let refresh_claims = decode_refresh_token(&refreshed_refresh_token);
+
+    assert!(
+        access_claims.legal_consent_accepted,
+        "access token should reflect current consent accepted state"
+    );
+    assert!(
+        refresh_claims.legal_consent_accepted,
+        "refresh token should reflect current consent accepted state"
+    );
+
+    let tracking_consent_response = client
+        .get(format!("{}/api/tracking/consent", base_url))
+        .header("Authorization", format!("Bearer {}", refreshed_access_token))
+        .send()
+        .await?;
+
+    let tracking_consent_status = tracking_consent_response.status();
+    let tracking_consent_body = response_json(tracking_consent_response).await;
+
+    assert_eq!(
+        tracking_consent_status,
+        StatusCode::OK,
+        "refreshed access token should not be blocked by stale legal consent claim, body: {}",
+        tracking_consent_body
+    );
+    assert_eq!(
+        tracking_consent_body
+            .get("legalConsentAccepted")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn heartbeat_ingestion_is_visible_in_supervisor_map_data(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((base_url, client, pool)) = setup_context().await? else {
+        return Ok(());
+    };
+
+    let supervisor_id = test_user_id();
+    let guard_id = test_user_id();
+
+    upsert_test_user(&pool, &supervisor_id, "supervisor", true, true).await?;
+    upsert_test_user(&pool, &guard_id, "guard", true, true).await?;
+
+    let guard_token = build_token("guard", &guard_id, true);
+    let heartbeat_response = client
+        .post(format!("{}/api/tracking/heartbeat", base_url))
+        .header("Authorization", format!("Bearer {}", guard_token))
+        .json(&json!({
+            "entityType": "guard",
+            "entityId": guard_id,
+            "status": "active",
+            "latitude": 7.075,
+            "longitude": 125.617,
+            "accuracyMeters": 10.0
+        }))
+        .send()
+        .await?;
+
+    let heartbeat_status = heartbeat_response.status();
+    let heartbeat_body = response_json(heartbeat_response).await;
+
+    assert_eq!(
+        heartbeat_status,
+        StatusCode::CREATED,
+        "expected heartbeat write to succeed, body: {}",
+        heartbeat_body
+    );
+
+    let supervisor_token = build_token("supervisor", &supervisor_id, true);
+    let map_response = client
+        .get(format!("{}/api/tracking/map-data", base_url))
+        .header("Authorization", format!("Bearer {}", supervisor_token))
+        .send()
+        .await?;
+
+    let map_status = map_response.status();
+    let map_body = response_json(map_response).await;
+
+    assert_eq!(
+        map_status,
+        StatusCode::OK,
+        "expected map-data to succeed, body: {}",
+        map_body
+    );
+
+    let found = map_body
+        .get("trackingPoints")
+        .and_then(Value::as_array)
+        .and_then(|points| {
+            points.iter().find(|point| {
+                point.get("entityId").and_then(Value::as_str) == Some(guard_id.as_str())
+            })
+        })
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    assert_eq!(
+        found.get("entityType").and_then(Value::as_str),
+        Some("guard")
+    );
+    assert_eq!(
+        found.get("heartbeatStatus").and_then(Value::as_str),
+        Some("active")
     );
 
     Ok(())
@@ -658,6 +939,132 @@ async fn supervisor_heartbeat_is_accepted_with_consent() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
+async fn supervisor_heartbeat_uses_user_entity_type_without_polluting_guard_streams(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((base_url, client, pool)) = setup_context().await? else {
+        return Ok(());
+    };
+
+    let supervisor_id = test_user_id();
+    let guard_id = test_user_id();
+
+    upsert_test_user(&pool, &supervisor_id, "supervisor", true, true).await?;
+    upsert_test_user(&pool, &guard_id, "guard", true, true).await?;
+    insert_guard_tracking_point(&pool, &guard_id, 1, 7.072, 125.613).await?;
+
+    let supervisor_token = build_token("supervisor", &supervisor_id, true);
+
+    let heartbeat_response = client
+        .post(format!("{}/api/tracking/heartbeat", base_url))
+        .header("Authorization", format!("Bearer {}", supervisor_token))
+        .json(&json!({
+            "entityType": "user",
+            "entityId": supervisor_id,
+            "status": "active",
+            "latitude": 7.071,
+            "longitude": 125.611,
+            "accuracyMeters": 10.0
+        }))
+        .send()
+        .await?;
+
+    let heartbeat_status = heartbeat_response.status();
+    let heartbeat_body = response_json(heartbeat_response).await;
+
+    assert_eq!(
+        heartbeat_status,
+        StatusCode::CREATED,
+        "expected supervisor heartbeat to be accepted, body: {}",
+        heartbeat_body
+    );
+
+    let stored_entity_type = sqlx::query_scalar::<_, String>(
+        r#"SELECT entity_type
+           FROM tracking_points
+           WHERE entity_id = $1
+           ORDER BY recorded_at DESC
+           LIMIT 1"#,
+    )
+    .bind(&supervisor_id)
+    .fetch_one(&pool)
+    .await?;
+
+    assert_eq!(stored_entity_type, "user");
+
+    let active_guards_response = client
+        .get(format!("{}/api/tracking/active-guards", base_url))
+        .header("Authorization", format!("Bearer {}", supervisor_token))
+        .send()
+        .await?;
+
+    let active_guards_status = active_guards_response.status();
+    let active_guards_body = response_json(active_guards_response).await;
+
+    assert_eq!(
+        active_guards_status,
+        StatusCode::OK,
+        "expected active-guards to succeed, body: {}",
+        active_guards_body
+    );
+
+    let guards = active_guards_body
+        .get("guards")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    assert!(
+        guards
+            .iter()
+            .all(|guard| guard.get("guardId").and_then(Value::as_str) != Some(supervisor_id.as_str())),
+        "supervisor heartbeat must not appear in active-guards, body: {}",
+        active_guards_body
+    );
+
+    let map_response = client
+        .get(format!("{}/api/tracking/map-data", base_url))
+        .header("Authorization", format!("Bearer {}", supervisor_token))
+        .send()
+        .await?;
+
+    let map_status = map_response.status();
+    let map_body = response_json(map_response).await;
+
+    assert_eq!(
+        map_status,
+        StatusCode::OK,
+        "expected map-data to succeed, body: {}",
+        map_body
+    );
+
+    let tracking_points = map_body
+        .get("trackingPoints")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    assert!(
+        tracking_points.iter().any(|point| {
+            point.get("entityId").and_then(Value::as_str) == Some(guard_id.as_str())
+                && point.get("entityType").and_then(Value::as_str) == Some("guard")
+        }),
+        "guard tracking point should remain visible in map-data, body: {}",
+        map_body
+    );
+
+    assert!(
+        tracking_points.iter().all(|point| {
+            !(point.get("entityId").and_then(Value::as_str) == Some(supervisor_id.as_str())
+                && point.get("entityType").and_then(Value::as_str) == Some("guard"))
+        }),
+        "supervisor heartbeat must not be labeled as guard in map-data, body: {}",
+        map_body
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_heartbeat_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let Some((base_url, client, pool)) = setup_context().await? else {
         return Ok(());
@@ -732,3 +1139,71 @@ async fn superadmin_heartbeat_is_rejected() -> Result<(), Box<dyn std::error::Er
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Guard heartbeat → guard-history → guard-path parity
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn guard_heartbeat_appears_in_history_and_path() -> Result<(), Box<dyn std::error::Error>> {
+    let Some((base_url, client, pool)) = setup_context().await? else {
+        return Ok(());
+    };
+
+    let guard_id = test_user_id();
+    upsert_test_user(&pool, &guard_id, "guard", true, true).await?;
+
+    let guard_token = build_token("guard", &guard_id, true);
+
+    // Send a heartbeat
+    let hb_resp = client
+        .post(format!("{}/api/tracking/heartbeat", base_url))
+        .header("Authorization", format!("Bearer {}", guard_token))
+        .json(&json!({
+            "entityType": "guard",
+            "entityId": guard_id,
+            "status": "active",
+            "latitude": 7.450,
+            "longitude": 125.810,
+            "accuracyMeters": 10.0
+        }))
+        .send()
+        .await?;
+    assert_eq!(hb_resp.status(), StatusCode::CREATED);
+
+    // Read guard-history — the heartbeat should appear
+    let history_resp = client
+        .get(format!("{}/api/tracking/guard-history/{}", base_url, guard_id))
+        .header("Authorization", format!("Bearer {}", guard_token))
+        .send()
+        .await?;
+    assert_eq!(history_resp.status(), StatusCode::OK);
+    let history_body = response_json(history_resp).await;
+    let history_points = history_body.get("points").and_then(Value::as_array).unwrap();
+    assert!(
+        !history_points.is_empty(),
+        "guard-history must contain the accepted heartbeat, got: {}",
+        history_body
+    );
+    let first = &history_points[history_points.len() - 1];
+    assert_eq!(first.get("latitude").and_then(Value::as_f64), Some(7.45));
+    assert_eq!(first.get("longitude").and_then(Value::as_f64), Some(125.81));
+
+    // Read guard-path — should also contain the point
+    let path_resp = client
+        .get(format!("{}/api/tracking/guard-path/{}", base_url, guard_id))
+        .header("Authorization", format!("Bearer {}", guard_token))
+        .send()
+        .await?;
+    assert_eq!(path_resp.status(), StatusCode::OK);
+    let path_body = response_json(path_resp).await;
+    let path_coords = path_body.get("coordinates").and_then(Value::as_array).unwrap();
+    assert!(
+        !path_coords.is_empty(),
+        "guard-path must contain the accepted heartbeat, got: {}",
+        path_body
+    );
+
+    Ok(())
+}
+

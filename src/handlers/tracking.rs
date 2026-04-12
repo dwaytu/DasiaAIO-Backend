@@ -2566,10 +2566,12 @@ pub async fn guard_heartbeat(
         ));
     }
 
-    let entity_type = if actor_role == "guard" {
-        "guard"
-    } else {
+    // Keep guard telemetry scoped to guard-only surfaces while allowing
+    // supervisors to send self-scoped heartbeat samples.
+    let entity_type = if actor_role == "supervisor" {
         "user"
+    } else {
+        "guard"
     };
 
     validate_coordinates(payload.latitude, payload.longitude)?;
@@ -2621,7 +2623,7 @@ pub async fn guard_heartbeat(
     .bind(&claims.sub)
     .execute(db.as_ref())
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to record guard heartbeat: {}", e)))?;
+    .map_err(|e| AppError::DatabaseError(format!("Failed to record location heartbeat: {}", e)))?;
 
     let geofence_events =
         evaluate_geofence_transitions(db.as_ref(), entity_type, &claims.sub, guard_label).await?;

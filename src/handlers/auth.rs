@@ -91,6 +91,73 @@ fn canonicalize_login_role(raw_role: &str) -> AppResult<String> {
     })
 }
 
+#[derive(Debug, Clone)]
+struct RefreshTokenContext {
+    email: String,
+    role: String,
+    legal_consent_accepted: bool,
+}
+
+async fn load_refresh_token_context(db: &PgPool, user_id: &str) -> AppResult<RefreshTokenContext> {
+    let user = sqlx::query(
+        r#"SELECT email, role, verified, COALESCE(approval_status, 'approved') AS approval_status, consent_accepted_at
+           FROM users
+           WHERE id = $1"#,
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to validate refresh token user state: {}",
+            e
+        ))
+    })?
+    .ok_or_else(|| AppError::Unauthorized("Invalid refresh token session".to_string()))?;
+
+    let verified: bool = user.try_get("verified").map_err(|e| {
+        AppError::DatabaseError(format!("Failed to parse refresh user verification state: {}", e))
+    })?;
+
+    let approval_status: String = user.try_get("approval_status").map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to parse refresh user approval status: {}",
+            e
+        ))
+    })?;
+
+    if !verified || approval_status != "approved" {
+        return Err(AppError::Unauthorized(
+            "Invalid refresh token session".to_string(),
+        ));
+    }
+
+    let email: String = user.try_get("email").map_err(|e| {
+        AppError::DatabaseError(format!("Failed to parse refresh user email: {}", e))
+    })?;
+
+    let persisted_role: String = user.try_get("role").map_err(|e| {
+        AppError::DatabaseError(format!("Failed to parse refresh user role: {}", e))
+    })?;
+
+    let role = canonicalize_login_role(&persisted_role)
+        .map_err(|_| AppError::Unauthorized("Invalid refresh token session".to_string()))?;
+
+    let consent_accepted_at: Option<chrono::DateTime<chrono::Utc>> =
+        user.try_get("consent_accepted_at").map_err(|e| {
+            AppError::DatabaseError(format!(
+                "Failed to parse refresh user consent state: {}",
+                e
+            ))
+        })?;
+
+    Ok(RefreshTokenContext {
+        email,
+        role,
+        legal_consent_accepted: consent_accepted_at.is_some(),
+    })
+}
+
 async fn get_lockout_seconds_remaining(db: &PgPool, key: &str) -> AppResult<Option<i64>> {
     let remaining = sqlx::query_scalar::<_, i64>(
         r#"SELECT GREATEST(1, EXTRACT(EPOCH FROM (locked_until - NOW()))::BIGINT)
@@ -872,55 +939,74 @@ pub async fn refresh_token(
     let requester = utils::extract_requester(&headers);
     let user_agent = extract_user_agent(&headers);
 
-    let user_is_active = sqlx::query_scalar::<_, bool>(
-        r#"SELECT EXISTS (
-                SELECT 1
-                FROM users
-                WHERE id = $1
-                  AND verified = TRUE
-                  AND COALESCE(approval_status, 'approved') = 'approved'
-           )"#,
-    )
-    .bind(&claims.sub)
-    .fetch_one(db.as_ref())
-    .await
-    .map_err(|e| {
-        AppError::DatabaseError(format!(
-            "Failed to validate refresh token user state: {}",
-            e
-        ))
-    })?;
+    let refresh_context = match load_refresh_token_context(db.as_ref(), &claims.sub).await {
+        Ok(context) => context,
+        Err(err) => {
+            let reason = if matches!(err, AppError::DatabaseError(_)) {
+                "Failed to validate refresh token user state"
+            } else {
+                "User is not active for token refresh"
+            };
 
-    if !user_is_active {
+            let metadata = if matches!(err, AppError::DatabaseError(_)) {
+                json!({ "jti": claims.jti, "error": err.to_string() })
+            } else {
+                json!({ "jti": claims.jti })
+            };
+
+            log_security_event(
+                db.as_ref(),
+                Some(&claims.sub),
+                "AUTH_TOKEN_REFRESH",
+                "failed",
+                reason,
+                &requester,
+                user_agent.as_deref(),
+                metadata,
+            )
+            .await;
+
+            return if matches!(err, AppError::DatabaseError(_)) {
+                Err(err)
+            } else {
+                Err(AppError::Unauthorized(
+                    "Invalid refresh token session".to_string(),
+                ))
+            };
+        }
+    };
+
+    let token = utils::generate_access_token(
+        &claims.sub,
+        &refresh_context.email,
+        &refresh_context.role,
+        refresh_context.legal_consent_accepted,
+    )?;
+    let refresh_token = utils::generate_refresh_token(
+        &claims.sub,
+        &refresh_context.email,
+        &refresh_context.role,
+        refresh_context.legal_consent_accepted,
+    )?;
+    let new_claims = utils::verify_refresh_token(&refresh_token)?;
+
+    if new_claims.sub != claims.sub {
         log_security_event(
             db.as_ref(),
             Some(&claims.sub),
             "AUTH_TOKEN_REFRESH",
             "failed",
-            "User is not active for token refresh",
+            "Refresh token subject mismatch during rotation",
             &requester,
             user_agent.as_deref(),
-            json!({ "jti": claims.jti }),
+            json!({ "jti": claims.jti, "newJti": new_claims.jti }),
         )
         .await;
+
         return Err(AppError::Unauthorized(
             "Invalid refresh token session".to_string(),
         ));
     }
-
-    let token = utils::generate_access_token(
-        &claims.sub,
-        &claims.email,
-        &claims.role,
-        claims.legal_consent_accepted,
-    )?;
-    let refresh_token = utils::generate_refresh_token(
-        &claims.sub,
-        &claims.email,
-        &claims.role,
-        claims.legal_consent_accepted,
-    )?;
-    let new_claims = utils::verify_refresh_token(&refresh_token)?;
 
     rotate_refresh_session(
         db.as_ref(),
