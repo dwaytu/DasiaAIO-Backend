@@ -29,6 +29,7 @@ pub struct TripDetails {
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
+#[allow(dead_code)]
 pub struct ActiveTripWithGuards {
     pub trip_id: String,
     pub destination: Option<String>,

@@ -92,15 +92,6 @@ pub fn generate_access_token(
     .map_err(|e| AppError::InternalServerError(format!("Failed to generate token: {}", e)))
 }
 
-pub fn generate_token(
-    user_id: &str,
-    email: &str,
-    role: &str,
-    legal_consent_accepted: bool,
-) -> AppResult<String> {
-    generate_access_token(user_id, email, role, legal_consent_accepted)
-}
-
 pub fn generate_refresh_token(
     user_id: &str,
     email: &str,
@@ -188,7 +179,11 @@ pub fn extract_bearer_token(headers: &HeaderMap) -> AppResult<String> {
     Ok(token.to_string())
 }
 
-pub fn extract_requester(headers: &HeaderMap) -> String {
+fn extract_requester_with_proxy_trust(headers: &HeaderMap, trust_proxy_headers: bool) -> String {
+    if !trust_proxy_headers {
+        return "unknown-client".to_string();
+    }
+
     headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
@@ -210,6 +205,19 @@ pub fn extract_requester(headers: &HeaderMap) -> String {
                 .filter(|value| !value.is_empty())
         })
         .unwrap_or_else(|| "unknown-client".to_string())
+}
+
+pub fn extract_requester(headers: &HeaderMap) -> String {
+    let trust_proxy_headers = std::env::var("TRUST_PROXY_HEADERS")
+        .map(|value| {
+            matches!(
+                value.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+
+    extract_requester_with_proxy_trust(headers, trust_proxy_headers)
 }
 
 pub fn normalize_role(role: &str) -> String {
@@ -508,8 +516,12 @@ pub async fn send_confirmation_email(api_key: &str, to_email: &str, code: &str) 
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_authenticated_role, verify_refresh_token, verify_token, RefreshTokenClaims, TokenClaims};
+    use super::{
+        extract_requester_with_proxy_trust, normalize_authenticated_role, verify_refresh_token,
+        verify_token, RefreshTokenClaims, TokenClaims,
+    };
     use crate::error::AppError;
+    use axum::http::{HeaderMap, HeaderValue};
     use chrono::{Duration, Utc};
     use jsonwebtoken::{encode, EncodingKey, Header};
 
@@ -612,6 +624,34 @@ mod tests {
         assert_eq!(
             normalize_authenticated_role("admin").expect("role should be accepted"),
             "admin"
+        );
+    }
+
+    #[test]
+    fn extract_requester_ignores_proxy_headers_by_default() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.10, 198.51.100.7"),
+        );
+
+        assert_eq!(
+            extract_requester_with_proxy_trust(&headers, false),
+            "unknown-client"
+        );
+    }
+
+    #[test]
+    fn extract_requester_uses_proxy_headers_when_explicitly_enabled() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.10, 198.51.100.7"),
+        );
+
+        assert_eq!(
+            extract_requester_with_proxy_trust(&headers, true),
+            "203.0.113.10"
         );
     }
 }

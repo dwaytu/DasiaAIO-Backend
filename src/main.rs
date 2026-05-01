@@ -18,7 +18,6 @@ use axum::{
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing_subscriber;
 
 fn native_wrapper_origins() -> [HeaderValue; 4] {
     [

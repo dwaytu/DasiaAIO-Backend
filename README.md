@@ -1,117 +1,102 @@
 # SENTINEL Backend
 
-Rust + Axum API server for the SENTINEL security operations platform.
+Rust/Axum API service for SENTINEL, the DSIA security operations platform.
+
+## Overview
+
+This service provides authentication, role-based authorization, operational workflows, tracking intelligence, and audit/governance endpoints for Web, Desktop, and Android clients.
+
+## Stack
+
+- Rust (edition 2021)
+- Axum
+- SQLx
+- PostgreSQL
+- Tokio
 
 ## Prerequisites
 
-- Rust 1.70+
-- PostgreSQL 12+
-- Git
+- Rust stable toolchain
+- PostgreSQL 14+
+- OpenSSL-compatible build environment
 
-## Setup
+## Configuration
 
-```bash
-cd DasiaAIO-Backend
-cp .env.example .env
-```
+Create a local environment file in `DasiaAIO-Backend/`.
 
-Update `.env` with your database and mail configuration.
-
-## Core Environment Variables
+Core runtime variables:
 
 ```env
 SERVER_HOST=0.0.0.0
 SERVER_PORT=5000
 DATABASE_URL=postgresql://user:password@localhost:5432/guard_firearm_system
+JWT_SECRET=replace_with_strong_secret
+ADMIN_CODE=replace_default_code
+```
+
+Optional mail variables (verification/reset flows):
+
+```env
 GMAIL_USER=your_email@gmail.com
-GMAIL_PASSWORD=your_app_specific_password
-ADMIN_CODE=122601
+GMAIL_PASSWORD=app_specific_password
 ```
 
-Production hardening note:
+## Security Hardening Behavior
 
-- When `APP_ENV=production` (or `NODE_ENV=production`), backend startup now validates critical settings and fails fast if unsafe:
-	- `JWT_SECRET` must be set to a strong secret (32+ chars)
-	- `ADMIN_CODE` must not use default `122601`
-	- `CORS_ORIGINS` or `CORS_ORIGIN` must be configured
-- Security middleware now applies production headers (`X-Content-Type-Options`, `X-Frame-Options`, `Content-Security-Policy`, and HSTS in production).
-- Global request timeout middleware protects against long-hanging requests (`REQUEST_TIMEOUT_SECS`, default 30s).
-- Container runtime now uses least privilege (`USER sentinel`) and build reproducibility via `Cargo.lock` + `cargo build --locked` in `Dockerfile`.
+When running in production (`APP_ENV=production` or `NODE_ENV=production`), startup enforces:
 
-`ADMIN_CODE` remains for compatibility, while public registration flow is guard self-registration with approval.
+- strong `JWT_SECRET`
+- non-default `ADMIN_CODE`
+- explicit CORS origin configuration (`CORS_ORIGINS`/`CORS_ORIGIN`)
 
-## Run Options
+Security middleware includes standard response hardening headers and request-timeout protection.
 
-### Docker (recommended)
+## Run Locally
 
 ```bash
-docker compose up -d --build
+cargo run --bin server
 ```
 
-Health check:
-
-```powershell
-Invoke-WebRequest -Uri "http://localhost:5000/api/health" -UseBasicParsing
-```
-
-### Local Development
-
-```bash
-cargo run
-```
-
-Auto-reload mode:
-
-```bash
-cargo install cargo-watch
-cargo watch -q -c -w src/ -x 'run'
-```
-
-### Tests
-
-```bash
-cargo test
-```
-
-## Key API Areas
-
-- Authentication and verification
-- Hierarchical RBAC user management
-- Firearm inventory and allocation
-- Guard replacement and attendance
-- Health and operational endpoints
-
-Primary health endpoint:
+Health checks:
 
 - `GET /api/health`
 - `GET /api/health/system`
 - `GET /api/system/version`
 
-## Role Hierarchy
+## Test and Validate
 
-- `superadmin > admin > supervisor > guard`
-- Guard self-registration requires approval before login access.
-
-## Project Structure
-
-```text
-DasiaAIO-Backend/
-	src/
-		handlers/
-		middleware/
-		services/
-		main.rs
-		routes.rs
-		models.rs
-		db.rs
-	migrations/
-	Dockerfile
-	docker-compose.yml
-	Cargo.toml
+```bash
+cargo check
+cargo test
 ```
 
-## Validation Checklist
+## Docker Workflow
 
-- `docker compose config -q` passes.
-- `docker compose up -d --build` starts required services.
-- `GET /api/health` returns a healthy status payload.
+```bash
+docker compose up -d --build
+```
+
+## API Domain Coverage
+
+- Authentication and session lifecycle
+- Role-based user and approval workflows
+- Scheduling, attendance, and replacement workflows
+- Firearm, permit, and armored vehicle operations
+- Incident, support, and notifications workflows
+- Live tracking, geofence events, and map data
+- Audit and forensic visibility
+
+## Role Model
+
+Supported roles:
+
+- `guard`
+- `supervisor`
+- `admin`
+- `superadmin`
+
+## Repository Links
+
+- Root governance/release repo: https://github.com/dwaytu/Capstone-Main
+- Frontend app repo: https://github.com/dwaytu/DasiaAIO-Frontend
+- Project docs: https://dwaytu.github.io/Capstone-Main/

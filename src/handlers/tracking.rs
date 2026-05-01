@@ -595,10 +595,8 @@ fn validate_geofence_payload(
 #[derive(sqlx::FromRow)]
 struct ShiftProximityCandidate {
     shift_id: String,
-    guard_id: String,
     guard_name: Option<String>,
     client_site: String,
-    start_time: chrono::DateTime<chrono::Utc>,
     client_latitude: f64,
     client_longitude: f64,
     guard_latitude: Option<f64>,
@@ -851,10 +849,8 @@ async fn evaluate_and_send_proximity_alerts(db: &PgPool) -> AppResult<(usize, us
     let candidates = sqlx::query_as::<_, ShiftProximityCandidate>(
         r#"SELECT
                s.id AS shift_id,
-               s.guard_id,
                COALESCE(NULLIF(u.full_name, ''), u.username) AS guard_name,
                s.client_site,
-               s.start_time,
                cs.latitude AS client_latitude,
                cs.longitude AS client_longitude,
                last_tp.latitude AS guard_latitude,
@@ -2940,4 +2936,3 @@ mod tests {
         assert!(enforce_vehicle_tracking_producer_scope("superadmin").is_ok());
     }
 }
-

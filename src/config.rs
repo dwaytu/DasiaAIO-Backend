@@ -5,8 +5,6 @@ pub struct Config {
     pub server_host: String,
     pub server_port: u16,
     pub database_url: String,
-    pub gmail_user: String,
-    pub gmail_password: String,
     pub admin_code: String,
     pub db_pool_max_connections: u32,
     pub db_pool_acquire_timeout_secs: u32,
@@ -117,8 +115,6 @@ impl Config {
                 .map_err(|_| format!("PORT '{}' must be a valid number", port_str))?,
             database_url: env::var("DATABASE_URL")
                 .map_err(|_| "DATABASE_URL must be set. In Railway dashboard: backend service → Variables → add DATABASE_URL and paste the value from the Postgres service Variables tab.".to_string())?,
-            gmail_user: env::var("GMAIL_USER").unwrap_or_else(|_| "no-reply@example.com".to_string()),
-            gmail_password: env::var("GMAIL_PASSWORD").unwrap_or_else(|_| "dummy-password".to_string()),
             admin_code,
             db_pool_max_connections,
             db_pool_acquire_timeout_secs,

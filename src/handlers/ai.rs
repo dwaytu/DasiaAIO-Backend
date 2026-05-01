@@ -110,18 +110,6 @@ fn suggested_actions_from_severity(severity: &str) -> Vec<String> {
     }
 }
 
-fn explanation_from_context(description: &str, severity: &str) -> String {
-    let clue_count = description
-        .split_whitespace()
-        .filter(|token| token.len() >= 5)
-        .count();
-
-    format!(
-        "Severity '{}' was inferred from incident wording and {} contextual signal(s).",
-        severity, clue_count
-    )
-}
-
 fn risk_level_from_summary(summary: &str, key_phrases: &[String]) -> String {
     let summary_lc = summary.to_lowercase();
     let phrase_lc: Vec<String> = key_phrases.iter().map(|item| item.to_lowercase()).collect();

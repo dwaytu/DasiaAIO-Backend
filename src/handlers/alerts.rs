@@ -213,6 +213,7 @@ pub async fn get_predictive_alerts(
                 "guards": guard_rows
                     .iter()
                     .map(|row| json!({
+                        "guardId": row.guard_id,
                         "name": row.guard_name,
                         "noShows": row.no_shows.unwrap_or(0),
                     }))

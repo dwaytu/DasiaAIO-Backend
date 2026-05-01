@@ -438,6 +438,36 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create incidents index: {}", e)))?;
 
+    // Feedback table used by feedback handlers and dashboards.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS feedback (
+            id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+            comments TEXT NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT feedback_user_unique UNIQUE (user_id),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create feedback table: {}", e)))?;
+
+    for feedback_index in &[
+        "CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_feedback_created_at ON feedback(created_at DESC)",
+    ] {
+        sqlx::query(feedback_index)
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                AppError::DatabaseError(format!("Failed to create feedback index: {}", e))
+            })?;
+    }
+
     // Create normalized RBAC tables for permission-based authorization.
     sqlx::query(
         r#"

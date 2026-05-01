@@ -38,11 +38,6 @@ pub async fn classify_incident_smart(description: &str) -> ClassificationResult 
     }
 }
 
-/// Keyword-only classification (sync, used as fallback and in unit tests).
-pub fn classify_incident(description: &str) -> String {
-    classify_incident_keywords(description).severity
-}
-
 struct LlmConfig {
     api_key: String,
     api_base: String,

@@ -14,6 +14,7 @@ use crate::{
 };
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct MissionAssignmentRequest {
     pub mission_name: String,
     pub guards_required: i32,
@@ -107,6 +108,12 @@ pub async fn assign_mission(
     let end_time =
         chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(end_datetime, chrono::Utc);
 
+    if end_time <= start_time {
+        return Err(AppError::BadRequest(
+            "End time must be later than start time".to_string(),
+        ));
+    }
+
     let duration = (end_time - start_time).num_hours() as f64;
 
     // 1. Find available guards
@@ -121,8 +128,18 @@ pub async fn assign_mission(
         "SELECT id, full_name, username FROM users 
          WHERE role IN ('guard') 
          AND verified = true 
-         LIMIT $1",
+         AND NOT EXISTS (
+             SELECT 1
+             FROM shifts s
+             WHERE s.guard_id = users.id
+               AND s.status IN ('scheduled', 'in_progress')
+               AND s.start_time < $2
+               AND s.end_time > $1
+         )
+         LIMIT $3",
     )
+    .bind(start_time)
+    .bind(end_time)
     .bind(payload.guards_required as i64)
     .fetch_all(db.as_ref())
     .await
@@ -173,8 +190,18 @@ pub async fn assign_mission(
     let vehicles = sqlx::query_as::<_, VehicleRow>(
         "SELECT id, model, passenger_capacity FROM armored_cars 
          WHERE status IN ('operational', 'available') 
-         LIMIT $1",
+         AND NOT EXISTS (
+             SELECT 1
+             FROM trips t
+             WHERE t.car_id = armored_cars.id
+               AND COALESCE(t.status, 'scheduled') IN ('scheduled', 'in_progress')
+               AND t.start_time < $2
+               AND t.end_time > $1
+         )
+         LIMIT $3",
     )
+    .bind(start_time)
+    .bind(end_time)
     .bind(payload.vehicles_required as i64)
     .fetch_all(db.as_ref())
     .await

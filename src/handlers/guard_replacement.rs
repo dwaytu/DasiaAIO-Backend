@@ -16,6 +16,35 @@ use crate::{
     utils,
 };
 
+async fn guard_has_shift_conflict(
+    db: &PgPool,
+    guard_id: &str,
+    start_time: chrono::DateTime<chrono::Utc>,
+    end_time: chrono::DateTime<chrono::Utc>,
+    exclude_shift_id: Option<&str>,
+) -> AppResult<bool> {
+    let conflict = sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS (
+               SELECT 1
+               FROM shifts s
+               WHERE s.guard_id = $1
+                 AND ($4::text IS NULL OR s.id <> $4)
+                 AND s.status IN ('scheduled', 'in_progress')
+                 AND s.start_time < $3
+                 AND s.end_time > $2
+           )"#,
+    )
+    .bind(guard_id)
+    .bind(start_time)
+    .bind(end_time)
+    .bind(exclude_shift_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to evaluate shift conflict: {}", e)))?;
+
+    Ok(conflict)
+}
+
 pub async fn create_shift(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
@@ -51,6 +80,18 @@ pub async fn create_shift(
         .ok()
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .ok_or_else(|| AppError::BadRequest("Invalid end_time format".to_string()))?;
+
+    if end_time <= start_time {
+        return Err(AppError::BadRequest(
+            "end_time must be later than start_time".to_string(),
+        ));
+    }
+
+    if guard_has_shift_conflict(db.as_ref(), &payload.guard_id, start_time, end_time, None).await? {
+        return Err(AppError::Conflict(
+            "Guard already has an overlapping scheduled or in-progress shift".to_string(),
+        ));
+    }
 
     sqlx::query(
         "INSERT INTO shifts (id, guard_id, start_time, end_time, client_site, status) VALUES ($1, $2, $3, $4, $5, 'scheduled')"
@@ -206,13 +247,10 @@ pub async fn detect_no_shows(
         start_time: chrono::DateTime<chrono::Utc>,
         end_time: chrono::DateTime<chrono::Utc>,
         client_site: String,
-        grace_period_minutes: Option<i32>,
-        replacement_status: Option<String>,
     }
 
     let no_show_shifts = sqlx::query_as::<_, NoShowShift>(
-        "SELECT s.id, s.guard_id, s.start_time, s.end_time, s.client_site, 
-                s.grace_period_minutes, s.replacement_status
+        "SELECT s.id, s.guard_id, s.start_time, s.end_time, s.client_site
          FROM shifts s 
          LEFT JOIN attendance a ON s.id = a.shift_id 
          WHERE a.id IS NULL 
@@ -346,12 +384,34 @@ pub async fn request_replacement(
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("Replacement guard not found".to_string()))?;
 
-    sqlx::query("SELECT id FROM shifts WHERE id = $1")
+    let shift_row = sqlx::query("SELECT id, start_time, end_time FROM shifts WHERE id = $1")
         .bind(&payload.shift_id)
         .fetch_optional(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("Shift not found".to_string()))?;
+
+    let shift_start: chrono::DateTime<chrono::Utc> = shift_row
+        .try_get("start_time")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse shift start_time: {}", e)))?;
+    let shift_end: chrono::DateTime<chrono::Utc> = shift_row
+        .try_get("end_time")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse shift end_time: {}", e)))?;
+
+    if guard_has_shift_conflict(
+        db.as_ref(),
+        &payload.replacement_guard_id,
+        shift_start,
+        shift_end,
+        Some(&payload.shift_id),
+    )
+    .await?
+    {
+        return Err(AppError::Conflict(
+            "Replacement guard already has an overlapping scheduled or in-progress shift"
+                .to_string(),
+        ));
+    }
 
     // Update shift to use replacement guard
     sqlx::query("UPDATE shifts SET guard_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
@@ -451,12 +511,26 @@ pub async fn accept_replacement(
         .ok_or_else(|| AppError::NotFound("Guard not found".to_string()))?;
 
     // Verify shift exists and needs replacement
-    let _shift = sqlx::query("SELECT id, replacement_status FROM shifts WHERE id = $1")
+    let shift = sqlx::query("SELECT id, replacement_status, start_time, end_time FROM shifts WHERE id = $1")
         .bind(shift_id)
         .fetch_optional(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("Shift not found".to_string()))?;
+
+    let shift_start: chrono::DateTime<chrono::Utc> = shift
+        .try_get("start_time")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse shift start_time: {}", e)))?;
+    let shift_end: chrono::DateTime<chrono::Utc> = shift
+        .try_get("end_time")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse shift end_time: {}", e)))?;
+
+    if guard_has_shift_conflict(db.as_ref(), guard_id, shift_start, shift_end, Some(shift_id)).await?
+    {
+        return Err(AppError::Conflict(
+            "Guard already has an overlapping scheduled or in-progress shift".to_string(),
+        ));
+    }
 
     // Update shift with new guard and mark as accepted
     sqlx::query(
@@ -673,6 +747,26 @@ pub async fn update_shift(
         .ok()
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .ok_or_else(|| AppError::BadRequest("Invalid end_time format".to_string()))?;
+
+    if end_time <= start_time {
+        return Err(AppError::BadRequest(
+            "end_time must be later than start_time".to_string(),
+        ));
+    }
+
+    if guard_has_shift_conflict(
+        db.as_ref(),
+        &payload.guard_id,
+        start_time,
+        end_time,
+        Some(&shift_id),
+    )
+    .await?
+    {
+        return Err(AppError::Conflict(
+            "Guard already has an overlapping scheduled or in-progress shift".to_string(),
+        ));
+    }
 
     sqlx::query(
         "UPDATE shifts SET guard_id = $1, start_time = $2, end_time = $3, client_site = $4, updated_at = CURRENT_TIMESTAMP WHERE id = $5"
