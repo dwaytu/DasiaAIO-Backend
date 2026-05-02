@@ -1050,6 +1050,7 @@ pub struct MdrImportBatch {
     pub new_rows: Option<i32>,
     pub ambiguous_rows: Option<i32>,
     pub error_rows: Option<i32>,
+    pub pending_rows: Option<i32>,
     pub committed_at: Option<DateTime<Utc>>,
     pub committed_by: Option<String>,
     pub notes: Option<String>,

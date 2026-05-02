@@ -14,6 +14,31 @@ use crate::{
     utils,
 };
 
+async fn insert_mdr_audit_event(
+    pool: &PgPool,
+    actor_user_id: Option<&str>,
+    action_key: &str,
+    entity_type: &str,
+    entity_id: &str,
+    result: &str,
+    reason: Option<&str>,
+    metadata: serde_json::Value,
+) {
+    let _ = sqlx::query(
+        "INSERT INTO audit_logs (id, actor_user_id, action_key, entity_type, entity_id, result, reason, metadata) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(utils::generate_id())
+    .bind(actor_user_id)
+    .bind(action_key)
+    .bind(entity_type)
+    .bind(entity_id)
+    .bind(result)
+    .bind(reason)
+    .bind(metadata)
+    .execute(pool)
+    .await;
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MdrImportRequest {
@@ -150,6 +175,27 @@ pub async fn import_mdr(
 
     let summary = mdr_import_service::match_staging_rows(pool.as_ref(), &batch_id).await?;
 
+    insert_mdr_audit_event(
+        pool.as_ref(),
+        Some(&claims.sub),
+        "mdr.batch.import",
+        "mdr_import_batch",
+        &batch_id,
+        "success",
+        None,
+        json!({
+            "filename": body.filename,
+            "reportMonth": body.report_month,
+            "branch": body.branch,
+            "totalRows": summary.total,
+            "matched": summary.matched,
+            "new": summary.new_rows,
+            "ambiguous": summary.ambiguous,
+            "errors": summary.errors,
+        }),
+    )
+    .await;
+
     Ok(Json(json!({
         "batchId": batch_id,
         "totalRows": summary.total,
@@ -158,6 +204,7 @@ pub async fn import_mdr(
             "new": summary.new_rows,
             "ambiguous": summary.ambiguous,
             "errors": summary.errors,
+            "pending": 0,
         }
     })))
 }
@@ -175,7 +222,19 @@ pub async fn get_batches(
         .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
     let items = sqlx::query_as::<_, MdrImportBatch>(
-        "SELECT * FROM mdr_import_batches ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+        r#"
+        SELECT
+            mib.*,
+            (
+                SELECT COUNT(*)::INT
+                FROM mdr_staging_rows msr
+                WHERE msr.batch_id = mib.id
+                  AND msr.match_status = 'pending'
+            ) AS pending_rows
+        FROM mdr_import_batches mib
+        ORDER BY mib.created_at DESC
+        LIMIT $1 OFFSET $2
+        "#,
     )
     .bind(page_size)
     .bind(offset)
@@ -196,7 +255,20 @@ pub async fn get_batch_by_id(
     State(pool): State<Arc<PgPool>>,
     Path(id): Path<String>,
 ) -> AppResult<Json<MdrImportBatch>> {
-    let batch = sqlx::query_as::<_, MdrImportBatch>("SELECT * FROM mdr_import_batches WHERE id = $1")
+    let batch = sqlx::query_as::<_, MdrImportBatch>(
+        r#"
+        SELECT
+            mib.*,
+            (
+                SELECT COUNT(*)::INT
+                FROM mdr_staging_rows msr
+                WHERE msr.batch_id = mib.id
+                  AND msr.match_status = 'pending'
+            ) AS pending_rows
+        FROM mdr_import_batches mib
+        WHERE mib.id = $1
+        "#,
+    )
         .bind(&id)
         .fetch_optional(pool.as_ref())
         .await
@@ -242,6 +314,7 @@ pub async fn get_batch_review(
 /// PATCH /api/mdr/staging/:id/resolve
 pub async fn resolve_staging_row(
     State(pool): State<Arc<PgPool>>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<ResolveRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -251,21 +324,45 @@ pub async fn resolve_staging_row(
         ));
     }
 
-    let result = sqlx::query(
-        "UPDATE mdr_staging_rows SET match_status = $1, matched_guard_id = $2, matched_firearm_id = $3, matched_client_id = $4 WHERE id = $5",
+    let updated_batch_id = sqlx::query_scalar::<_, String>(
+        "UPDATE mdr_staging_rows SET match_status = $1, matched_guard_id = $2, matched_firearm_id = $3, matched_client_id = $4 WHERE id = $5 RETURNING batch_id",
     )
     .bind(&body.match_status)
     .bind(&body.matched_guard_id)
     .bind(&body.matched_firearm_id)
     .bind(&body.matched_client_id)
     .bind(&id)
-    .execute(pool.as_ref())
+    .fetch_optional(pool.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-    if result.rows_affected() == 0 {
+    let Some(batch_id) = updated_batch_id else {
         return Err(AppError::NotFound("Staging row not found".to_string()));
-    }
+    };
+
+    mdr_import_service::refresh_batch_statistics(pool.as_ref(), &batch_id).await?;
+
+    let actor_claims = utils::extract_bearer_token(&headers)
+        .ok()
+        .and_then(|token| utils::verify_token(&token).ok());
+
+    insert_mdr_audit_event(
+        pool.as_ref(),
+        actor_claims.as_ref().map(|claims| claims.sub.as_str()),
+        "mdr.row.resolve",
+        "mdr_staging_row",
+        &id,
+        "success",
+        None,
+        json!({
+            "batchId": batch_id,
+            "matchStatus": body.match_status,
+            "matchedGuardId": body.matched_guard_id,
+            "matchedFirearmId": body.matched_firearm_id,
+            "matchedClientId": body.matched_client_id,
+        }),
+    )
+    .await;
 
     Ok(Json(json!({ "status": "resolved" })))
 }
@@ -288,8 +385,159 @@ pub async fn commit_batch(
 /// POST /api/mdr/batches/:id/reject
 pub async fn reject_batch(
     State(pool): State<Arc<PgPool>>,
+    headers: axum::http::HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let claims = utils::require_min_role(&headers, "superadmin")?;
     mdr_import_service::reject_batch(pool.as_ref(), &id).await?;
+    insert_mdr_audit_event(
+        pool.as_ref(),
+        Some(&claims.sub),
+        "mdr.batch.reject",
+        "mdr_import_batch",
+        &id,
+        "success",
+        None,
+        json!({}),
+    )
+    .await;
     Ok(Json(json!({ "status": "rejected" })))
+}
+
+/// GET /api/mdr/batches/:id/compliance-report
+pub async fn get_batch_compliance_report(
+    State(pool): State<Arc<PgPool>>,
+    Path(id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    let batch = sqlx::query_as::<_, MdrImportBatch>(
+        r#"
+        SELECT
+            mib.*,
+            (
+                SELECT COUNT(*)::INT
+                FROM mdr_staging_rows msr
+                WHERE msr.batch_id = mib.id
+                  AND msr.match_status = 'pending'
+            ) AS pending_rows
+        FROM mdr_import_batches mib
+        WHERE mib.id = $1
+        "#,
+    )
+    .bind(&id)
+    .fetch_optional(pool.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("Batch not found".to_string()))?;
+
+    let status_breakdown = sqlx::query_as::<_, (String, i64)>(
+        "SELECT match_status, COUNT(*)::BIGINT FROM mdr_staging_rows WHERE batch_id = $1 GROUP BY match_status ORDER BY match_status",
+    )
+    .bind(&id)
+    .fetch_all(pool.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    let section_breakdown = sqlx::query_as::<_, (Option<String>, i64)>(
+        "SELECT section, COUNT(*)::BIGINT FROM mdr_staging_rows WHERE batch_id = $1 GROUP BY section ORDER BY section",
+    )
+    .bind(&id)
+    .fetch_all(pool.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    let validation_issue_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM mdr_staging_rows WHERE batch_id = $1 AND validation_errors IS NOT NULL AND jsonb_typeof(validation_errors) = 'array' AND jsonb_array_length(validation_errors) > 0",
+    )
+    .bind(&id)
+    .fetch_one(pool.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    let audit_events = sqlx::query_as::<_, (String, String, String, Option<String>)>(
+        "SELECT action_key, result, created_at::TEXT, reason FROM audit_logs WHERE entity_type = 'mdr_import_batch' AND entity_id = $1 ORDER BY created_at DESC LIMIT 20",
+    )
+    .bind(&id)
+    .fetch_all(pool.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    Ok(Json(json!({
+        "batch": batch,
+        "statusBreakdown": status_breakdown
+            .into_iter()
+            .map(|(status, count)| json!({ "status": status, "count": count }))
+            .collect::<Vec<_>>(),
+        "sectionBreakdown": section_breakdown
+            .into_iter()
+            .map(|(section, count)| json!({ "section": section.unwrap_or_else(|| "unclassified".to_string()), "count": count }))
+            .collect::<Vec<_>>(),
+        "validationIssueCount": validation_issue_count,
+        "auditEvents": audit_events
+            .into_iter()
+            .map(|(action_key, result, created_at, reason)| {
+                json!({
+                    "actionKey": action_key,
+                    "result": result,
+                    "createdAt": created_at,
+                    "reason": reason
+                })
+            })
+            .collect::<Vec<_>>()
+    })))
+}
+
+/// GET /api/mdr/ops-health
+pub async fn get_mdr_ops_health(
+    State(pool): State<Arc<PgPool>>,
+) -> AppResult<Json<serde_json::Value>> {
+    let reviewing_batches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM mdr_import_batches WHERE status = 'reviewing'",
+    )
+    .fetch_one(pool.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    let stale_reviewing_batches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM mdr_import_batches WHERE status = 'reviewing' AND created_at < NOW() - INTERVAL '24 hours'",
+    )
+    .fetch_one(pool.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    let pending_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM mdr_staging_rows WHERE match_status = 'pending'",
+    )
+    .fetch_one(pool.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    let failed_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM mdr_staging_rows WHERE match_status = 'error'",
+    )
+    .fetch_one(pool.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    let rejected_last_7d: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM mdr_import_batches WHERE status = 'rejected' AND created_at >= NOW() - INTERVAL '7 days'",
+    )
+    .fetch_one(pool.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    let last_committed_at: Option<String> = sqlx::query_scalar(
+        "SELECT committed_at::TEXT FROM mdr_import_batches WHERE status = 'committed' ORDER BY committed_at DESC NULLS LAST LIMIT 1",
+    )
+    .fetch_optional(pool.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+
+    Ok(Json(json!({
+        "reviewingBatches": reviewing_batches,
+        "staleReviewingBatches24h": stale_reviewing_batches,
+        "pendingRows": pending_rows,
+        "errorRows": failed_rows,
+        "rejectedBatchesLast7d": rejected_last_7d,
+        "lastCommittedAt": last_committed_at,
+    })))
 }

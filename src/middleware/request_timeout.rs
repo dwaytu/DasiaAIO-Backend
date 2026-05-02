@@ -16,9 +16,24 @@ fn request_timeout_seconds() -> u64 {
         .unwrap_or(30)
 }
 
+fn mdr_commit_timeout_seconds() -> u64 {
+    std::env::var("REQUEST_TIMEOUT_MDR_COMMIT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(30, 300))
+        .unwrap_or(120)
+}
+
 pub async fn enforce_request_timeout(request: Request<Body>, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let timeout_secs = if path.starts_with("/api/mdr/batches/") && path.ends_with("/commit") {
+        mdr_commit_timeout_seconds()
+    } else {
+        request_timeout_seconds()
+    };
+
     match tokio::time::timeout(
-        Duration::from_secs(request_timeout_seconds()),
+        Duration::from_secs(timeout_secs),
         next.run(request),
     )
     .await

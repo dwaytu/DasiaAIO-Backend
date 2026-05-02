@@ -1625,6 +1625,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         )
         .route(
+            "/api/mdr/batches/:id/compliance-report",
+            get(handlers::mdr::get_batch_compliance_report).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_mdr_management),
+            ),
+        )
+        .route(
+            "/api/mdr/ops-health",
+            get(handlers::mdr::get_mdr_ops_health).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_mdr_management,
+            )),
+        )
+        .route(
             "/api/mdr/staging/:id/resolve",
             patch(handlers::mdr::resolve_staging_row)
                 .route_layer(axum_middleware::from_fn(
