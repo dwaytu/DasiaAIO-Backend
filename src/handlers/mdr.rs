@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     Json,
 };
 use serde::Deserialize;
@@ -372,14 +373,30 @@ pub async fn commit_batch(
     State(pool): State<Arc<PgPool>>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let claims = utils::require_min_role(&headers, "superadmin")?;
+    let unresolved = mdr_import_service::unresolved_breakdown(pool.as_ref(), &id).await?;
+    if unresolved.total > 0 {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "blocked",
+                "reason": "unresolved_rows",
+                "message": "Commit blocked: resolve all pending, ambiguous, and error rows first.",
+                "unresolved": unresolved
+            })),
+        ));
+    }
+
     let summary = mdr_import_service::commit_batch(pool.as_ref(), &id, &claims.sub).await?;
 
-    Ok(Json(json!({
-        "status": "committed",
-        "summary": summary
-    })))
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "status": "committed",
+            "summary": summary
+        })),
+    ))
 }
 
 /// POST /api/mdr/batches/:id/reject

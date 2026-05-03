@@ -17,6 +17,20 @@ use crate::{
     utils,
 };
 
+fn validate_armored_car_status(status: &str) -> AppResult<&'static str> {
+    let normalized = status.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "available" => Ok("available"),
+        "allocated" => Ok("allocated"),
+        "maintenance" => Ok("maintenance"),
+        "in_transit" => Ok("in_transit"),
+        "inactive" => Ok("inactive"),
+        _ => Err(AppError::ValidationError(
+            "Invalid armored car status. Allowed values: available, allocated, maintenance, in_transit, inactive".to_string(),
+        )),
+    }
+}
+
 // ========== Armored Car Management ==========
 
 pub async fn add_armored_car(
@@ -117,7 +131,7 @@ pub async fn update_armored_car(
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
     .ok_or_else(|| AppError::NotFound("Armored car not found".to_string()))?;
 
-    let status = payload.status.as_deref().unwrap_or(&car.status);
+    let status = validate_armored_car_status(payload.status.as_deref().unwrap_or(&car.status))?;
     let mileage = payload.mileage.unwrap_or(car.mileage);
     let registration_expiry = payload.registration_expiry.or(car.registration_expiry);
     let insurance_expiry = payload.insurance_expiry.or(car.insurance_expiry);
@@ -145,6 +159,15 @@ pub async fn delete_armored_car(
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
+
+    let exists = sqlx::query_scalar::<_, String>("SELECT id FROM armored_cars WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+    if exists.is_none() {
+        return Err(AppError::NotFound("Armored car not found".to_string()));
+    }
 
     sqlx::query("DELETE FROM armored_cars WHERE id = $1")
         .bind(&id)

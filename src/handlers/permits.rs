@@ -13,6 +13,19 @@ use crate::{
     utils,
 };
 
+fn validate_permit_status(status: &str) -> AppResult<&'static str> {
+    let normalized = status.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "active" => Ok("active"),
+        "expired" => Ok("expired"),
+        "revoked" => Ok("revoked"),
+        "pending" => Ok("pending"),
+        _ => Err(AppError::ValidationError(
+            "Invalid permit status. Allowed values: active, expired, revoked, pending".to_string(),
+        )),
+    }
+}
+
 pub async fn get_guard_permits(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
@@ -46,9 +59,43 @@ pub async fn create_guard_permit(
             "Guard ID and permit type are required".to_string(),
         ));
     }
+    if payload.issued_date >= payload.expiry_date {
+        return Err(AppError::ValidationError(
+            "Permit expiry date must be later than issued date".to_string(),
+        ));
+    }
+
+    let guard_exists = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM users WHERE id = $1 AND role = 'guard' LIMIT 1",
+    )
+    .bind(&payload.guard_id)
+    .fetch_optional(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+
+    if guard_exists.is_none() {
+        return Err(AppError::BadRequest(
+            "Guard ID does not exist or is not a guard account".to_string(),
+        ));
+    }
+
+    if let Some(ref firearm_id) = payload.firearm_id {
+        let firearm_exists = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM firearms WHERE id = $1 LIMIT 1",
+        )
+        .bind(firearm_id)
+        .fetch_optional(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+        if firearm_exists.is_none() {
+            return Err(AppError::BadRequest(
+                "Firearm ID does not exist".to_string(),
+            ));
+        }
+    }
 
     let id = utils::generate_id();
-    let status = payload.status.as_deref().unwrap_or("active");
+    let status = validate_permit_status(payload.status.as_deref().unwrap_or("active"))?;
 
     sqlx::query(
         "INSERT INTO guard_firearm_permits (id, guard_id, firearm_id, permit_type, issued_date, expiry_date, status) VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -125,7 +172,7 @@ pub async fn revoke_permit(
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
     let result = sqlx::query(
-        "UPDATE guard_firearm_permits SET status = 'revoked', updated_at = NOW() WHERE id = $1",
+        "UPDATE guard_firearm_permits SET status = 'revoked', updated_at = NOW() WHERE id = $1 AND status IN ('active', 'pending')",
     )
     .bind(&permit_id)
     .execute(db.as_ref())
@@ -133,7 +180,9 @@ pub async fn revoke_permit(
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
     if result.rows_affected() == 0 {
-        return Err(AppError::NotFound("Permit not found".to_string()));
+        return Err(AppError::BadRequest(
+            "Permit not found or already non-revocable".to_string(),
+        ));
     }
 
     Ok(Json(json!({ "message": "Permit revoked successfully" })))

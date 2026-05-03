@@ -13,6 +13,20 @@ use crate::{
     utils,
 };
 
+fn validate_firearm_status(status: &str) -> AppResult<&'static str> {
+    let normalized = status.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "available" => Ok("available"),
+        "allocated" => Ok("allocated"),
+        "maintenance" => Ok("maintenance"),
+        "deployed" => Ok("deployed"),
+        "lost" => Ok("lost"),
+        _ => Err(AppError::ValidationError(
+            "Invalid firearm status. Allowed values: available, allocated, maintenance, deployed, lost".to_string(),
+        )),
+    }
+}
+
 pub async fn add_firearm(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
@@ -27,7 +41,7 @@ pub async fn add_firearm(
     }
 
     let id = utils::generate_id();
-    let status = payload.status.as_deref().unwrap_or("available");
+    let status = validate_firearm_status(payload.status.as_deref().unwrap_or("available"))?;
 
     sqlx::query(
         "INSERT INTO firearms (id, name, serial_number, model, caliber, status) VALUES ($1, $2, $3, $4, $5, $6)"
@@ -123,10 +137,11 @@ pub async fn update_firearm(
         .ok_or_else(|| AppError::NotFound("Firearm not found".to_string()))?;
 
     if let Some(status) = payload.status {
+        let normalized_status = validate_firearm_status(&status)?;
         sqlx::query(
             "UPDATE firearms SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
         )
-        .bind(&status)
+        .bind(normalized_status)
         .bind(&id)
         .execute(db.as_ref())
         .await
@@ -134,6 +149,11 @@ pub async fn update_firearm(
     }
 
     if let Some(caliber) = payload.caliber {
+        if caliber.trim().is_empty() {
+            return Err(AppError::ValidationError(
+                "Caliber cannot be empty".to_string(),
+            ));
+        }
         sqlx::query(
             "UPDATE firearms SET caliber = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
         )

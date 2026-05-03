@@ -19,6 +19,15 @@ pub struct MatchSummary {
     pub errors: i32,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnresolvedBreakdown {
+    pub total: i64,
+    pub pending: i64,
+    pub ambiguous: i64,
+    pub errors: i64,
+}
+
 #[derive(Debug)]
 struct BatchCounters {
     total: i32,
@@ -228,6 +237,34 @@ pub async fn refresh_batch_statistics(pool: &PgPool, batch_id: &str) -> AppResul
     Ok(())
 }
 
+pub async fn unresolved_breakdown(pool: &PgPool, batch_id: &str) -> AppResult<UnresolvedBreakdown> {
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE match_status = 'pending')::BIGINT AS pending,
+            COUNT(*) FILTER (WHERE match_status = 'ambiguous')::BIGINT AS ambiguous,
+            COUNT(*) FILTER (WHERE match_status = 'error')::BIGINT AS errors
+        FROM mdr_staging_rows
+        WHERE batch_id = $1
+        "#,
+    )
+    .bind(batch_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to compute unresolved MDR counts: {}", e)))?;
+
+    let pending = counts.0;
+    let ambiguous = counts.1;
+    let errors = counts.2;
+
+    Ok(UnresolvedBreakdown {
+        total: pending + ambiguous + errors,
+        pending,
+        ambiguous,
+        errors,
+    })
+}
+
 /// Match staging rows against existing data.
 /// For each row in a batch:
 /// - Match guard by license_number -> users.license_number (primary)
@@ -435,18 +472,11 @@ pub async fn commit_batch(pool: &PgPool, batch_id: &str, committed_by: &str) -> 
         None => return Err(AppError::NotFound("Batch not found".to_string())),
     }
 
-    let unresolved: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM mdr_staging_rows WHERE batch_id = $1 AND match_status IN ('ambiguous', 'error', 'pending')",
-    )
-    .bind(batch_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
-
-    if unresolved > 0 {
+    let unresolved = unresolved_breakdown(pool, batch_id).await?;
+    if unresolved.total > 0 {
         return Err(AppError::BadRequest(format!(
-            "{} staging rows are still unresolved (ambiguous/error/pending). Resolve them first.",
-            unresolved
+            "Commit blocked: {} unresolved rows remain (pending: {}, ambiguous: {}, error: {}). Resolve all unresolved rows first.",
+            unresolved.total, unresolved.pending, unresolved.ambiguous, unresolved.errors
         )));
     }
 
