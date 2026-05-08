@@ -852,6 +852,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         ("admin", "view_merit"),
         ("admin", "manage_merit"),
         // supervisor
+        ("supervisor", "create_user"),
         ("supervisor", "update_user"),
         ("supervisor", "approve_guard_registration"),
         ("supervisor", "manage_firearms"),

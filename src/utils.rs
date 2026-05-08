@@ -288,6 +288,7 @@ pub fn role_permissions(role: &str) -> &'static [&'static str] {
             "manage_merit",
         ],
         "supervisor" => &[
+            "create_user",
             "update_user",
             "approve_guard_registration",
             "manage_firearms",

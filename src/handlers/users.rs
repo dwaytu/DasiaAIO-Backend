@@ -348,19 +348,33 @@ pub async fn update_user(
     Path(id): Path<String>,
     Json(payload): Json<serde_json::Value>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let _claims = utils::require_self_or_min_role(&headers, &id, "supervisor")?;
+    let claims = utils::require_self_or_min_role(&headers, &id, "supervisor")?;
 
-    // Check if user exists
-    sqlx::query("SELECT id FROM users WHERE id = $1")
+    // Check if user exists and resolve target role for guard-scoped credential edits.
+    let target_user = sqlx::query("SELECT id, role FROM users WHERE id = $1")
         .bind(&id)
         .fetch_optional(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
+    let target_role_raw: String = target_user
+        .try_get("role")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse target role: {}", e)))?;
+    let target_role = utils::normalize_role(&target_role_raw);
+    let actor_role = utils::normalize_role(&claims.role);
+    let is_self_update = claims.sub == id;
+    let can_edit_credentials = !is_self_update
+        && match actor_role.as_str() {
+            "superadmin" => true,
+            "admin" | "supervisor" => target_role == "guard",
+            _ => false,
+        };
+
     let full_name = payload.get("fullName").and_then(|v| v.as_str());
     let phone_number = payload.get("phoneNumber").and_then(|v| v.as_str());
     let email = payload.get("email").and_then(|v| v.as_str());
+    let username = payload.get("username").and_then(|v| v.as_str());
     let license_number = payload.get("licenseNumber").and_then(|v| v.as_str());
     let license_issued_date = payload.get("licenseIssuedDate").and_then(|v| v.as_str());
     let license_expiry_date = payload.get("licenseExpiryDate").and_then(|v| v.as_str());
@@ -379,8 +393,58 @@ pub async fn update_user(
     }
 
     if let Some(email) = email {
+        if !is_self_update && !can_edit_credentials {
+            return Err(AppError::Forbidden(
+                "Only superadmin can edit non-guard email/username; admin and supervisor may edit guard credentials only".to_string(),
+            ));
+        }
+        utils::validate_email(email)?;
+        let duplicate = sqlx::query(
+            "SELECT id FROM users WHERE email = $1 AND id <> $2",
+        )
+        .bind(email)
+        .bind(&id)
+        .fetch_optional(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+        if duplicate.is_some() {
+            return Err(AppError::Conflict("Email already in use".to_string()));
+        }
         sqlx::query("UPDATE users SET email = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
             .bind(email)
+            .bind(&id)
+            .execute(db.as_ref())
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+    }
+
+    if let Some(username) = username {
+        if !is_self_update && !can_edit_credentials {
+            return Err(AppError::Forbidden(
+                "Only superadmin can edit non-guard email/username; admin and supervisor may edit guard credentials only".to_string(),
+            ));
+        }
+        let trimmed = username.trim();
+        let username_regex = regex::Regex::new(r"^[A-Za-z0-9_]{3,}$")
+            .map_err(|e| AppError::InternalServerError(format!("Regex error: {}", e)))?;
+        if !username_regex.is_match(trimmed) {
+            return Err(AppError::BadRequest(
+                "Username must be at least 3 characters and use only letters, numbers, and underscores".to_string(),
+            ));
+        }
+        let duplicate = sqlx::query(
+            "SELECT id FROM users WHERE username = $1 AND id <> $2",
+        )
+        .bind(trimmed)
+        .bind(&id)
+        .fetch_optional(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+        if duplicate.is_some() {
+            return Err(AppError::Conflict("Username already in use".to_string()));
+        }
+        sqlx::query("UPDATE users SET username = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+            .bind(trimmed)
             .bind(&id)
             .execute(db.as_ref())
             .await
@@ -560,4 +624,3 @@ pub async fn delete_profile_photo(
         "message": "Profile photo removed successfully"
     })))
 }
-
