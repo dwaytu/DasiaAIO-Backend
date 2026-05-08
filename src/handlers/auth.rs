@@ -1365,7 +1365,7 @@ pub async fn reset_password(
         AppError::DatabaseError(format!("Failed to start reset transaction: {}", e))
     })?;
 
-    let redeemed_token_marker = sqlx::query_scalar::<_, i64>(
+    let redeemed_token_marker = sqlx::query_scalar::<_, i32>(
         r#"UPDATE password_reset_tokens
            SET is_used = TRUE
            WHERE user_id = $1
