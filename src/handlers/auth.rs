@@ -1365,14 +1365,14 @@ pub async fn reset_password(
         AppError::DatabaseError(format!("Failed to start reset transaction: {}", e))
     })?;
 
-    let redeemed_token_id = sqlx::query_scalar::<_, String>(
+    let redeemed_token_marker = sqlx::query_scalar::<_, i64>(
         r#"UPDATE password_reset_tokens
            SET is_used = TRUE
            WHERE user_id = $1
              AND is_used = FALSE
              AND expires_at > NOW()
              AND (token = $2 OR token = $3)
-           RETURNING id"#,
+           RETURNING 1"#,
     )
     .bind(&user_id)
     .bind(&code_hash)
@@ -1381,7 +1381,7 @@ pub async fn reset_password(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to redeem reset token: {}", e)))?;
 
-    if redeemed_token_id.is_none() {
+    if redeemed_token_marker.is_none() {
         tx.rollback().await.map_err(|e| {
             AppError::DatabaseError(format!("Failed to rollback reset transaction: {}", e))
         })?;
