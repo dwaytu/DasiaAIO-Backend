@@ -1065,7 +1065,7 @@ async fn supervisor_heartbeat_uses_user_entity_type_without_polluting_guard_stre
 }
 
 #[tokio::test]
-async fn admin_heartbeat_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+async fn admin_heartbeat_is_allowed() -> Result<(), Box<dyn std::error::Error>> {
     let Some((base_url, client, pool)) = setup_context().await? else {
         return Ok(());
     };
@@ -1094,8 +1094,8 @@ async fn admin_heartbeat_is_rejected() -> Result<(), Box<dyn std::error::Error>>
 
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "expected admin heartbeat to be rejected, body: {}",
+        StatusCode::CREATED,
+        "expected admin heartbeat to be accepted, body: {}",
         body
     );
 
@@ -1103,7 +1103,7 @@ async fn admin_heartbeat_is_rejected() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[tokio::test]
-async fn superadmin_heartbeat_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+async fn superadmin_heartbeat_is_allowed() -> Result<(), Box<dyn std::error::Error>> {
     let Some((base_url, client, pool)) = setup_context().await? else {
         return Ok(());
     };
@@ -1132,8 +1132,8 @@ async fn superadmin_heartbeat_is_rejected() -> Result<(), Box<dyn std::error::Er
 
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "expected superadmin heartbeat to be rejected, body: {}",
+        StatusCode::CREATED,
+        "expected superadmin heartbeat to be accepted, body: {}",
         body
     );
 

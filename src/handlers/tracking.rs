@@ -446,9 +446,13 @@ fn enforce_person_tracking_producer_scope(
     entity_type: &str,
     entity_id: &str,
 ) -> AppResult<()> {
-    if actor_role != "guard" && actor_role != "supervisor" {
+    if actor_role != "guard"
+        && actor_role != "supervisor"
+        && actor_role != "admin"
+        && actor_role != "superadmin"
+    {
         return Err(AppError::Forbidden(
-            "Only guard and supervisor roles may submit guard/user tracking points.".to_string(),
+            "Only operational roles may submit guard/user tracking points.".to_string(),
         ));
     }
 
@@ -463,7 +467,7 @@ fn enforce_person_tracking_producer_scope(
 
     if entity_type != "user" || entity_id != actor_user_id {
         return Err(AppError::Forbidden(
-            "Supervisors can only submit their own user tracking points".to_string(),
+            "Operational roles can only submit their own user tracking points".to_string(),
         ));
     }
 
@@ -2555,20 +2559,20 @@ pub async fn guard_heartbeat(
 
     let actor_role = utils::normalize_role(&claims.role);
 
-    // Only guard and supervisor roles are allowed to send heartbeats
-    if actor_role != "guard" && actor_role != "supervisor" {
+    // Operational roles are allowed to send self-scoped heartbeats.
+    if actor_role != "guard"
+        && actor_role != "supervisor"
+        && actor_role != "admin"
+        && actor_role != "superadmin"
+    {
         return Err(AppError::Forbidden(
-            "Only guard and supervisor roles may send location heartbeats.".to_string(),
+            "Only operational roles may send location heartbeats.".to_string(),
         ));
     }
 
     // Keep guard telemetry scoped to guard-only surfaces while allowing
-    // supervisors to send self-scoped heartbeat samples.
-    let entity_type = if actor_role == "supervisor" {
-        "user"
-    } else {
-        "guard"
-    };
+    // elevated roles to send self-scoped user heartbeat samples.
+    let entity_type = if actor_role == "guard" { "guard" } else { "user" };
 
     validate_coordinates(payload.latitude, payload.longitude)?;
 
@@ -2873,9 +2877,20 @@ mod tests {
     }
 
     #[test]
-    fn person_tracking_producer_scope_rejects_admin_for_guard_user_entities() {
-        let result = enforce_person_tracking_producer_scope("admin", "admin-1", "guard", "admin-1");
+    fn person_tracking_producer_scope_rejects_admin_for_guard_entities() {
+        let result =
+            enforce_person_tracking_producer_scope("admin", "admin-1", "guard", "admin-1");
         assert!(matches!(result, Err(AppError::Forbidden(_))));
+    }
+
+    #[test]
+    fn person_tracking_producer_scope_allows_admin_and_superadmin_self_user_entity() {
+        assert!(
+            enforce_person_tracking_producer_scope("admin", "admin-1", "user", "admin-1").is_ok()
+        );
+        assert!(
+            enforce_person_tracking_producer_scope("superadmin", "sa-1", "user", "sa-1").is_ok()
+        );
     }
 
     #[test]
