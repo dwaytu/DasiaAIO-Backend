@@ -468,19 +468,6 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active'",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS mdr_batch_id VARCHAR(36)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS lic_reg_name VARCHAR(100)",
-        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS kind VARCHAR(100)",
-        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS make VARCHAR(100)",
-        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS validity_date TIMESTAMP WITH TIME ZONE",
-        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS ammo_issued INTEGER",
-        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS lic_reg_name VARCHAR(100)",
-        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS vault_status VARCHAR(50)",
-        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS return_remarks VARCHAR(255)",
-        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS mdr_batch_id VARCHAR(36)",
-        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS mdr_batch_id VARCHAR(36)",
-        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS mdr_row_ref VARCHAR(50)",
-        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS expected_return_date TIMESTAMP WITH TIME ZONE",
-        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS notes TEXT",
-        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS issued_by VARCHAR(36)",
         "ALTER TABLE client_sites ADD COLUMN IF NOT EXISTS client_id VARCHAR(36)",
     ] {
         sqlx::query(alter_sql)
@@ -968,6 +955,29 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .map_err(|e| {
         AppError::DatabaseError(format!("Failed to create firearm_allocations table: {}", e))
     })?;
+
+    // Apply legacy firearm fields only after the base tables exist. Fresh databases
+    // must be able to complete startup before compatibility alters run.
+    for alter_sql in &[
+        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS kind VARCHAR(100)",
+        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS make VARCHAR(100)",
+        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS validity_date TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS ammo_issued INTEGER",
+        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS lic_reg_name VARCHAR(100)",
+        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS vault_status VARCHAR(50)",
+        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS return_remarks VARCHAR(255)",
+        "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS mdr_batch_id VARCHAR(36)",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS mdr_batch_id VARCHAR(36)",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS mdr_row_ref VARCHAR(50)",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS expected_return_date TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS notes TEXT",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS issued_by VARCHAR(36)",
+    ] {
+        sqlx::query(alter_sql)
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Failed firearm schema alter: {}", e)))?;
+    }
 
     // Create shifts table
     sqlx::query(
