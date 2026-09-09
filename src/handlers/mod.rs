@@ -1,11 +1,13 @@
-pub mod ai;
 pub mod alerts;
 pub mod analytics;
 pub mod armored_cars;
 pub mod audit;
 pub mod auth;
 pub mod clients;
+pub mod decision_support;
+pub mod dtr;
 pub mod feedback;
+pub mod firearm_compliance;
 pub mod firearm_allocation;
 pub mod firearm_maintenance;
 pub mod firearms;

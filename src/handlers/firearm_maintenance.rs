@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use chrono::Utc;
+use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -57,6 +58,26 @@ pub async fn schedule_maintenance(
         .map_err(|e| AppError::DatabaseError(format!("Failed to update firearm: {}", e)))?;
 
     Ok((StatusCode::CREATED, Json(rec)))
+}
+
+/// GET /api/firearm-maintenance
+pub async fn get_all_maintenance(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
+    let records = sqlx::query_as::<_, FirearmMaintenance>(
+        "SELECT * FROM firearm_maintenance ORDER BY scheduled_date DESC",
+    )
+    .fetch_all(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+
+    Ok(Json(json!({
+        "total": records.len(),
+        "maintenances": records,
+    })))
 }
 
 /// GET /api/firearm-maintenance/pending

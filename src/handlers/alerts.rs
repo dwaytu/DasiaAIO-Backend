@@ -47,7 +47,7 @@ struct GuardCapacityRow {
     committed_today: Option<i64>,
 }
 
-pub async fn get_predictive_alerts(
+pub async fn get_operational_risk_alerts(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
 ) -> AppResult<Json<Vec<PredictiveAlert>>> {

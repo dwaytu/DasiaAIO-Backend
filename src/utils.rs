@@ -318,16 +318,15 @@ pub fn has_permission(role: &str, permission: &str) -> bool {
     role_permissions(role).contains(&permission)
 }
 
-pub fn can_create_role(actor_role: &str, target_role: &str) -> bool {
-    let actor = normalize_role(actor_role);
-    let target = normalize_role(target_role);
-
-    match actor.as_str() {
-        "superadmin" => matches!(target.as_str(), "admin" | "supervisor" | "guard"),
-        "admin" => matches!(target.as_str(), "supervisor" | "guard"),
-        "supervisor" => matches!(target.as_str(), "guard"),
+pub fn can_manage_role(actor_role: &str, target_role: &str) -> bool {
+    match (role_rank(actor_role), role_rank(target_role)) {
+        (Some(actor_rank), Some(target_rank)) => actor_rank > target_rank,
         _ => false,
     }
+}
+
+pub fn can_create_role(actor_role: &str, target_role: &str) -> bool {
+    can_manage_role(actor_role, target_role)
 }
 
 pub fn require_min_role(headers: &HeaderMap, minimum_role: &str) -> AppResult<TokenClaims> {
@@ -518,8 +517,8 @@ pub async fn send_confirmation_email(api_key: &str, to_email: &str, code: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_requester_with_proxy_trust, normalize_authenticated_role, verify_refresh_token,
-        verify_token, RefreshTokenClaims, TokenClaims,
+        can_manage_role, extract_requester_with_proxy_trust, normalize_authenticated_role,
+        verify_refresh_token, verify_token, RefreshTokenClaims, TokenClaims,
     };
     use crate::error::AppError;
     use axum::http::{HeaderMap, HeaderValue};
@@ -626,6 +625,30 @@ mod tests {
             normalize_authenticated_role("admin").expect("role should be accepted"),
             "admin"
         );
+    }
+
+    #[test]
+    fn can_manage_role_enforces_strict_role_hierarchy() {
+        let roles = ["guard", "supervisor", "admin", "superadmin"];
+
+        for (actor_index, actor_role) in roles.iter().enumerate() {
+            for (target_index, target_role) in roles.iter().enumerate() {
+                assert_eq!(
+                    can_manage_role(actor_role, target_role),
+                    actor_index > target_index,
+                    "unexpected decision for {actor_role} managing {target_role}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn can_manage_role_normalizes_roles_and_denies_unknown_roles() {
+        assert!(can_manage_role("  SUPERADMIN ", " Guard "));
+        assert!(can_manage_role("ADMIN", "supervisor"));
+        assert!(!can_manage_role("supervisor", " SUPERVISOR "));
+        assert!(!can_manage_role("unknown", "guard"));
+        assert!(!can_manage_role("superadmin", "unknown"));
     }
 
     #[test]

@@ -194,23 +194,3 @@ pub async fn delete_firearm(
         "message": "Firearm deleted successfully"
     })))
 }
-
-pub async fn get_firearm_maintenance(
-    State(db): State<Arc<PgPool>>,
-    headers: HeaderMap,
-) -> AppResult<Json<serde_json::Value>> {
-    let _claims = utils::require_min_role(&headers, "supervisor")?;
-
-    // For now, return firearms that need maintenance (status = 'maintenance')
-    let maintenance_firearms = sqlx::query_as::<_, Firearm>(
-        "SELECT id, name, serial_number, model, caliber, status, created_at, updated_at FROM firearms WHERE status = 'maintenance' ORDER BY updated_at DESC"
-    )
-    .fetch_all(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
-
-    Ok(Json(json!({
-        "total": maintenance_firearms.len(),
-        "maintenances": maintenance_firearms
-    })))
-}

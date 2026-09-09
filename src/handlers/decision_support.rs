@@ -10,8 +10,8 @@ use std::sync::Arc;
 use crate::{
     error::AppResult,
     services::{
-        guard_prediction_service, incident_ai_classifier, incident_summary_service,
-        replacement_ai_service, vehicle_predictive_service,
+        guard_prediction_service, incident_severity_classifier, incident_summary_service,
+        replacement_scoring_service, vehicle_predictive_service,
     },
     utils,
 };
@@ -153,10 +153,10 @@ pub async fn get_replacement_suggestions(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
     Query(query): Query<ReplacementSuggestionsQuery>,
-) -> AppResult<Json<Vec<replacement_ai_service::ReplacementSuggestion>>> {
+) -> AppResult<Json<Vec<replacement_scoring_service::ReplacementSuggestion>>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
-    let rows = replacement_ai_service::suggest_replacement(db.as_ref(), &query.post_id).await?;
+    let rows = replacement_scoring_service::suggest_replacement(db.as_ref(), &query.post_id).await?;
     Ok(Json(rows))
 }
 
@@ -173,7 +173,7 @@ pub async fn classify_incident(
         normalized_description.to_string()
     };
 
-    let result = incident_ai_classifier::classify_incident_smart(&merged_text).await;
+    let result = incident_severity_classifier::classify_incident_severity(&merged_text);
     let explanation = format!(
         "Severity '{}' classified via {} with {:.0}% confidence based on incident wording and {} contextual token(s).",
         result.severity,

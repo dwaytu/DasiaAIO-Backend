@@ -45,6 +45,43 @@ async fn guard_has_shift_conflict(
     Ok(conflict)
 }
 
+fn is_approved_guard(role: &str, verified: bool, approval_status: &str) -> bool {
+    utils::normalize_role(role) == "guard"
+        && verified
+        && approval_status.trim().eq_ignore_ascii_case("approved")
+}
+
+async fn require_approved_guard(db: &PgPool, guard_id: &str) -> AppResult<()> {
+    let guard = sqlx::query(
+        "SELECT role, COALESCE(verified, false) AS verified, \
+                COALESCE(approval_status, 'approved') AS approval_status \
+         FROM users WHERE id = $1",
+    )
+    .bind(guard_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+    .ok_or_else(|| AppError::NotFound("Guard not found".to_string()))?;
+
+    let role: String = guard
+        .try_get("role")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse guard role: {}", e)))?;
+    let verified: bool = guard.try_get("verified").map_err(|e| {
+        AppError::DatabaseError(format!("Failed to parse guard verification status: {}", e))
+    })?;
+    let approval_status: String = guard.try_get("approval_status").map_err(|e| {
+        AppError::DatabaseError(format!("Failed to parse guard approval status: {}", e))
+    })?;
+
+    if !is_approved_guard(&role, verified, &approval_status) {
+        return Err(AppError::BadRequest(
+            "Selected account must be an approved, verified guard".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 pub async fn create_shift(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
@@ -60,13 +97,7 @@ pub async fn create_shift(
         return Err(AppError::BadRequest("All fields are required".to_string()));
     }
 
-    // Check if guard exists
-    sqlx::query("SELECT id FROM users WHERE id = $1")
-        .bind(&payload.guard_id)
-        .fetch_optional(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
-        .ok_or_else(|| AppError::NotFound("Guard not found".to_string()))?;
+    require_approved_guard(db.as_ref(), &payload.guard_id).await?;
 
     let shift_id = utils::generate_id();
 
@@ -133,10 +164,14 @@ pub async fn check_in(
 
     let _claims = utils::require_self_or_min_role(&headers, &payload.guard_id, "supervisor")?;
 
-    // Check if shift exists
-    let shift_guard = sqlx::query("SELECT id, guard_id FROM shifts WHERE id = $1")
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to start check-in: {}", e)))?;
+
+    let shift_guard = sqlx::query("SELECT guard_id FROM shifts WHERE id = $1 FOR UPDATE")
         .bind(&payload.shift_id)
-        .fetch_optional(db.as_ref())
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("Shift not found".to_string()))?;
@@ -151,6 +186,45 @@ pub async fn check_in(
         ));
     }
 
+    let existing_attendance = sqlx::query(
+        "SELECT id, guard_id FROM attendance \
+         WHERE shift_id = $1 \
+         ORDER BY check_in_time ASC, created_at ASC \
+         LIMIT 1",
+    )
+    .bind(&payload.shift_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to check attendance: {}", e)))?;
+
+    if let Some(existing_attendance) = existing_attendance {
+        let attendance_id: String = existing_attendance.try_get("id").map_err(|e| {
+            AppError::DatabaseError(format!("Failed to parse attendance ID: {}", e))
+        })?;
+        let attendance_guard_id: String =
+            existing_attendance.try_get("guard_id").map_err(|e| {
+                AppError::DatabaseError(format!("Failed to parse attendance guard: {}", e))
+            })?;
+
+        if attendance_guard_id != payload.guard_id {
+            return Err(AppError::Conflict(
+                "Shift already has attendance recorded for a different guard".to_string(),
+            ));
+        }
+
+        tx.commit().await.map_err(|e| {
+            AppError::DatabaseError(format!("Failed to complete check-in: {}", e))
+        })?;
+
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "message": "Check-in already recorded",
+                "attendanceId": attendance_id
+            })),
+        ));
+    }
+
     let attendance_id = utils::generate_id();
 
     sqlx::query(
@@ -159,7 +233,7 @@ pub async fn check_in(
     .bind(&attendance_id)
     .bind(&payload.guard_id)
     .bind(&payload.shift_id)
-    .execute(db.as_ref())
+    .execute(&mut *tx)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to record check-in: {}", e)))?;
 
@@ -180,9 +254,13 @@ pub async fn check_in(
     .bind(&punctuality_id)
     .bind(&payload.guard_id)
     .bind(&payload.shift_id)
-    .execute(db.as_ref())
+    .execute(&mut *tx)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to record punctuality: {}", e)))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to complete check-in: {}", e)))?;
 
     Ok((
         StatusCode::CREATED,
@@ -204,10 +282,16 @@ pub async fn check_out(
         ));
     }
 
-    // Check if attendance exists and capture guard ownership.
-    let attendance = sqlx::query("SELECT id, guard_id FROM attendance WHERE id = $1")
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to start check-out: {}", e)))?;
+
+    let attendance = sqlx::query(
+        "SELECT guard_id, check_out_time FROM attendance WHERE id = $1 FOR UPDATE",
+    )
         .bind(&payload.attendance_id)
-        .fetch_optional(db.as_ref())
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("Attendance not found".to_string()))?;
@@ -218,13 +302,33 @@ pub async fn check_out(
 
     let _claims = utils::require_self_or_min_role(&headers, &attendance_guard_id, "supervisor")?;
 
+    let existing_check_out: Option<chrono::DateTime<chrono::Utc>> = attendance
+        .try_get("check_out_time")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse check-out time: {}", e)))?;
+
+    if existing_check_out.is_some() {
+        tx.commit().await.map_err(|e| {
+            AppError::DatabaseError(format!("Failed to complete check-out: {}", e))
+        })?;
+
+        return Ok(Json(json!({
+            "message": "Check-out already recorded"
+        })));
+    }
+
     sqlx::query(
-        "UPDATE attendance SET check_out_time = CURRENT_TIMESTAMP, status = 'checked_out', updated_at = CURRENT_TIMESTAMP WHERE id = $1"
+        "UPDATE attendance \
+         SET check_out_time = CURRENT_TIMESTAMP, status = 'checked_out', updated_at = CURRENT_TIMESTAMP \
+         WHERE id = $1 AND check_out_time IS NULL"
     )
     .bind(&payload.attendance_id)
-    .execute(db.as_ref())
+    .execute(&mut *tx)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to complete check-out: {}", e)))?;
 
     Ok(Json(json!({
         "message": "Check-out recorded successfully"
@@ -237,9 +341,6 @@ pub async fn detect_no_shows(
 ) -> AppResult<Json<serde_json::Value>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
-    // Enhanced no-show detection with grace period and automatic notifications
-
-    // Step 1: Find shifts that have passed their grace period without check-in
     #[derive(sqlx::FromRow)]
     struct NoShowShift {
         id: String,
@@ -249,33 +350,58 @@ pub async fn detect_no_shows(
         client_site: String,
     }
 
+    let mut tx = db.begin().await.map_err(|e| {
+        AppError::DatabaseError(format!("Failed to start no-show detection: {}", e))
+    })?;
+
     let no_show_shifts = sqlx::query_as::<_, NoShowShift>(
-        "SELECT s.id, s.guard_id, s.start_time, s.end_time, s.client_site
-         FROM shifts s 
-         LEFT JOIN attendance a ON s.id = a.shift_id 
-         WHERE a.id IS NULL 
-         AND s.status = 'scheduled'
-         AND (s.start_time + INTERVAL '1 minute' * COALESCE(s.grace_period_minutes, 15)) <= CURRENT_TIMESTAMP
-         AND COALESCE(s.replacement_status, 'not_needed') = 'not_needed'"
+        "WITH candidates AS (
+             SELECT s.id
+             FROM shifts s
+             WHERE s.status = 'scheduled'
+               AND (s.start_time + INTERVAL '1 minute' * COALESCE(s.grace_period_minutes, 15)) <= CURRENT_TIMESTAMP
+               AND COALESCE(s.replacement_status, 'not_needed') = 'not_needed'
+               AND NOT EXISTS (
+                   SELECT 1 FROM attendance a WHERE a.shift_id = s.id
+               )
+             FOR UPDATE OF s SKIP LOCKED
+         )
+         UPDATE shifts s
+         SET replacement_status = 'searching', updated_at = CURRENT_TIMESTAMP
+         FROM candidates c
+         WHERE s.id = c.id
+         RETURNING s.id, s.guard_id, s.start_time, s.end_time, s.client_site"
     )
-    .fetch_all(db.as_ref())
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to detect no-shows: {}", e)))?;
 
     let mut notified_guards = Vec::new();
 
-    // Step 2: For each no-show, find available substitutes and notify them
     for shift in &no_show_shifts {
-        // Update shift status to searching
+        let punctuality_id = utils::generate_id();
         sqlx::query(
-            "UPDATE shifts SET replacement_status = 'searching', updated_at = CURRENT_TIMESTAMP WHERE id = $1"
+            "INSERT INTO punctuality_records (
+                 id, guard_id, shift_id, scheduled_start_time, actual_check_in_time,
+                 minutes_late, is_on_time, status
+             )
+             SELECT $1, $2, $3, $4, NULL, NULL, false, 'no_show'
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM punctuality_records
+                 WHERE shift_id = $3 AND guard_id = $2 AND status = 'no_show'
+             )",
         )
+        .bind(&punctuality_id)
+        .bind(&shift.guard_id)
         .bind(&shift.id)
-        .execute(db.as_ref())
+        .bind(shift.start_time)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to update shift status: {}", e)))?;
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to record no-show punctuality: {}", e))
+        })?;
 
-        // Find available guards (not the original guard, verified users, with role 'user')
         #[derive(sqlx::FromRow)]
         struct AvailableGuard {
             id: String,
@@ -303,11 +429,10 @@ pub async fn detect_no_shows(
         .bind(&shift.guard_id)
         .bind(&shift.end_time)
         .bind(&shift.start_time)
-        .fetch_all(db.as_ref())
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to find available guards: {}", e)))?;
 
-        // Step 3: Create notifications for available guards
         for guard in &available_guards {
             let notification_id = utils::generate_id();
             let guard_name = guard.full_name.as_ref().unwrap_or(&guard.username);
@@ -326,7 +451,7 @@ pub async fn detect_no_shows(
                 shift.end_time.format("%I:%M %p")
             ))
             .bind(&shift.id)
-            .execute(db.as_ref())
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::DatabaseError(format!("Failed to create notification: {}", e)))?;
 
@@ -344,6 +469,10 @@ pub async fn detect_no_shows(
             available_guards.len()
         );
     }
+
+    tx.commit().await.map_err(|e| {
+        AppError::DatabaseError(format!("Failed to complete no-show detection: {}", e))
+    })?;
 
     Ok(Json(json!({
         "message": "No-show detection completed",
@@ -729,6 +858,16 @@ pub async fn update_shift(
 ) -> AppResult<Json<serde_json::Value>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
+    if payload.guard_id.is_empty()
+        || payload.start_time.is_empty()
+        || payload.end_time.is_empty()
+        || payload.client_site.is_empty()
+    {
+        return Err(AppError::BadRequest("All fields are required".to_string()));
+    }
+
+    require_approved_guard(db.as_ref(), &payload.guard_id).await?;
+
     // Check if shift exists
     sqlx::query("SELECT id FROM shifts WHERE id = $1")
         .bind(&shift_id)
@@ -812,5 +951,19 @@ pub async fn delete_shift(
     Ok(Json(json!({
         "message": "Shift deleted successfully"
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_approved_guard;
+
+    #[test]
+    fn approved_guard_check_rejects_wrong_role_or_status() {
+        assert!(is_approved_guard("guard", true, "approved"));
+        assert!(is_approved_guard(" GUARD ", true, "Approved"));
+        assert!(!is_approved_guard("admin", true, "approved"));
+        assert!(!is_approved_guard("guard", false, "approved"));
+        assert!(!is_approved_guard("guard", true, "pending"));
+    }
 }
 

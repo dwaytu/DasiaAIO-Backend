@@ -481,6 +481,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         "ALTER TABLE firearms ADD COLUMN IF NOT EXISTS mdr_batch_id VARCHAR(36)",
         "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS mdr_batch_id VARCHAR(36)",
         "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS mdr_row_ref VARCHAR(50)",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS expected_return_date TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS notes TEXT",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS issued_by VARCHAR(36)",
         "ALTER TABLE client_sites ADD COLUMN IF NOT EXISTS client_id VARCHAR(36)",
     ] {
         sqlx::query(alter_sql)
@@ -1257,6 +1260,16 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         AppError::DatabaseError(format!("Failed to create guard_availability table: {}", e))
     })?;
 
+    // Older databases may have the base shifts table without replacement workflow fields.
+    for migration in &[
+        "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS grace_period_minutes INTEGER NOT NULL DEFAULT 15",
+        "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS replacement_status VARCHAR(20) NOT NULL DEFAULT 'not_needed'",
+    ] {
+        sqlx::query(migration).execute(pool).await.map_err(|e| {
+            AppError::DatabaseError(format!("Shift replacement migration failed '{}': {}", migration, e))
+        })?;
+    }
+
     // Create guard_shift_swaps table
     sqlx::query(
         r#"
@@ -1421,7 +1434,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         AppError::DatabaseError(format!("Failed to create firearm_maintenance table: {}", e))
     })?;
 
-    // Create AI-assisted SOC intelligence tables (deterministic/explainable outputs).
+    // Create operational analytics tables (deterministic/explainable outputs).
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS guard_absence_predictions (

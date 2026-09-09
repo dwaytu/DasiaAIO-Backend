@@ -15,6 +15,106 @@ use crate::{
     utils,
 };
 
+const MAX_PROFILE_PHOTO_BYTES: usize = 5 * 1024 * 1024;
+
+fn optional_string_field(
+    payload: &serde_json::Value,
+    field_names: &[&str],
+    label: &str,
+) -> AppResult<Option<String>> {
+    for field_name in field_names {
+        if let Some(value) = payload.get(field_name) {
+            return value
+                .as_str()
+                .map(|value| Some(value.trim().to_string()))
+                .ok_or_else(|| AppError::BadRequest(format!("{} must be a string", label)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_user_date(value: Option<String>, label: &str) -> AppResult<Option<chrono::DateTime<chrono::Utc>>> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&value) {
+        return Ok(Some(parsed.with_timezone(&chrono::Utc)));
+    }
+
+    let date = chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d").map_err(|_| {
+        AppError::BadRequest(format!(
+            "{} must use YYYY-MM-DD or RFC3339 format",
+            label
+        ))
+    })?;
+    let midnight = date.and_hms_opt(0, 0, 0).ok_or_else(|| {
+        AppError::BadRequest(format!("{} is outside the supported date range", label))
+    })?;
+
+    Ok(Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+        midnight,
+        chrono::Utc,
+    )))
+}
+
+fn ensure_actor_can_manage_target(
+    actor_id: &str,
+    actor_role: &str,
+    target_id: &str,
+    target_role: &str,
+) -> AppResult<()> {
+    if actor_id == target_id || utils::can_manage_role(actor_role, target_role) {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(
+        "You cannot manage an account with an equal or higher role".to_string(),
+    ))
+}
+
+fn validate_profile_photo_data_url(value: &str) -> AppResult<()> {
+    let (metadata, encoded) = value.split_once(',').ok_or_else(|| {
+        AppError::BadRequest("Profile photo must be a base64 image data URL".to_string())
+    })?;
+
+    if !matches!(
+        metadata.to_ascii_lowercase().as_str(),
+        "data:image/png;base64" | "data:image/jpeg;base64" | "data:image/webp;base64"
+    ) {
+        return Err(AppError::BadRequest(
+            "Profile photo must be a PNG, JPEG, or WebP image".to_string(),
+        ));
+    }
+
+    if encoded.is_empty()
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    {
+        return Err(AppError::BadRequest(
+            "Profile photo contains invalid base64 data".to_string(),
+        ));
+    }
+
+    let padding = encoded.bytes().rev().take_while(|byte| *byte == b'=').count();
+    let content_length = encoded.len().saturating_sub(padding);
+    if encoded.len() % 4 != 0 || padding > 2 || encoded[..content_length].contains('=') {
+        return Err(AppError::BadRequest(
+            "Profile photo contains invalid base64 padding".to_string(),
+        ));
+    }
+    let decoded_size = (encoded.len() / 4).saturating_mul(3).saturating_sub(padding);
+    if decoded_size > MAX_PROFILE_PHOTO_BYTES {
+        return Err(AppError::BadRequest(
+            "Profile photo must be 5 MB or smaller".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, serde::Serialize, sqlx::FromRow)]
 pub struct PendingApprovalUser {
     pub id: String,
@@ -350,7 +450,6 @@ pub async fn update_user(
 ) -> AppResult<Json<serde_json::Value>> {
     let claims = utils::require_self_or_min_role(&headers, &id, "supervisor")?;
 
-    // Check if user exists and resolve target role for guard-scoped credential edits.
     let target_user = sqlx::query("SELECT id, role FROM users WHERE id = $1")
         .bind(&id)
         .fetch_optional(db.as_ref())
@@ -363,41 +462,50 @@ pub async fn update_user(
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse target role: {}", e)))?;
     let target_role = utils::normalize_role(&target_role_raw);
     let actor_role = utils::normalize_role(&claims.role);
-    let is_self_update = claims.sub == id;
-    let can_edit_credentials = !is_self_update
-        && match actor_role.as_str() {
-            "superadmin" => true,
-            "admin" | "supervisor" => target_role == "guard",
-            _ => false,
-        };
+    ensure_actor_can_manage_target(&claims.sub, &actor_role, &id, &target_role)?;
 
-    let full_name = payload.get("fullName").and_then(|v| v.as_str());
-    let phone_number = payload.get("phoneNumber").and_then(|v| v.as_str());
-    let email = payload.get("email").and_then(|v| v.as_str());
-    let username = payload.get("username").and_then(|v| v.as_str());
-    let license_number = payload.get("licenseNumber").and_then(|v| v.as_str());
-    let license_issued_date = payload.get("licenseIssuedDate").and_then(|v| v.as_str());
-    let license_expiry_date = payload.get("licenseExpiryDate").and_then(|v| v.as_str());
-    let address = payload.get("address").and_then(|v| v.as_str());
+    let full_name = optional_string_field(&payload, &["fullName", "full_name"], "full name")?;
+    let phone_number =
+        optional_string_field(&payload, &["phoneNumber", "phone_number"], "phone number")?;
+    let email = optional_string_field(&payload, &["email"], "email")?;
+    let username = optional_string_field(&payload, &["username"], "username")?;
+    let license_number = optional_string_field(
+        &payload,
+        &["licenseNumber", "license_number"],
+        "license number",
+    )?;
+    let license_issued_date = parse_user_date(
+        optional_string_field(
+            &payload,
+            &["licenseIssuedDate", "license_issued_date"],
+            "license issued date",
+        )?,
+        "license issued date",
+    )?;
+    let license_expiry_date = parse_user_date(
+        optional_string_field(
+            &payload,
+            &["licenseExpiryDate", "license_expiry_date"],
+            "license expiry date",
+        )?,
+        "license expiry date",
+    )?;
+    let address = optional_string_field(&payload, &["address"], "address")?;
 
-    // Build query based on provided fields
-    if let Some(full_name) = full_name {
-        sqlx::query(
-            "UPDATE users SET full_name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-        )
-        .bind(full_name)
-        .bind(&id)
-        .execute(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+    if let Some(value) = full_name.as_deref() {
+        if value.is_empty() {
+            return Err(AppError::BadRequest("Full name cannot be empty".to_string()));
+        }
     }
-
-    if let Some(email) = email {
-        if !is_self_update && !can_edit_credentials {
-            return Err(AppError::Forbidden(
-                "Only superadmin can edit non-guard email/username; admin and supervisor may edit guard credentials only".to_string(),
+    if let Some(value) = phone_number.as_deref() {
+        if value.is_empty() {
+            return Err(AppError::BadRequest(
+                "Phone number cannot be empty".to_string(),
             ));
         }
+    }
+
+    if let Some(email) = email.as_deref() {
         utils::validate_email(email)?;
         let duplicate = sqlx::query(
             "SELECT id FROM users WHERE email = $1 AND id <> $2",
@@ -410,24 +518,12 @@ pub async fn update_user(
         if duplicate.is_some() {
             return Err(AppError::Conflict("Email already in use".to_string()));
         }
-        sqlx::query("UPDATE users SET email = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
-            .bind(email)
-            .bind(&id)
-            .execute(db.as_ref())
-            .await
-            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
     }
 
-    if let Some(username) = username {
-        if !is_self_update && !can_edit_credentials {
-            return Err(AppError::Forbidden(
-                "Only superadmin can edit non-guard email/username; admin and supervisor may edit guard credentials only".to_string(),
-            ));
-        }
-        let trimmed = username.trim();
+    if let Some(username) = username.as_deref() {
         let username_regex = regex::Regex::new(r"^[A-Za-z0-9_]{3,}$")
             .map_err(|e| AppError::InternalServerError(format!("Regex error: {}", e)))?;
-        if !username_regex.is_match(trimmed) {
+        if !username_regex.is_match(username) {
             return Err(AppError::BadRequest(
                 "Username must be at least 3 characters and use only letters, numbers, and underscores".to_string(),
             ));
@@ -435,7 +531,7 @@ pub async fn update_user(
         let duplicate = sqlx::query(
             "SELECT id FROM users WHERE username = $1 AND id <> $2",
         )
-        .bind(trimmed)
+        .bind(username)
         .bind(&id)
         .fetch_optional(db.as_ref())
         .await
@@ -443,78 +539,33 @@ pub async fn update_user(
         if duplicate.is_some() {
             return Err(AppError::Conflict("Username already in use".to_string()));
         }
-        sqlx::query("UPDATE users SET username = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
-            .bind(trimmed)
-            .bind(&id)
-            .execute(db.as_ref())
-            .await
-            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
     }
 
-    if let Some(phone_number) = phone_number {
-        sqlx::query(
-            "UPDATE users SET phone_number = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-        )
-        .bind(phone_number)
-        .bind(&id)
-        .execute(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
-    }
-
-    if let Some(license_number) = license_number {
-        sqlx::query(
-            "UPDATE users SET license_number = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-        )
-        .bind(license_number)
-        .bind(&id)
-        .execute(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
-    }
-
-    if let Some(license_expiry_date) = license_expiry_date {
-        let expiry_date = chrono::DateTime::parse_from_rfc3339(license_expiry_date)
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-
-        if let Some(expiry_date) = expiry_date {
-            sqlx::query(
-                "UPDATE users SET license_expiry_date = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
-            )
-            .bind(expiry_date)
-            .bind(&id)
-            .execute(db.as_ref())
-            .await
-            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
-        }
-    }
-
-    if let Some(license_issued_date) = license_issued_date {
-        let issued_date = chrono::DateTime::parse_from_rfc3339(license_issued_date)
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-
-        if let Some(issued_date) = issued_date {
-            sqlx::query(
-                "UPDATE users SET license_issued_date = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
-            )
-            .bind(issued_date)
-            .bind(&id)
-            .execute(db.as_ref())
-            .await
-            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
-        }
-    }
-
-    if let Some(address) = address {
-        sqlx::query("UPDATE users SET address = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
-            .bind(address)
-            .bind(&id)
-            .execute(db.as_ref())
-            .await
-            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
-    }
+    sqlx::query(
+        r#"UPDATE users
+           SET full_name = COALESCE($1, full_name),
+               phone_number = COALESCE($2, phone_number),
+               email = COALESCE($3, email),
+               username = COALESCE($4, username),
+               license_number = COALESCE($5, license_number),
+               license_issued_date = COALESCE($6, license_issued_date),
+               license_expiry_date = COALESCE($7, license_expiry_date),
+               address = COALESCE($8, address),
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $9"#,
+    )
+    .bind(full_name.as_deref())
+    .bind(phone_number.as_deref())
+    .bind(email.as_deref())
+    .bind(username.as_deref())
+    .bind(license_number.as_deref())
+    .bind(license_issued_date)
+    .bind(license_expiry_date)
+    .bind(address.as_deref())
+    .bind(&id)
+    .execute(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
     Ok(Json(json!({
         "message": "User updated successfully"
@@ -534,13 +585,16 @@ pub async fn delete_user(
         ));
     }
 
-    // Check if user exists
-    sqlx::query("SELECT id FROM users WHERE id = $1")
+    let target_user = sqlx::query("SELECT role FROM users WHERE id = $1")
         .bind(&id)
         .fetch_optional(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    let target_role: String = target_user
+        .try_get("role")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse target role: {}", e)))?;
+    ensure_actor_can_manage_target(&claims.sub, &claims.role, &id, &target_role)?;
 
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(&id)
@@ -559,25 +613,25 @@ pub async fn update_profile_photo(
     Path(id): Path<String>,
     Json(payload): Json<serde_json::Value>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let _claims = utils::require_self_or_min_role(&headers, &id, "supervisor")?;
+    let claims = utils::require_self_or_min_role(&headers, &id, "supervisor")?;
 
-    // Check if user exists
-    sqlx::query("SELECT id FROM users WHERE id = $1")
+    let target_user = sqlx::query("SELECT role FROM users WHERE id = $1")
         .bind(&id)
         .fetch_optional(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    let target_role: String = target_user
+        .try_get("role")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse target role: {}", e)))?;
+    ensure_actor_can_manage_target(&claims.sub, &claims.role, &id, &target_role)?;
 
     let profile_photo = payload
         .get("profilePhoto")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("Missing profilePhoto field".to_string()))?;
 
-    // Validate base64 format
-    if !profile_photo.starts_with("data:image/") {
-        return Err(AppError::BadRequest("Invalid image format".to_string()));
-    }
+    validate_profile_photo_data_url(profile_photo)?;
 
     tracing::info!("Updating profile photo for user: {}", id);
 
@@ -602,15 +656,18 @@ pub async fn delete_profile_photo(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let _claims = utils::require_self_or_min_role(&headers, &id, "supervisor")?;
+    let claims = utils::require_self_or_min_role(&headers, &id, "supervisor")?;
 
-    // Check if user exists
-    sqlx::query("SELECT id FROM users WHERE id = $1")
+    let target_user = sqlx::query("SELECT role FROM users WHERE id = $1")
         .bind(&id)
         .fetch_optional(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    let target_role: String = target_user
+        .try_get("role")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse target role: {}", e)))?;
+    ensure_actor_can_manage_target(&claims.sub, &claims.role, &id, &target_role)?;
 
     sqlx::query(
         "UPDATE users SET profile_photo = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
@@ -623,4 +680,32 @@ pub async fn delete_profile_photo(
     Ok(Json(json!({
         "message": "Profile photo removed successfully"
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_user_date, validate_profile_photo_data_url};
+
+    #[test]
+    fn user_dates_accept_date_only_and_rfc3339_values() {
+        assert!(parse_user_date(Some("2026-08-19".to_string()), "date")
+            .expect("date-only value should parse")
+            .is_some());
+        assert!(parse_user_date(Some("2026-08-19T08:30:00Z".to_string()), "date")
+            .expect("RFC3339 value should parse")
+            .is_some());
+        assert!(parse_user_date(Some("19/08/2026".to_string()), "date").is_err());
+    }
+
+    #[test]
+    fn profile_photo_validation_restricts_type_and_size() {
+        assert!(validate_profile_photo_data_url("data:image/png;base64,aGVsbG8=").is_ok());
+        assert!(validate_profile_photo_data_url("data:image/svg+xml;base64,PHN2Zz4=").is_err());
+
+        let oversized = format!(
+            "data:image/jpeg;base64,{}",
+            "A".repeat(((5usize * 1024 * 1024 + 1) * 4).div_ceil(3))
+        );
+        assert!(validate_profile_photo_data_url(&oversized).is_err());
+    }
 }

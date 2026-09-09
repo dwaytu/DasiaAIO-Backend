@@ -177,6 +177,7 @@ impl std::fmt::Display for FirearmStatus {
 
 // Firearm model
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct Firearm {
     pub id: String,
     pub name: String,
@@ -207,6 +208,7 @@ pub struct UpdateFirearmRequest {
 
 // Firearm Allocation model
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct FirearmAllocation {
     pub id: String,
     pub guard_id: String,
@@ -315,9 +317,13 @@ pub struct Shift {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateShiftRequest {
+    #[serde(alias = "guard_id")]
     pub guard_id: String,
+    #[serde(alias = "start_time")]
     pub start_time: String,
+    #[serde(alias = "end_time")]
     pub end_time: String,
+    #[serde(alias = "client_site")]
     pub client_site: String,
 }
 
@@ -538,6 +544,7 @@ pub struct EndTripRequest {
 
 // Guard permit model
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct GuardFirearmPermit {
     pub id: String,
     pub guard_id: String,
@@ -562,6 +569,7 @@ pub struct CreateGuardFirearmPermitRequest {
 
 // Guard allocation view with firearm details
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct GuardAllocationView {
     pub id: String,
     pub guard_id: String,
@@ -835,7 +843,7 @@ pub struct CreateTrainingRecordRequest {
     pub notes: Option<String>,
 }
 
-// Phase 1: AI-assisted operational intelligence models.
+// Phase 1: rule-based operational analytics models.
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -916,7 +924,7 @@ pub struct PredictiveVehicleMaintenance {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
-pub struct AiIncidentSummary {
+pub struct IncidentSummaryRecord {
     pub id: String,
     pub incident_id: String,
     pub summary_kind: String,

@@ -555,6 +555,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     middleware::audit::audit_write_requests,
                 )),
         )
+        .route(
+            "/api/firearms/compliance-report",
+            get(handlers::firearm_compliance::get_compliance_report).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_firearm_management),
+            ),
+        )
+        .route(
+            "/api/firearms/compliance-notifications",
+            post(handlers::firearm_compliance::create_expiry_notifications)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_firearm_management,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
         // Firearm allocation routes
         .route(
             "/api/firearm-allocation/issue",
@@ -610,7 +627,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Firearm maintenance routes
         .route(
             "/api/firearm-maintenance",
-            get(handlers::firearms::get_firearm_maintenance).route_layer(axum_middleware::from_fn(
+            get(handlers::firearm_maintenance::get_all_maintenance).route_layer(axum_middleware::from_fn(
                 middleware::authz::require_firearm_management,
             )),
         )
@@ -709,6 +726,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(handlers::guard_replacement::get_guard_attendance).route_layer(
                 axum_middleware::from_fn(middleware::authz::require_authenticated),
             ),
+        )
+        .route(
+            "/api/attendance/dtr",
+            get(handlers::dtr::get_dtr_report).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_analytics_view,
+            )),
         )
         .route(
             "/api/guard-replacement/detect-no-shows",
@@ -1316,6 +1339,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         )
         .route(
+            "/api/analytics/guard-performance-report",
+            get(handlers::analytics::get_guard_performance_report).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_analytics_view),
+            ),
+        )
+        .route(
             "/api/analytics/mission-status",
             put(handlers::analytics::update_mission_status)
                 .route_layer(axum_middleware::from_fn(
@@ -1327,8 +1356,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
         )
         .route(
-            "/api/alerts/predictive",
-            get(handlers::alerts::get_predictive_alerts)
+            "/api/alerts/operational-risk",
+            get(handlers::alerts::get_operational_risk_alerts)
                 .route_layer(axum_middleware::from_fn(
                     middleware::authz::require_analytics_view,
                 ))
@@ -1338,8 +1367,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
         )
         .route(
-            "/api/ai/guard-absence-risk",
-            get(handlers::ai::get_guard_absence_risk)
+            "/api/analytics/guard-absence-risk",
+            get(handlers::decision_support::get_guard_absence_risk)
                 .route_layer(axum_middleware::from_fn(
                     middleware::authz::require_analytics_view,
                 ))
@@ -1349,8 +1378,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
         )
         .route(
-            "/api/ai/replacement-suggestions",
-            get(handlers::ai::get_replacement_suggestions)
+            "/api/analytics/replacement-suggestions",
+            get(handlers::decision_support::get_replacement_suggestions)
                 .route_layer(axum_middleware::from_fn(
                     middleware::authz::require_analytics_view,
                 ))
@@ -1360,8 +1389,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
         )
         .route(
-            "/api/ai/vehicle-maintenance-risk",
-            get(handlers::ai::get_vehicle_maintenance_risk)
+            "/api/analytics/vehicle-maintenance-risk",
+            get(handlers::decision_support::get_vehicle_maintenance_risk)
                 .route_layer(axum_middleware::from_fn(
                     middleware::authz::require_analytics_view,
                 ))
@@ -1371,8 +1400,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
         )
         .route(
-            "/api/ai/classify-incident",
-            post(handlers::ai::classify_incident)
+            "/api/analytics/incident-severity",
+            post(handlers::decision_support::classify_incident)
                 .route_layer(axum_middleware::from_fn(
                     middleware::authz::require_authenticated,
                 ))
@@ -1382,8 +1411,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
         )
         .route(
-            "/api/ai/summarize-incident",
-            post(handlers::ai::summarize_incident)
+            "/api/analytics/incident-summary",
+            post(handlers::decision_support::summarize_incident)
                 .route_layer(axum_middleware::from_fn(
                     middleware::authz::require_authenticated,
                 ))
