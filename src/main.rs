@@ -627,9 +627,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Firearm maintenance routes
         .route(
             "/api/firearm-maintenance",
-            get(handlers::firearm_maintenance::get_all_maintenance).route_layer(axum_middleware::from_fn(
-                middleware::authz::require_firearm_management,
-            )),
+            get(handlers::firearm_maintenance::get_all_maintenance).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_firearm_management),
+            ),
         )
         // Guard replacement routes
         .route(
@@ -842,10 +842,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route(
             "/api/notifications/push-subscribe",
-            post(handlers::notifications::push_subscribe)
-                .route_layer(axum_middleware::from_fn(
-                    middleware::authz::require_authenticated,
-                )),
+            post(handlers::notifications::push_subscribe).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_authenticated,
+            )),
         )
         // Mission assignment routes (Integrated Workflow)
         .route(
@@ -868,15 +867,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Guard shift swap routes
         .route(
             "/api/shifts/swap-request",
-            post(handlers::shift_swap::create_swap_request).route_layer(
-                axum_middleware::from_fn(middleware::authz::require_authenticated),
-            ),
+            post(handlers::shift_swap::create_swap_request).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_authenticated,
+            )),
         )
         .route(
             "/api/shifts/swap-requests",
-            get(handlers::shift_swap::list_swap_requests).route_layer(
-                axum_middleware::from_fn(middleware::authz::require_authenticated),
-            ),
+            get(handlers::shift_swap::list_swap_requests).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_authenticated,
+            )),
         )
         .route(
             "/api/shifts/swap-requests/:id/respond",
@@ -1019,6 +1018,119 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(handlers::support_tickets::get_guard_tickets).route_layer(
                 axum_middleware::from_fn(middleware::authz::require_authenticated),
             ),
+        )
+        // Operational service, deposit, return, and registration requests
+        .route(
+            "/api/operational-requests",
+            get(handlers::operational_requests::list_requests)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_authenticated,
+                ))
+                .merge(
+                    post(handlers::operational_requests::create_request)
+                        .route_layer(axum_middleware::from_fn(
+                            middleware::authz::require_operational_request_creation,
+                        ))
+                        .route_layer(axum_middleware::from_fn_with_state(
+                            db.clone(),
+                            middleware::audit::audit_write_requests,
+                        )),
+                ),
+        )
+        .route(
+            "/api/operational-requests/resources/mine",
+            get(handlers::operational_requests::get_my_resources).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_authenticated),
+            ),
+        )
+        .route(
+            "/api/operational-requests/:id",
+            get(handlers::operational_requests::get_request).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_authenticated,
+            )),
+        )
+        .route(
+            "/api/operational-requests/:id/events",
+            get(handlers::operational_requests::get_events).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_authenticated,
+            )),
+        )
+        .route(
+            "/api/operational-requests/:id/resubmit",
+            post(handlers::operational_requests::resubmit_request)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_authenticated,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/operational-requests/:id/cancel",
+            post(handlers::operational_requests::cancel_request)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_authenticated,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/operational-requests/:id/approve",
+            post(handlers::operational_requests::approve_request)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_operational_request_review,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/operational-requests/:id/reject",
+            post(handlers::operational_requests::reject_request)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_operational_request_review,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/operational-requests/:id/return-for-correction",
+            post(handlers::operational_requests::return_for_correction)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_operational_request_review,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/operational-requests/:id/start",
+            post(handlers::operational_requests::start_request)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_operational_request_fulfillment,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/operational-requests/:id/complete",
+            post(handlers::operational_requests::complete_request)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_operational_request_fulfillment,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
         )
         // Merit score system routes (Requirement 2)
         .route(
@@ -1655,9 +1767,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route(
             "/api/mdr/batches/:id/compliance-report",
-            get(handlers::mdr::get_batch_compliance_report).route_layer(
-                axum_middleware::from_fn(middleware::authz::require_mdr_management),
-            ),
+            get(handlers::mdr::get_batch_compliance_report).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_mdr_management,
+            )),
         )
         .route(
             "/api/mdr/ops-health",

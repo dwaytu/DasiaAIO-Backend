@@ -31,7 +31,7 @@ pub async fn get_user_notifications(
     let _claims = utils::require_self_or_min_role(&headers, &user_id, "supervisor")?;
 
     let notifications = sqlx::query_as::<_, Notification>(
-        "SELECT id, user_id, title, message, type as notification_type, related_shift_id, read, created_at, updated_at 
+        "SELECT id, user_id, title, message, type as notification_type, related_shift_id, related_request_id, read, created_at, updated_at
          FROM notifications 
          WHERE user_id = $1 
          ORDER BY created_at DESC 
@@ -97,8 +97,8 @@ pub async fn create_notification(
     let id = utils::generate_id();
 
     sqlx::query(
-        "INSERT INTO notifications (id, user_id, title, message, type, related_shift_id, read) 
-         VALUES ($1, $2, $3, $4, $5, $6, false)",
+        "INSERT INTO notifications (id, user_id, title, message, type, related_shift_id, related_request_id, read)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, false)",
     )
     .bind(&id)
     .bind(&payload.user_id)
@@ -106,6 +106,7 @@ pub async fn create_notification(
     .bind(&payload.message)
     .bind(&payload.notification_type)
     .bind(&payload.related_shift_id)
+    .bind(&payload.related_request_id)
     .execute(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create notification: {}", e)))?;

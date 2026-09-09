@@ -168,9 +168,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_ip VARCHAR(64)")
         .execute(pool)
         .await
-        .map_err(|e| {
-            AppError::DatabaseError(format!("Failed to add consent_ip column: {}", e))
-        })?;
+        .map_err(|e| AppError::DatabaseError(format!("Failed to add consent_ip column: {}", e)))?;
 
     sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_user_agent TEXT")
         .execute(pool)
@@ -367,10 +365,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_staging_batch ON mdr_staging_rows(batch_id)",
         "CREATE INDEX IF NOT EXISTS idx_staging_match ON mdr_staging_rows(batch_id, match_status)",
     ] {
-        sqlx::query(index_sql)
-            .execute(pool)
-            .await
-            .map_err(|e| AppError::DatabaseError(format!("Failed to create staging index: {}", e)))?;
+        sqlx::query(index_sql).execute(pool).await.map_err(|e| {
+            AppError::DatabaseError(format!("Failed to create staging index: {}", e))
+        })?;
     }
 
     sqlx::query(
@@ -802,6 +799,16 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         ("view_support_tickets", "View support tickets"),
         ("create_support_ticket", "Create support tickets"),
         ("manage_notifications", "Read/update notifications"),
+        ("create_operational_request", "Create operational requests"),
+        (
+            "view_operational_requests",
+            "View operational request queues",
+        ),
+        ("review_operational_requests", "Review operational requests"),
+        (
+            "fulfill_operational_requests",
+            "Fulfill approved operational requests",
+        ),
         ("view_merit", "View merit scoring data"),
         ("manage_merit", "Calculate or update merit scoring data"),
     ] {
@@ -834,6 +841,10 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         ("superadmin", "view_support_tickets"),
         ("superadmin", "create_support_ticket"),
         ("superadmin", "manage_notifications"),
+        ("superadmin", "create_operational_request"),
+        ("superadmin", "view_operational_requests"),
+        ("superadmin", "review_operational_requests"),
+        ("superadmin", "fulfill_operational_requests"),
         ("superadmin", "view_merit"),
         ("superadmin", "manage_merit"),
         // admin
@@ -852,6 +863,10 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         ("admin", "view_support_tickets"),
         ("admin", "create_support_ticket"),
         ("admin", "manage_notifications"),
+        ("admin", "create_operational_request"),
+        ("admin", "view_operational_requests"),
+        ("admin", "review_operational_requests"),
+        ("admin", "fulfill_operational_requests"),
         ("admin", "view_merit"),
         ("admin", "manage_merit"),
         // supervisor
@@ -869,11 +884,15 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         ("supervisor", "view_support_tickets"),
         ("supervisor", "create_support_ticket"),
         ("supervisor", "manage_notifications"),
+        ("supervisor", "create_operational_request"),
+        ("supervisor", "view_operational_requests"),
+        ("supervisor", "review_operational_requests"),
         ("supervisor", "view_merit"),
         ("supervisor", "manage_merit"),
         // guard
         ("guard", "create_support_ticket"),
         ("guard", "manage_notifications"),
+        ("guard", "create_operational_request"),
         ("guard", "view_merit"),
     ] {
         sqlx::query(
@@ -1238,6 +1257,101 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create notifications table: {}", e)))?;
 
+    sqlx::query(
+        "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS related_request_id VARCHAR(36)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to add notifications.related_request_id: {}",
+            e
+        ))
+    })?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS operational_requests (
+            id VARCHAR(36) PRIMARY KEY,
+            request_type VARCHAR(40) NOT NULL,
+            status VARCHAR(30) NOT NULL DEFAULT 'pending',
+            requester_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            resource_type VARCHAR(40),
+            resource_id VARCHAR(36),
+            subject VARCHAR(255) NOT NULL,
+            reason TEXT NOT NULL,
+            details TEXT,
+            priority VARCHAR(20) NOT NULL DEFAULT 'normal',
+            client_site_id VARCHAR(36) REFERENCES client_sites(id) ON DELETE SET NULL,
+            shift_id VARCHAR(36) REFERENCES shifts(id) ON DELETE SET NULL,
+            operational_event_key VARCHAR(255),
+            reviewer_id VARCHAR(36) REFERENCES users(id) ON DELETE SET NULL,
+            reviewed_at TIMESTAMP WITH TIME ZONE,
+            decision_reason TEXT,
+            fulfilled_by VARCHAR(36) REFERENCES users(id) ON DELETE SET NULL,
+            fulfilled_at TIMESTAMP WITH TIME ZONE,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT operational_requests_type_check
+                CHECK (request_type IN ('service', 'deposit', 'return', 'firearm_registration')),
+            CONSTRAINT operational_requests_status_check
+                CHECK (status IN ('pending', 'needs_correction', 'approved', 'rejected', 'in_progress', 'completed', 'cancelled')),
+            CONSTRAINT operational_requests_priority_check
+                CHECK (priority IN ('normal', 'high', 'urgent'))
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create operational_requests table: {}", e))
+    })?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS operational_request_events (
+            id VARCHAR(36) PRIMARY KEY,
+            request_id VARCHAR(36) NOT NULL REFERENCES operational_requests(id) ON DELETE CASCADE,
+            actor_user_id VARCHAR(36) REFERENCES users(id) ON DELETE SET NULL,
+            from_status VARCHAR(30),
+            to_status VARCHAR(30) NOT NULL,
+            comment TEXT,
+            metadata JSONB,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to create operational_request_events table: {}",
+            e
+        ))
+    })?;
+
+    for request_index in &[
+        "CREATE INDEX IF NOT EXISTS idx_operational_requests_status_created ON operational_requests(status, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_operational_requests_requester_created ON operational_requests(requester_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_operational_requests_type_status ON operational_requests(request_type, status)",
+        "CREATE INDEX IF NOT EXISTS idx_operational_requests_resource_status ON operational_requests(resource_id, status)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_operational_requests_active_resource ON operational_requests(requester_id, request_type, resource_type, resource_id) WHERE resource_id IS NOT NULL AND status IN ('pending', 'needs_correction', 'approved', 'in_progress')",
+        "CREATE INDEX IF NOT EXISTS idx_operational_request_events_request ON operational_request_events(request_id, created_at ASC)",
+        "CREATE INDEX IF NOT EXISTS idx_operational_request_events_actor ON operational_request_events(actor_user_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_notifications_related_request ON notifications(related_request_id) WHERE related_request_id IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_request_event_dedupe ON notifications(user_id, type, related_request_id) WHERE related_request_id IS NOT NULL",
+    ] {
+        sqlx::query(request_index)
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                AppError::DatabaseError(format!(
+                    "Failed to create operational request index: {}",
+                    e
+                ))
+            })?;
+    }
+
     // Create guard_availability table
     sqlx::query(
         r#"
@@ -1300,12 +1414,9 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_shift_swaps_target ON guard_shift_swaps(target_id)",
         "CREATE INDEX IF NOT EXISTS idx_shift_swaps_status ON guard_shift_swaps(status)",
     ] {
-        sqlx::query(swap_index)
-            .execute(pool)
-            .await
-            .map_err(|e| {
-                AppError::DatabaseError(format!("Failed to create shift swap index: {}", e))
-            })?;
+        sqlx::query(swap_index).execute(pool).await.map_err(|e| {
+            AppError::DatabaseError(format!("Failed to create shift swap index: {}", e))
+        })?;
     }
 
     // Create guard_merit_scores table

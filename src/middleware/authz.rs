@@ -90,11 +90,7 @@ pub async fn require_tracking_access(req: Request<Body>, next: Next) -> Result<R
 
     let role = utils::normalize_role(&claims.role);
     if !has_tracking_access_role(&role) {
-        log_denied_access(
-            &path,
-            &role,
-            "tracking scope requires an operational role",
-        );
+        log_denied_access(&path, &role, "tracking scope requires an operational role");
         return Err(AppError::Forbidden(
             "Tracking endpoints are limited to authenticated operational roles".to_string(),
         ));
@@ -166,6 +162,27 @@ pub async fn require_notifications_management(
     next: Next,
 ) -> Result<Response, AppError> {
     authorize_permission(req, next, "manage_notifications").await
+}
+
+pub async fn require_operational_request_review(
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    authorize_permission(req, next, "review_operational_requests").await
+}
+
+pub async fn require_operational_request_fulfillment(
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    authorize_permission(req, next, "fulfill_operational_requests").await
+}
+
+pub async fn require_operational_request_creation(
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    authorize_permission(req, next, "create_operational_request").await
 }
 
 pub async fn require_merit_view(req: Request<Body>, next: Next) -> Result<Response, AppError> {

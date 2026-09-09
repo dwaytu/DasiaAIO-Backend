@@ -604,6 +604,77 @@ pub struct CreateSupportTicketRequest {
     pub message: String,
 }
 
+// Operational request and approval workflow
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationalRequest {
+    pub id: String,
+    pub request_type: String,
+    pub status: String,
+    pub requester_id: String,
+    pub requester_name: String,
+    pub resource_type: Option<String>,
+    pub resource_id: Option<String>,
+    pub subject: String,
+    pub reason: String,
+    pub details: Option<String>,
+    pub priority: String,
+    pub client_site_id: Option<String>,
+    pub shift_id: Option<String>,
+    pub operational_event_key: Option<String>,
+    pub reviewer_id: Option<String>,
+    pub reviewed_at: Option<DateTime<Utc>>,
+    pub decision_reason: Option<String>,
+    pub fulfilled_by: Option<String>,
+    pub fulfilled_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationalRequestEvent {
+    pub id: String,
+    pub request_id: String,
+    pub actor_user_id: Option<String>,
+    pub actor_name: Option<String>,
+    pub from_status: Option<String>,
+    pub to_status: String,
+    pub comment: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateOperationalRequest {
+    pub request_type: String,
+    pub resource_type: Option<String>,
+    pub resource_id: Option<String>,
+    pub subject: String,
+    pub reason: String,
+    pub details: Option<String>,
+    pub priority: Option<String>,
+    pub client_site_id: Option<String>,
+    pub shift_id: Option<String>,
+    pub operational_event_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationalRequestDecision {
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResubmitOperationalRequest {
+    pub subject: String,
+    pub reason: String,
+    pub details: Option<String>,
+    pub priority: Option<String>,
+}
+
 // Notification model for web-based notification system
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -615,6 +686,7 @@ pub struct Notification {
     #[serde(rename = "type")]
     pub notification_type: String,
     pub related_shift_id: Option<String>,
+    pub related_request_id: Option<String>,
     pub read: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -629,6 +701,7 @@ pub struct CreateNotificationRequest {
     #[serde(rename = "type")]
     pub notification_type: String,
     pub related_shift_id: Option<String>,
+    pub related_request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
