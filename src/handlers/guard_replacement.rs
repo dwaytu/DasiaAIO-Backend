@@ -1,4 +1,4 @@
-﻿use axum::{
+use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
@@ -201,10 +201,9 @@ pub async fn check_in(
         let attendance_id: String = existing_attendance.try_get("id").map_err(|e| {
             AppError::DatabaseError(format!("Failed to parse attendance ID: {}", e))
         })?;
-        let attendance_guard_id: String =
-            existing_attendance.try_get("guard_id").map_err(|e| {
-                AppError::DatabaseError(format!("Failed to parse attendance guard: {}", e))
-            })?;
+        let attendance_guard_id: String = existing_attendance.try_get("guard_id").map_err(|e| {
+            AppError::DatabaseError(format!("Failed to parse attendance guard: {}", e))
+        })?;
 
         if attendance_guard_id != payload.guard_id {
             return Err(AppError::Conflict(
@@ -212,9 +211,9 @@ pub async fn check_in(
             ));
         }
 
-        tx.commit().await.map_err(|e| {
-            AppError::DatabaseError(format!("Failed to complete check-in: {}", e))
-        })?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Failed to complete check-in: {}", e)))?;
 
         return Ok((
             StatusCode::OK,
@@ -287,14 +286,13 @@ pub async fn check_out(
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to start check-out: {}", e)))?;
 
-    let attendance = sqlx::query(
-        "SELECT guard_id, check_out_time FROM attendance WHERE id = $1 FOR UPDATE",
-    )
-        .bind(&payload.attendance_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
-        .ok_or_else(|| AppError::NotFound("Attendance not found".to_string()))?;
+    let attendance =
+        sqlx::query("SELECT guard_id, check_out_time FROM attendance WHERE id = $1 FOR UPDATE")
+            .bind(&payload.attendance_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+            .ok_or_else(|| AppError::NotFound("Attendance not found".to_string()))?;
 
     let attendance_guard_id: String = attendance
         .try_get("guard_id")
@@ -307,9 +305,9 @@ pub async fn check_out(
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse check-out time: {}", e)))?;
 
     if existing_check_out.is_some() {
-        tx.commit().await.map_err(|e| {
-            AppError::DatabaseError(format!("Failed to complete check-out: {}", e))
-        })?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Failed to complete check-out: {}", e)))?;
 
         return Ok(Json(json!({
             "message": "Check-out already recorded"
@@ -640,12 +638,14 @@ pub async fn accept_replacement(
         .ok_or_else(|| AppError::NotFound("Guard not found".to_string()))?;
 
     // Verify shift exists and needs replacement
-    let shift = sqlx::query("SELECT id, replacement_status, start_time, end_time FROM shifts WHERE id = $1")
-        .bind(shift_id)
-        .fetch_optional(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
-        .ok_or_else(|| AppError::NotFound("Shift not found".to_string()))?;
+    let shift = sqlx::query(
+        "SELECT id, replacement_status, start_time, end_time FROM shifts WHERE id = $1",
+    )
+    .bind(shift_id)
+    .fetch_optional(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+    .ok_or_else(|| AppError::NotFound("Shift not found".to_string()))?;
 
     let shift_start: chrono::DateTime<chrono::Utc> = shift
         .try_get("start_time")
@@ -654,7 +654,14 @@ pub async fn accept_replacement(
         .try_get("end_time")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse shift end_time: {}", e)))?;
 
-    if guard_has_shift_conflict(db.as_ref(), guard_id, shift_start, shift_end, Some(shift_id)).await?
+    if guard_has_shift_conflict(
+        db.as_ref(),
+        guard_id,
+        shift_start,
+        shift_end,
+        Some(shift_id),
+    )
+    .await?
     {
         return Err(AppError::Conflict(
             "Guard already has an overlapping scheduled or in-progress shift".to_string(),
@@ -966,4 +973,3 @@ mod tests {
         assert!(!is_approved_guard("guard", true, "pending"));
     }
 }
-

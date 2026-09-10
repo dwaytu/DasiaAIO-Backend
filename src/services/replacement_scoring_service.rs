@@ -1,4 +1,4 @@
-﻿use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::json;
 use sqlx::{FromRow, PgPool};
@@ -301,4 +301,3 @@ pub async fn suggest_replacement(
 
     Ok(top_three)
 }
-

@@ -99,7 +99,8 @@ pub async fn import_mdr(
     headers: axum::http::HeaderMap,
     Json(body): Json<MdrImportRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let claims = utils::extract_bearer_token(&headers).and_then(|token| utils::verify_token(&token))?;
+    let claims =
+        utils::extract_bearer_token(&headers).and_then(|token| utils::verify_token(&token))?;
 
     let batch_id = utils::generate_id();
 
@@ -270,11 +271,11 @@ pub async fn get_batch_by_id(
         WHERE mib.id = $1
         "#,
     )
-        .bind(&id)
-        .fetch_optional(pool.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Batch not found".to_string()))?;
+    .bind(&id)
+    .fetch_optional(pool.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound("Batch not found".to_string()))?;
 
     Ok(Json(batch))
 }

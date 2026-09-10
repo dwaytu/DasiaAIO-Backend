@@ -63,10 +63,7 @@ fn parse_u32_env(name: &str, default_value: u32, min: u32, max: u32) -> Result<u
                 .parse::<u32>()
                 .map_err(|_| format!("{} must be a valid unsigned integer.", name))?;
             if parsed < min || parsed > max {
-                return Err(format!(
-                    "{} must be between {} and {}.",
-                    name, min, max
-                ));
+                return Err(format!("{} must be between {} and {}.", name, min, max));
             }
             Ok(parsed)
         }

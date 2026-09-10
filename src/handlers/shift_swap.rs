@@ -89,7 +89,7 @@ pub async fn list_swap_requests(
         JOIN users t ON t.id = s.target_id
         ORDER BY s.created_at DESC
         LIMIT 200
-        "#
+        "#,
     )
     .fetch_all(db.as_ref())
     .await
@@ -150,5 +150,7 @@ pub async fn respond_to_swap(
         )));
     }
 
-    Ok(Json(json!({ "message": "Swap request updated", "status": status })))
+    Ok(Json(
+        json!({ "message": "Swap request updated", "status": status }),
+    ))
 }

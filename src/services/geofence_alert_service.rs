@@ -12,8 +12,7 @@ fn alert_interval_secs() -> u64 {
 
 /// Entry point: runs forever, checking geofence violations on every tick.
 pub async fn run_geofence_alert_loop(pool: Arc<PgPool>) {
-    let interval_duration =
-        std::time::Duration::from_secs(alert_interval_secs());
+    let interval_duration = std::time::Duration::from_secs(alert_interval_secs());
     let mut interval = tokio::time::interval(interval_duration);
 
     info!(
@@ -102,18 +101,18 @@ async fn check_geofence_violations(pool: &PgPool) -> Result<(), sqlx::Error> {
         }
 
         // Fetch all supervisors/admins to notify.
-                let recipients = sqlx::query(
+        let recipients = sqlx::query(
             r#"
             SELECT id FROM users
             WHERE LOWER(role) IN ('supervisor', 'admin', 'superadmin')
               AND COALESCE(approval_status, 'approved') = 'approved'
-            "#
+            "#,
         )
         .fetch_all(pool)
         .await?;
 
-                let guard_name = guard_name_opt.unwrap_or_else(|| guard_id.clone());
-                let site_name = site_name_opt.unwrap_or_else(|| client_site_id.clone());
+        let guard_name = guard_name_opt.unwrap_or_else(|| guard_id.clone());
+        let site_name = site_name_opt.unwrap_or_else(|| client_site_id.clone());
         let title = format!("Guard Outside Geofence: {guard_name}");
         let message = format!(
             "Guard {guard_name} has exited the designated geofence zone for site '{site_name}'. \

@@ -1,4 +1,8 @@
-use axum::{extract::{Query, State}, http::HeaderMap, Json};
+use axum::{
+    extract::{Query, State},
+    http::HeaderMap,
+    Json,
+};
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -217,14 +221,23 @@ mod tests {
 
     #[test]
     fn date_filters_are_normalized_and_validated() {
-        assert_eq!(normalize_date(Some("2026-08-19".to_string()), "from").unwrap(), Some("2026-08-19".to_string()));
+        assert_eq!(
+            normalize_date(Some("2026-08-19".to_string()), "from").unwrap(),
+            Some("2026-08-19".to_string())
+        );
         assert!(normalize_date(Some("19-08-2026".to_string()), "from").is_err());
-        assert_eq!(normalize_date(Some("  ".to_string()), "from").unwrap(), None);
+        assert_eq!(
+            normalize_date(Some("  ".to_string()), "from").unwrap(),
+            None
+        );
     }
 
     #[test]
     fn status_filter_accepts_only_report_statuses() {
-        assert_eq!(normalize_status(Some("COMPLETED".to_string())).unwrap(), Some("completed".to_string()));
+        assert_eq!(
+            normalize_status(Some("COMPLETED".to_string())).unwrap(),
+            Some("completed".to_string())
+        );
         assert!(normalize_status(Some("late".to_string())).is_err());
     }
 }

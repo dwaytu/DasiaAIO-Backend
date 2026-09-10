@@ -185,6 +185,8 @@ pub struct Firearm {
     pub model: String,
     pub caliber: String,
     pub status: String,
+    #[serde(rename = "licenseExpiryDate")]
+    pub license_expiry_date: Option<DateTime<Utc>>,
 
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -197,6 +199,7 @@ pub struct CreateFirearmRequest {
     pub model: String,
     pub caliber: String,
     pub status: Option<String>,
+    pub license_expiry_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

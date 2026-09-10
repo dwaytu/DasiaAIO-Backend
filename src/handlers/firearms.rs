@@ -3,6 +3,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -27,6 +28,32 @@ fn validate_firearm_status(status: &str) -> AppResult<&'static str> {
     }
 }
 
+fn parse_license_expiry_date(value: Option<String>) -> AppResult<Option<DateTime<Utc>>> {
+    let Some(value) = value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(&value) {
+        return Ok(Some(parsed.with_timezone(&Utc)));
+    }
+
+    let date = NaiveDate::parse_from_str(&value, "%Y-%m-%d").map_err(|_| {
+        AppError::BadRequest(
+            "License expiry date must use YYYY-MM-DD or RFC3339 format".to_string(),
+        )
+    })?;
+    let midnight = date.and_hms_opt(0, 0, 0).ok_or_else(|| {
+        AppError::BadRequest("License expiry date is outside the supported date range".to_string())
+    })?;
+
+    Ok(Some(DateTime::<Utc>::from_naive_utc_and_offset(
+        midnight, Utc,
+    )))
+}
+
 pub async fn add_firearm(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
@@ -42,9 +69,10 @@ pub async fn add_firearm(
 
     let id = utils::generate_id();
     let status = validate_firearm_status(payload.status.as_deref().unwrap_or("available"))?;
+    let license_expiry_date = parse_license_expiry_date(payload.license_expiry_date)?;
 
     sqlx::query(
-        "INSERT INTO firearms (id, name, serial_number, model, caliber, status) VALUES ($1, $2, $3, $4, $5, $6)"
+        "INSERT INTO firearms (id, name, serial_number, model, caliber, status, validity_date) VALUES ($1, $2, $3, $4, $5, $6, $7)"
     )
     .bind(&id)
     .bind(&payload.model)
@@ -52,6 +80,7 @@ pub async fn add_firearm(
     .bind(&payload.model)
     .bind(&payload.caliber)
     .bind(status)
+    .bind(license_expiry_date)
     .execute(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create firearm: {}", e)))?;
@@ -77,7 +106,7 @@ pub async fn get_all_firearms(
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
     let firearms = sqlx::query_as::<_, Firearm>(
-        "SELECT id, name, serial_number, model, caliber, status, created_at, updated_at FROM firearms ORDER BY created_at DESC LIMIT $1 OFFSET $2"
+        "SELECT id, name, serial_number, model, caliber, status, validity_date AS license_expiry_date, created_at, updated_at FROM firearms ORDER BY created_at DESC LIMIT $1 OFFSET $2"
     )
     .bind(page_size)
     .bind(offset)
@@ -98,7 +127,7 @@ pub async fn get_firearm_by_id(
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     let firearm = sqlx::query_as::<_, Firearm>(
-        "SELECT id, name, serial_number, model, caliber, status, created_at, updated_at FROM firearms WHERE id = $1"
+        "SELECT id, name, serial_number, model, caliber, status, validity_date AS license_expiry_date, created_at, updated_at FROM firearms WHERE id = $1"
     )
     .bind(&id)
     .fetch_optional(db.as_ref())
@@ -193,4 +222,22 @@ pub async fn delete_firearm(
     Ok(Json(json!({
         "message": "Firearm deleted successfully"
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_license_expiry_date;
+
+    #[test]
+    fn parses_date_only_and_empty_license_expiry_values() {
+        assert!(parse_license_expiry_date(Some("2026-12-31".to_string())).is_ok());
+        assert!(parse_license_expiry_date(Some("  ".to_string()))
+            .expect("blank dates should be optional")
+            .is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_license_expiry_values() {
+        assert!(parse_license_expiry_date(Some("31/12/2026".to_string())).is_err());
+    }
 }

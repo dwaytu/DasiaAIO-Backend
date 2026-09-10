@@ -89,13 +89,14 @@ pub async fn get_incidents(
     let (page, page_size, offset) = utils::resolve_pagination(pagination, 50, 200);
 
     let (total, incidents) = if actor_role == "guard" {
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM incidents WHERE reported_by = $1")
-            .bind(&claims.sub)
-            .fetch_one(db.as_ref())
-            .await
-            .map_err(|e| {
-                AppError::DatabaseError(format!("Failed to fetch incidents count: {}", e))
-            })?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM incidents WHERE reported_by = $1")
+                .bind(&claims.sub)
+                .fetch_one(db.as_ref())
+                .await
+                .map_err(|e| {
+                    AppError::DatabaseError(format!("Failed to fetch incidents count: {}", e))
+                })?;
 
         let incidents = sqlx::query_as::<_, Incident>(
             r#"SELECT
@@ -167,17 +168,17 @@ pub async fn get_incidents(
 
 pub async fn get_active_incidents(
     State(db): State<Arc<PgPool>>,
-        headers: HeaderMap,
+    headers: HeaderMap,
     Query(pagination): Query<utils::PaginationQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-        let token = utils::extract_bearer_token(&headers)?;
-        let claims = utils::verify_token(&token)?;
-        let actor_role = utils::normalize_role(&claims.role);
+    let token = utils::extract_bearer_token(&headers)?;
+    let claims = utils::verify_token(&token)?;
+    let actor_role = utils::normalize_role(&claims.role);
 
     let (page, page_size, offset) = utils::resolve_pagination(pagination, 50, 200);
 
-        let (total, incidents) = if actor_role == "guard" {
-                let total: i64 = sqlx::query_scalar(
+    let (total, incidents) = if actor_role == "guard" {
+        let total: i64 = sqlx::query_scalar(
                         "SELECT COUNT(*) FROM incidents WHERE status IN ('open', 'investigating') AND reported_by = $1",
                 )
                 .bind(&claims.sub)
@@ -187,8 +188,8 @@ pub async fn get_active_incidents(
                         AppError::DatabaseError(format!("Failed to fetch active incidents count: {}", e))
                 })?;
 
-                let incidents = sqlx::query_as::<_, Incident>(
-                        r#"SELECT
+        let incidents = sqlx::query_as::<_, Incident>(
+            r#"SELECT
                                i.id,
                                i.title,
                                i.description,
@@ -212,27 +213,27 @@ pub async fn get_active_incidents(
                                  END DESC,
                                  i.created_at DESC
                              LIMIT $2 OFFSET $3"#,
-                )
-                .bind(&claims.sub)
-                .bind(page_size)
-                .bind(offset)
-                .fetch_all(db.as_ref())
-                .await
-                .map_err(|e| AppError::DatabaseError(format!("Failed to fetch active incidents: {}", e)))?;
+        )
+        .bind(&claims.sub)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to fetch active incidents: {}", e)))?;
 
-                (total, incidents)
-        } else {
-                let total: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM incidents WHERE status IN ('open', 'investigating')",
-                )
-                .fetch_one(db.as_ref())
-                .await
-                .map_err(|e| {
-                        AppError::DatabaseError(format!("Failed to fetch active incidents count: {}", e))
-                })?;
+        (total, incidents)
+    } else {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM incidents WHERE status IN ('open', 'investigating')",
+        )
+        .fetch_one(db.as_ref())
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to fetch active incidents count: {}", e))
+        })?;
 
-                let incidents = sqlx::query_as::<_, Incident>(
-                        r#"SELECT
+        let incidents = sqlx::query_as::<_, Incident>(
+            r#"SELECT
                                i.id,
                                i.title,
                                i.description,
@@ -255,15 +256,15 @@ pub async fn get_active_incidents(
                                  END DESC,
                                  i.created_at DESC
                              LIMIT $1 OFFSET $2"#,
-                )
-                .bind(page_size)
-                .bind(offset)
-                .fetch_all(db.as_ref())
-                .await
-                .map_err(|e| AppError::DatabaseError(format!("Failed to fetch active incidents: {}", e)))?;
+        )
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to fetch active incidents: {}", e)))?;
 
-                (total, incidents)
-        };
+        (total, incidents)
+    };
 
     Ok(Json(json!({
         "total": total,

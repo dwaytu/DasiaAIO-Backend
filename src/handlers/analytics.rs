@@ -1,7 +1,7 @@
-﻿use axum::{extract::State, http::HeaderMap, Json};
-use serde::{Deserialize, Serialize};
 use axum::extract::Query;
+use axum::{extract::State, http::HeaderMap, Json};
 use chrono::{DateTime, Days, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -177,14 +177,20 @@ fn parse_report_date(
 
     let boundary_date = if add_day_for_exclusive_end {
         date.checked_add_days(Days::new(1)).ok_or_else(|| {
-            AppError::BadRequest(format!("{} is outside the supported date range", field_name))
+            AppError::BadRequest(format!(
+                "{} is outside the supported date range",
+                field_name
+            ))
         })?
     } else {
         date
     };
 
     let naive_boundary = boundary_date.and_hms_opt(0, 0, 0).ok_or_else(|| {
-        AppError::BadRequest(format!("{} is outside the supported date range", field_name))
+        AppError::BadRequest(format!(
+            "{} is outside the supported date range",
+            field_name
+        ))
     })?;
 
     Ok((
@@ -213,10 +219,8 @@ fn build_guard_performance_summary(
         .iter()
         .map(|guard| guard.incident_reports_submitted)
         .sum();
-    let total_replacement_frequency: i64 = guards
-        .iter()
-        .map(|guard| guard.replacement_frequency)
-        .sum();
+    let total_replacement_frequency: i64 =
+        guards.iter().map(|guard| guard.replacement_frequency).sum();
     let total_evaluations: i64 = guards.iter().map(|guard| guard.evaluation_count).sum();
 
     let average_attendance_rate = if total_shifts > 0 {
@@ -324,11 +328,12 @@ pub async fn get_analytics(
             .await
             .unwrap_or(0);
 
-    let available_vehicles =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM armored_cars WHERE status = 'available'")
-            .fetch_one(db.as_ref())
-            .await
-            .unwrap_or(0);
+    let available_vehicles = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM armored_cars WHERE status = 'available'",
+    )
+    .fetch_one(db.as_ref())
+    .await
+    .unwrap_or(0);
 
     // Performance metrics
     let mission_completion_rate = if total_missions > 0 {
@@ -857,4 +862,3 @@ pub struct UpdateMissionStatusRequest {
     pub mission_id: String,
     pub status: String,
 }
-

@@ -8,7 +8,9 @@ use crate::{error::AppError, error::AppResult, utils};
 
 fn refresh_expiry_datetime(refresh_exp: i64) -> AppResult<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::from_timestamp(refresh_exp, 0).ok_or_else(|| {
-        AppError::InternalServerError("Failed to resolve refresh token expiry timestamp".to_string())
+        AppError::InternalServerError(
+            "Failed to resolve refresh token expiry timestamp".to_string(),
+        )
     })
 }
 
@@ -29,8 +31,7 @@ pub async fn record_consent_acceptance(
 ) -> AppResult<Json<serde_json::Value>> {
     if !(payload.terms_accepted && payload.privacy_accepted && payload.acceptable_use_accepted) {
         return Err(AppError::BadRequest(
-            "Terms, Privacy Policy, and Acceptable Use Policy must all be accepted."
-                .to_string(),
+            "Terms, Privacy Policy, and Acceptable Use Policy must all be accepted.".to_string(),
         ));
     }
 
@@ -75,11 +76,13 @@ pub async fn record_consent_acceptance(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to record legal consent: {}", e)))?;
 
-    let consent_accepted_at = consent_row
-        .ok_or_else(|| AppError::NotFound("User record not found for consent update".to_string()))?;
+    let consent_accepted_at = consent_row.ok_or_else(|| {
+        AppError::NotFound("User record not found for consent update".to_string())
+    })?;
 
     let token = utils::generate_access_token(&claims.sub, &claims.email, &claims.role, true)?;
-    let refresh_token = utils::generate_refresh_token(&claims.sub, &claims.email, &claims.role, true)?;
+    let refresh_token =
+        utils::generate_refresh_token(&claims.sub, &claims.email, &claims.role, true)?;
     let refresh_claims = utils::verify_refresh_token(&refresh_token)?;
 
     sqlx::query(
@@ -124,19 +127,18 @@ pub async fn get_consent_status(
     let token = utils::extract_bearer_token(&headers)?;
     let claims = utils::verify_token(&token)?;
 
-    let row = sqlx::query(
-        "SELECT consent_accepted_at, consent_version FROM users WHERE id = $1",
-    )
-    .bind(&claims.sub)
-    .fetch_optional(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to fetch consent status: {}", e)))?;
+    let row = sqlx::query("SELECT consent_accepted_at, consent_version FROM users WHERE id = $1")
+        .bind(&claims.sub)
+        .fetch_optional(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to fetch consent status: {}", e)))?;
 
     let row = row.ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
     let consent_accepted_at: Option<chrono::DateTime<chrono::Utc>> =
-        row.try_get("consent_accepted_at")
-            .map_err(|e| AppError::DatabaseError(format!("Failed to parse consent_accepted_at: {}", e)))?;
+        row.try_get("consent_accepted_at").map_err(|e| {
+            AppError::DatabaseError(format!("Failed to parse consent_accepted_at: {}", e))
+        })?;
     let consent_version: Option<String> = row
         .try_get("consent_version")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse consent_version: {}", e)))?;

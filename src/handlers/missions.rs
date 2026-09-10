@@ -1,4 +1,4 @@
-﻿use axum::{
+use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     Json,
@@ -370,4 +370,3 @@ pub async fn get_missions(
         "missions": missions
     })))
 }
-

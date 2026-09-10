@@ -1899,6 +1899,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         services::geofence_alert_service::run_geofence_alert_loop(geofence_pool).await;
     });
 
+    // Spawn the scheduled attendance alert background task.
+    let shift_alert_pool = db.clone();
+    tokio::spawn(async move {
+        services::shift_alert_service::run_shift_alert_loop(shift_alert_pool).await;
+    });
+
     let listener =
         tokio::net::TcpListener::bind(format!("{}:{}", config.server_host, config.server_port))
             .await?;

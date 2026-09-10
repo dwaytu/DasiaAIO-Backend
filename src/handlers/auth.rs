@@ -60,11 +60,7 @@ fn generate_password_reset_code() -> String {
     let max = 10_u64.pow(code_length as u32);
     let mut rng = rand::thread_rng();
 
-    format!(
-        "{:0width$}",
-        rng.gen_range(0..max),
-        width = code_length
-    )
+    format!("{:0width$}", rng.gen_range(0..max), width = code_length)
 }
 
 fn is_valid_password_reset_code(code: &str) -> bool {
@@ -116,7 +112,10 @@ async fn load_refresh_token_context(db: &PgPool, user_id: &str) -> AppResult<Ref
     .ok_or_else(|| AppError::Unauthorized("Invalid refresh token session".to_string()))?;
 
     let verified: bool = user.try_get("verified").map_err(|e| {
-        AppError::DatabaseError(format!("Failed to parse refresh user verification state: {}", e))
+        AppError::DatabaseError(format!(
+            "Failed to parse refresh user verification state: {}",
+            e
+        ))
     })?;
 
     let approval_status: String = user.try_get("approval_status").map_err(|e| {
@@ -145,10 +144,7 @@ async fn load_refresh_token_context(db: &PgPool, user_id: &str) -> AppResult<Ref
 
     let consent_accepted_at: Option<chrono::DateTime<chrono::Utc>> =
         user.try_get("consent_accepted_at").map_err(|e| {
-            AppError::DatabaseError(format!(
-                "Failed to parse refresh user consent state: {}",
-                e
-            ))
+            AppError::DatabaseError(format!("Failed to parse refresh user consent state: {}", e))
         })?;
 
     Ok(RefreshTokenContext {
@@ -864,8 +860,7 @@ pub async fn login(
 
     // Generate JWT access + refresh tokens
     let token = utils::generate_access_token(&id, &email, &role, legal_consent_accepted)?;
-    let refresh_token =
-        utils::generate_refresh_token(&id, &email, &role, legal_consent_accepted)?;
+    let refresh_token = utils::generate_refresh_token(&id, &email, &role, legal_consent_accepted)?;
     let refresh_claims = utils::verify_refresh_token(&refresh_token)?;
 
     store_refresh_session(
@@ -1412,12 +1407,15 @@ pub async fn reset_password(
     .execute(&mut *tx)
     .await
     .map_err(|e| {
-        AppError::DatabaseError(format!("Failed to revoke refresh sessions after reset: {}", e))
+        AppError::DatabaseError(format!(
+            "Failed to revoke refresh sessions after reset: {}",
+            e
+        ))
     })?;
 
-    tx.commit()
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to commit reset transaction: {}", e)))?;
+    tx.commit().await.map_err(|e| {
+        AppError::DatabaseError(format!("Failed to commit reset transaction: {}", e))
+    })?;
 
     clear_login_failures(db.as_ref(), &[user_key, ip_key]).await?;
 

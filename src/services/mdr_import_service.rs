@@ -251,7 +251,9 @@ pub async fn unresolved_breakdown(pool: &PgPool, batch_id: &str) -> AppResult<Un
     .bind(batch_id)
     .fetch_one(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to compute unresolved MDR counts: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to compute unresolved MDR counts: {}", e))
+    })?;
 
     let pending = counts.0;
     let ambiguous = counts.1;
@@ -333,24 +335,24 @@ pub async fn match_staging_rows(pool: &PgPool, batch_id: &str) -> AppResult<Matc
 
         if status != "error" {
             if let Some(ref lic) = row.license_number {
-            if !lic.trim().is_empty() {
-                let guard_matches: Vec<(String,)> = sqlx::query_as(
-                    "SELECT id FROM users WHERE license_number = $1 AND role = 'guard'",
-                )
-                .bind(lic.trim())
-                .fetch_all(pool)
-                .await
-                .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+                if !lic.trim().is_empty() {
+                    let guard_matches: Vec<(String,)> = sqlx::query_as(
+                        "SELECT id FROM users WHERE license_number = $1 AND role = 'guard'",
+                    )
+                    .bind(lic.trim())
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-                match guard_matches.len() {
-                    1 => {
-                        guard_id = Some(guard_matches[0].0.clone());
-                        status = "matched";
-                    }
-                    0 => {
-                        if let Some(ref name) = row.guard_name {
-                            if !name.trim().is_empty() {
-                                let name_matches: Vec<(String,)> = sqlx::query_as(
+                    match guard_matches.len() {
+                        1 => {
+                            guard_id = Some(guard_matches[0].0.clone());
+                            status = "matched";
+                        }
+                        0 => {
+                            if let Some(ref name) = row.guard_name {
+                                if !name.trim().is_empty() {
+                                    let name_matches: Vec<(String,)> = sqlx::query_as(
                                     "SELECT id FROM users WHERE UPPER(full_name) = UPPER($1) AND role = 'guard'",
                                 )
                                 .bind(name.trim())
@@ -358,62 +360,64 @@ pub async fn match_staging_rows(pool: &PgPool, batch_id: &str) -> AppResult<Matc
                                 .await
                                 .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-                                match name_matches.len() {
-                                    1 => {
-                                        guard_id = Some(name_matches[0].0.clone());
-                                        status = "matched";
+                                    match name_matches.len() {
+                                        1 => {
+                                            guard_id = Some(name_matches[0].0.clone());
+                                            status = "matched";
+                                        }
+                                        x if x > 1 => {
+                                            status = "ambiguous";
+                                        }
+                                        _ => {}
                                     }
-                                    x if x > 1 => {
-                                        status = "ambiguous";
-                                    }
-                                    _ => {}
                                 }
                             }
                         }
-                    }
-                    _ => {
-                        status = "ambiguous";
+                        _ => {
+                            status = "ambiguous";
+                        }
                     }
                 }
             }
-        }
 
             if let Some(ref serial_number) = row.serial_number {
-            if !serial_number.trim().is_empty() {
-                let firearm_matches: Vec<(String,)> = sqlx::query_as(
-                    "SELECT id FROM firearms WHERE serial_number = $1",
-                )
-                .bind(serial_number.trim())
-                .fetch_all(pool)
-                .await
-                .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+                if !serial_number.trim().is_empty() {
+                    let firearm_matches: Vec<(String,)> =
+                        sqlx::query_as("SELECT id FROM firearms WHERE serial_number = $1")
+                            .bind(serial_number.trim())
+                            .fetch_all(pool)
+                            .await
+                            .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-                if firearm_matches.len() == 1 {
-                    firearm_id = Some(firearm_matches[0].0.clone());
+                    if firearm_matches.len() == 1 {
+                        firearm_id = Some(firearm_matches[0].0.clone());
+                    }
                 }
             }
-        }
 
             if let Some(ref client_name) = row.client_name {
-            if !client_name.trim().is_empty() {
-                let client_matches: Vec<(String,)> = sqlx::query_as(
-                    "SELECT id FROM clients WHERE UPPER(name) = UPPER($1)",
-                )
-                .bind(client_name.trim())
-                .fetch_all(pool)
-                .await
-                .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+                if !client_name.trim().is_empty() {
+                    let client_matches: Vec<(String,)> =
+                        sqlx::query_as("SELECT id FROM clients WHERE UPPER(name) = UPPER($1)")
+                            .bind(client_name.trim())
+                            .fetch_all(pool)
+                            .await
+                            .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-                if client_matches.len() == 1 {
-                    client_id = Some(client_matches[0].0.clone());
+                    if client_matches.len() == 1 {
+                        client_id = Some(client_matches[0].0.clone());
+                    }
                 }
             }
-        }
 
             if row.section.as_deref() != Some("equipment")
                 && row.section.as_deref() != Some("returned")
             {
-                if row.guard_name.as_ref().is_none_or(|name| name.trim().is_empty()) {
+                if row
+                    .guard_name
+                    .as_ref()
+                    .is_none_or(|name| name.trim().is_empty())
+                {
                     status = "error";
                     validation_errors = Some(json!(["Guard name is required for this row."]));
                 }
@@ -454,12 +458,17 @@ pub async fn match_staging_rows(pool: &PgPool, batch_id: &str) -> AppResult<Matc
 }
 
 /// Commit batch: transactional upsert of all staging rows to production tables.
-pub async fn commit_batch(pool: &PgPool, batch_id: &str, committed_by: &str) -> AppResult<CommitSummary> {
-    let batch_status: Option<String> = sqlx::query_scalar("SELECT status FROM mdr_import_batches WHERE id = $1")
-        .bind(batch_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+pub async fn commit_batch(
+    pool: &PgPool,
+    batch_id: &str,
+    committed_by: &str,
+) -> AppResult<CommitSummary> {
+    let batch_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM mdr_import_batches WHERE id = $1")
+            .bind(batch_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
     match batch_status.as_deref() {
         Some("staging") | Some("reviewing") => {}
@@ -905,7 +914,8 @@ pub async fn commit_batch(pool: &PgPool, batch_id: &str, committed_by: &str) -> 
                         } else {
                             "active"
                         };
-                        let existing_guard_id = if let Some(ref license_number) = normalized_license {
+                        let existing_guard_id = if let Some(ref license_number) = normalized_license
+                        {
                             sqlx::query_scalar::<_, String>(
                                 "SELECT id FROM users WHERE license_number = $1 LIMIT 1",
                             )

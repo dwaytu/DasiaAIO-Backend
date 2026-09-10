@@ -81,11 +81,10 @@ fn summarize_confidence(risk_level: &str, summary: &str, key_phrases: &[String])
     let summary_density = (summary.split_whitespace().count() as f64 / 40.0).min(1.0);
     let severity_signal = ((summary_signal_count + phrase_signal_count) / 5.0).min(1.0);
 
-    let score = 0.45 + (phrase_density * 0.20) + (summary_density * 0.10) + (severity_signal * 0.25);
+    let score =
+        0.45 + (phrase_density * 0.20) + (summary_density * 0.10) + (severity_signal * 0.25);
     score.clamp(0.55, 0.95)
 }
-
-
 
 fn suggested_actions_from_severity(severity: &str) -> Vec<String> {
     match severity.to_lowercase().as_str() {
@@ -156,7 +155,8 @@ pub async fn get_replacement_suggestions(
 ) -> AppResult<Json<Vec<replacement_scoring_service::ReplacementSuggestion>>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
-    let rows = replacement_scoring_service::suggest_replacement(db.as_ref(), &query.post_id).await?;
+    let rows =
+        replacement_scoring_service::suggest_replacement(db.as_ref(), &query.post_id).await?;
     Ok(Json(rows))
 }
 

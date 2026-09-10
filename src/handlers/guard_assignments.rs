@@ -18,12 +18,13 @@ pub async fn get_all_guard_assignments(
 ) -> AppResult<Json<serde_json::Value>> {
     let (page, page_size, offset) = utils::resolve_pagination(pagination, 50, 200);
 
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM guard_assignments WHERE status = 'active'")
-        .fetch_one(pool.as_ref())
-        .await
-        .map_err(|e| {
-            AppError::DatabaseError(format!("Failed to count active guard assignments: {}", e))
-        })?;
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM guard_assignments WHERE status = 'active'")
+            .fetch_one(pool.as_ref())
+            .await
+            .map_err(|e| {
+                AppError::DatabaseError(format!("Failed to count active guard assignments: {}", e))
+            })?;
 
     let items = sqlx::query_as::<_, GuardAssignment>(
         r#"
@@ -92,7 +93,10 @@ pub async fn get_assignments_by_client(
     .fetch_all(pool.as_ref())
     .await
     .map_err(|e| {
-        AppError::DatabaseError(format!("Failed to fetch guard assignments by client: {}", e))
+        AppError::DatabaseError(format!(
+            "Failed to fetch guard assignments by client: {}",
+            e
+        ))
     })?;
 
     Ok(Json(json!({

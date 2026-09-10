@@ -231,7 +231,9 @@ pub async fn create_expiry_notifications(
     .bind(days)
     .fetch_all(db.as_ref())
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to find firearm expiry candidates: {e}")))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to find firearm expiry candidates: {e}"))
+    })?;
 
     let recipients = sqlx::query_scalar::<_, String>(
         "SELECT id FROM users WHERE role IN ('supervisor', 'admin', 'superadmin') AND approval_status = 'approved'",
@@ -301,7 +303,10 @@ mod tests {
 
     #[test]
     fn compliance_status_filter_is_strict() {
-        assert_eq!(normalized_status(Some("expired".into())).unwrap(), Some("expired".into()));
+        assert_eq!(
+            normalized_status(Some("expired".into())).unwrap(),
+            Some("expired".into())
+        );
         assert_eq!(normalized_status(Some("all".into())).unwrap(), None);
         assert!(normalized_status(Some("unknown".into())).is_err());
     }

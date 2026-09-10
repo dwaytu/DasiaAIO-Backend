@@ -5,4 +5,5 @@ pub mod incident_summary_service;
 pub mod mdr_import_service;
 pub mod operational_requests;
 pub mod replacement_scoring_service;
+pub mod shift_alert_service;
 pub mod vehicle_predictive_service;

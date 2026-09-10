@@ -53,13 +53,12 @@ impl IntoResponse for AppError {
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg, None),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "unauthorized", msg, None),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg, None),
-            AppError::RateLimited(msg) => (StatusCode::TOO_MANY_REQUESTS, "rate_limited", msg, None),
-            AppError::GatewayTimeout(msg) => (
-                StatusCode::GATEWAY_TIMEOUT,
-                "gateway_timeout",
-                msg,
-                None,
-            ),
+            AppError::RateLimited(msg) => {
+                (StatusCode::TOO_MANY_REQUESTS, "rate_limited", msg, None)
+            }
+            AppError::GatewayTimeout(msg) => {
+                (StatusCode::GATEWAY_TIMEOUT, "gateway_timeout", msg, None)
+            }
             AppError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg, None),
             AppError::InternalServerError(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -67,12 +66,9 @@ impl IntoResponse for AppError {
                 "Internal server error".to_string(),
                 Some(msg),
             ),
-            AppError::ValidationError(msg) => (
-                StatusCode::BAD_REQUEST,
-                "validation_error",
-                msg,
-                None,
-            ),
+            AppError::ValidationError(msg) => {
+                (StatusCode::BAD_REQUEST, "validation_error", msg, None)
+            }
         };
 
         if let Some(msg) = log_message {

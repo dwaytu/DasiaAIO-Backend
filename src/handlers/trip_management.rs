@@ -1,4 +1,4 @@
-﻿use axum::{
+use axum::{
     extract::{Path, State},
     http::HeaderMap,
     Json,
@@ -293,4 +293,3 @@ pub struct AssignDriverRequest {
 pub struct UpdateTripStatusRequest {
     pub status: String,
 }
-

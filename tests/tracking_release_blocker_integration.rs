@@ -130,14 +130,13 @@ async fn seed_refresh_session(
     user_agent: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let refresh_claims = decode_refresh_token(refresh_token);
-    let expires_at = chrono::DateTime::<Utc>::from_timestamp(refresh_claims.exp, 0).ok_or_else(
-        || {
+    let expires_at =
+        chrono::DateTime::<Utc>::from_timestamp(refresh_claims.exp, 0).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "invalid refresh token expiry",
             )
-        },
-    )?;
+        })?;
 
     sqlx::query(
         r#"INSERT INTO refresh_token_sessions (
@@ -387,7 +386,8 @@ async fn unscheduled_guard_heartbeat_is_accepted() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
-async fn refresh_uses_current_consent_state_from_database() -> Result<(), Box<dyn std::error::Error>> {
+async fn refresh_uses_current_consent_state_from_database() -> Result<(), Box<dyn std::error::Error>>
+{
     let Some((base_url, client, pool)) = setup_context().await? else {
         return Ok(());
     };
@@ -466,7 +466,10 @@ async fn refresh_uses_current_consent_state_from_database() -> Result<(), Box<dy
 
     let tracking_consent_response = client
         .get(format!("{}/api/tracking/consent", base_url))
-        .header("Authorization", format!("Bearer {}", refreshed_access_token))
+        .header(
+            "Authorization",
+            format!("Bearer {}", refreshed_access_token),
+        )
         .send()
         .await?;
 
@@ -602,9 +605,9 @@ async fn unscheduled_guard_appears_in_map_data() -> Result<(), Box<dyn std::erro
         .get("trackingPoints")
         .and_then(Value::as_array)
         .and_then(|points| {
-            points
-                .iter()
-                .find(|point| point.get("entityId").and_then(Value::as_str) == Some(guard_id.as_str()))
+            points.iter().find(|point| {
+                point.get("entityId").and_then(Value::as_str) == Some(guard_id.as_str())
+            })
         })
         .cloned()
         .unwrap_or_else(|| json!({}));
@@ -626,7 +629,8 @@ async fn unscheduled_guard_appears_in_map_data() -> Result<(), Box<dyn std::erro
 }
 
 #[tokio::test]
-async fn stale_and_offline_classification_use_heartbeat_age() -> Result<(), Box<dyn std::error::Error>> {
+async fn stale_and_offline_classification_use_heartbeat_age(
+) -> Result<(), Box<dyn std::error::Error>> {
     let Some((base_url, client, pool)) = setup_context().await? else {
         return Ok(());
     };
@@ -645,7 +649,10 @@ async fn stale_and_offline_classification_use_heartbeat_age() -> Result<(), Box<
     let supervisor_token = build_token("supervisor", &supervisor_id, true);
 
     let response = client
-        .get(format!("{}/api/tracking/active-guards?windowMinutes=15", base_url))
+        .get(format!(
+            "{}/api/tracking/active-guards?windowMinutes=15",
+            base_url
+        ))
         .header("Authorization", format!("Bearer {}", supervisor_token))
         .send()
         .await?;
@@ -674,7 +681,9 @@ async fn stale_and_offline_classification_use_heartbeat_age() -> Result<(), Box<
 
     let offline_guard = guards
         .iter()
-        .find(|guard| guard.get("guardId").and_then(Value::as_str) == Some(offline_guard_id.as_str()))
+        .find(|guard| {
+            guard.get("guardId").and_then(Value::as_str) == Some(offline_guard_id.as_str())
+        })
         .cloned()
         .unwrap_or_else(|| json!({}));
 
@@ -867,7 +876,10 @@ async fn websocket_query_token_auth_is_rejected() -> Result<(), Box<dyn std::err
     let supervisor_token = build_token("supervisor", &supervisor_id, true);
 
     let ws_response = client
-        .get(format!("{}/api/tracking/ws?token={}", base_url, supervisor_token))
+        .get(format!(
+            "{}/api/tracking/ws?token={}",
+            base_url, supervisor_token
+        ))
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")
@@ -1016,7 +1028,8 @@ async fn supervisor_heartbeat_uses_user_entity_type_without_polluting_guard_stre
     assert!(
         guards
             .iter()
-            .all(|guard| guard.get("guardId").and_then(Value::as_str) != Some(supervisor_id.as_str())),
+            .all(|guard| guard.get("guardId").and_then(Value::as_str)
+                != Some(supervisor_id.as_str())),
         "supervisor heartbeat must not appear in active-guards, body: {}",
         active_guards_body
     );
@@ -1173,13 +1186,19 @@ async fn guard_heartbeat_appears_in_history_and_path() -> Result<(), Box<dyn std
 
     // Read guard-history — the heartbeat should appear
     let history_resp = client
-        .get(format!("{}/api/tracking/guard-history/{}", base_url, guard_id))
+        .get(format!(
+            "{}/api/tracking/guard-history/{}",
+            base_url, guard_id
+        ))
         .header("Authorization", format!("Bearer {}", guard_token))
         .send()
         .await?;
     assert_eq!(history_resp.status(), StatusCode::OK);
     let history_body = response_json(history_resp).await;
-    let history_points = history_body.get("points").and_then(Value::as_array).unwrap();
+    let history_points = history_body
+        .get("points")
+        .and_then(Value::as_array)
+        .unwrap();
     assert!(
         !history_points.is_empty(),
         "guard-history must contain the accepted heartbeat, got: {}",
@@ -1197,7 +1216,10 @@ async fn guard_heartbeat_appears_in_history_and_path() -> Result<(), Box<dyn std
         .await?;
     assert_eq!(path_resp.status(), StatusCode::OK);
     let path_body = response_json(path_resp).await;
-    let path_coords = path_body.get("coordinates").and_then(Value::as_array).unwrap();
+    let path_coords = path_body
+        .get("coordinates")
+        .and_then(Value::as_array)
+        .unwrap();
     assert!(
         !path_coords.is_empty(),
         "guard-path must contain the accepted heartbeat, got: {}",
@@ -1206,4 +1228,3 @@ async fn guard_heartbeat_appears_in_history_and_path() -> Result<(), Box<dyn std
 
     Ok(())
 }
-

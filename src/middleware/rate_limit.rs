@@ -149,10 +149,7 @@ async fn enforce_bucket_limit(
 
         return Some(cors_safe_error_response(
             origin,
-            AppError::RateLimited(format!(
-                "{} Retry in {} second(s).",
-                message, retry_after
-            )),
+            AppError::RateLimited(format!("{} Retry in {} second(s).", message, retry_after)),
         ));
     }
 

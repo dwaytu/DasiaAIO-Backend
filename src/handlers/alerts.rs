@@ -1,4 +1,4 @@
-﻿use axum::{extract::State, http::HeaderMap, Json};
+use axum::{extract::State, http::HeaderMap, Json};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::json;
@@ -287,4 +287,3 @@ pub async fn get_operational_risk_alerts(
 
     Ok(Json(alerts))
 }
-

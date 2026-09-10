@@ -1,4 +1,4 @@
-﻿use axum::{
+use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
@@ -34,7 +34,10 @@ fn optional_string_field(
     Ok(None)
 }
 
-fn parse_user_date(value: Option<String>, label: &str) -> AppResult<Option<chrono::DateTime<chrono::Utc>>> {
+fn parse_user_date(
+    value: Option<String>,
+    label: &str,
+) -> AppResult<Option<chrono::DateTime<chrono::Utc>>> {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -44,19 +47,15 @@ fn parse_user_date(value: Option<String>, label: &str) -> AppResult<Option<chron
     }
 
     let date = chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d").map_err(|_| {
-        AppError::BadRequest(format!(
-            "{} must use YYYY-MM-DD or RFC3339 format",
-            label
-        ))
+        AppError::BadRequest(format!("{} must use YYYY-MM-DD or RFC3339 format", label))
     })?;
     let midnight = date.and_hms_opt(0, 0, 0).ok_or_else(|| {
         AppError::BadRequest(format!("{} is outside the supported date range", label))
     })?;
 
-    Ok(Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-        midnight,
-        chrono::Utc,
-    )))
+    Ok(Some(
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(midnight, chrono::Utc),
+    ))
 }
 
 fn ensure_actor_can_manage_target(
@@ -98,14 +97,20 @@ fn validate_profile_photo_data_url(value: &str) -> AppResult<()> {
         ));
     }
 
-    let padding = encoded.bytes().rev().take_while(|byte| *byte == b'=').count();
+    let padding = encoded
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'=')
+        .count();
     let content_length = encoded.len().saturating_sub(padding);
     if encoded.len() % 4 != 0 || padding > 2 || encoded[..content_length].contains('=') {
         return Err(AppError::BadRequest(
             "Profile photo contains invalid base64 padding".to_string(),
         ));
     }
-    let decoded_size = (encoded.len() / 4).saturating_mul(3).saturating_sub(padding);
+    let decoded_size = (encoded.len() / 4)
+        .saturating_mul(3)
+        .saturating_sub(padding);
     if decoded_size > MAX_PROFILE_PHOTO_BYTES {
         return Err(AppError::BadRequest(
             "Profile photo must be 5 MB or smaller".to_string(),
@@ -494,7 +499,9 @@ pub async fn update_user(
 
     if let Some(value) = full_name.as_deref() {
         if value.is_empty() {
-            return Err(AppError::BadRequest("Full name cannot be empty".to_string()));
+            return Err(AppError::BadRequest(
+                "Full name cannot be empty".to_string(),
+            ));
         }
     }
     if let Some(value) = phone_number.as_deref() {
@@ -507,14 +514,12 @@ pub async fn update_user(
 
     if let Some(email) = email.as_deref() {
         utils::validate_email(email)?;
-        let duplicate = sqlx::query(
-            "SELECT id FROM users WHERE email = $1 AND id <> $2",
-        )
-        .bind(email)
-        .bind(&id)
-        .fetch_optional(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+        let duplicate = sqlx::query("SELECT id FROM users WHERE email = $1 AND id <> $2")
+            .bind(email)
+            .bind(&id)
+            .fetch_optional(db.as_ref())
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
         if duplicate.is_some() {
             return Err(AppError::Conflict("Email already in use".to_string()));
         }
@@ -528,14 +533,12 @@ pub async fn update_user(
                 "Username must be at least 3 characters and use only letters, numbers, and underscores".to_string(),
             ));
         }
-        let duplicate = sqlx::query(
-            "SELECT id FROM users WHERE username = $1 AND id <> $2",
-        )
-        .bind(username)
-        .bind(&id)
-        .fetch_optional(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+        let duplicate = sqlx::query("SELECT id FROM users WHERE username = $1 AND id <> $2")
+            .bind(username)
+            .bind(&id)
+            .fetch_optional(db.as_ref())
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
         if duplicate.is_some() {
             return Err(AppError::Conflict("Username already in use".to_string()));
         }
@@ -691,9 +694,11 @@ mod tests {
         assert!(parse_user_date(Some("2026-08-19".to_string()), "date")
             .expect("date-only value should parse")
             .is_some());
-        assert!(parse_user_date(Some("2026-08-19T08:30:00Z".to_string()), "date")
-            .expect("RFC3339 value should parse")
-            .is_some());
+        assert!(
+            parse_user_date(Some("2026-08-19T08:30:00Z".to_string()), "date")
+                .expect("RFC3339 value should parse")
+                .is_some()
+        );
         assert!(parse_user_date(Some("19/08/2026".to_string()), "date").is_err());
     }
 

@@ -25,18 +25,17 @@ pub fn classify_incident_severity(description: &str) -> ClassificationResult {
         "loitering",
         "tampering",
     ];
-    let low_keywords = [
-        "lost item",
-        "noise",
-        "complaint",
-        "minor",
-        "slip",
-        "fall",
-    ];
+    let low_keywords = ["lost item", "noise", "complaint", "minor", "slip", "fall"];
 
-    let critical_hits = critical_keywords.iter().filter(|&&k| text.contains(k)).count();
+    let critical_hits = critical_keywords
+        .iter()
+        .filter(|&&k| text.contains(k))
+        .count();
     let high_hits = high_keywords.iter().filter(|&&k| text.contains(k)).count();
-    let medium_hits = medium_keywords.iter().filter(|&&k| text.contains(k)).count();
+    let medium_hits = medium_keywords
+        .iter()
+        .filter(|&&k| text.contains(k))
+        .count();
     let low_hits = low_keywords.iter().filter(|&&k| text.contains(k)).count();
 
     let (severity, hits, tier_size) = if critical_hits > 0 {

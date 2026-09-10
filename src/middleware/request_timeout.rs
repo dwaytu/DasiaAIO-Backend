@@ -32,14 +32,10 @@ pub async fn enforce_request_timeout(request: Request<Body>, next: Next) -> Resp
         request_timeout_seconds()
     };
 
-    match tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        next.run(request),
-    )
-    .await
-    {
+    match tokio::time::timeout(Duration::from_secs(timeout_secs), next.run(request)).await {
         Ok(response) => response,
-        Err(_) => AppError::GatewayTimeout("Request timed out. Please retry.".to_string())
-            .into_response(),
+        Err(_) => {
+            AppError::GatewayTimeout("Request timed out. Please retry.".to_string()).into_response()
+        }
     }
 }

@@ -1,4 +1,4 @@
-﻿use axum::{
+use axum::{
     extract::ws::{Message, WebSocket},
     extract::State,
     extract::{Path, Query, WebSocketUpgrade},
@@ -116,7 +116,10 @@ fn classify_guard_presence_at(
 fn derive_tracking_source(status: Option<&str>, accuracy_meters: Option<f64>) -> String {
     let normalized_status = status.unwrap_or_default().trim().to_lowercase();
 
-    if matches!(normalized_status.as_str(), "approximate" | "gps" | "network") {
+    if matches!(
+        normalized_status.as_str(),
+        "approximate" | "gps" | "network"
+    ) {
         return normalized_status;
     }
 
@@ -181,7 +184,9 @@ async fn get_location_tracking_consent_state(
     .bind(user_id)
     .fetch_optional(db)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to fetch tracking consent state: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to fetch tracking consent state: {}", e))
+    })?;
 
     let row = row.ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
@@ -286,7 +291,9 @@ fn extract_ws_token_from_query(query: &TrackingWsAuthQuery) -> Option<String> {
 
 fn reject_query_string_ws_token(query: &TrackingWsAuthQuery) -> AppResult<()> {
     if extract_ws_token_from_query(query).is_some() {
-        tracing::warn!("Rejected tracking websocket upgrade due to query-string token auth attempt");
+        tracing::warn!(
+            "Rejected tracking websocket upgrade due to query-string token auth attempt"
+        );
         return Err(AppError::Unauthorized(
             "Query-string websocket tokens are not allowed. Use Sec-WebSocket-Protocol with bearer.<token>.".to_string(),
         ));
@@ -2572,7 +2579,11 @@ pub async fn guard_heartbeat(
 
     // Keep guard telemetry scoped to guard-only surfaces while allowing
     // elevated roles to send self-scoped user heartbeat samples.
-    let entity_type = if actor_role == "guard" { "guard" } else { "user" };
+    let entity_type = if actor_role == "guard" {
+        "guard"
+    } else {
+        "user"
+    };
 
     validate_coordinates(payload.latitude, payload.longitude)?;
 
@@ -2842,10 +2853,7 @@ mod tests {
             derive_tracking_source(Some("approximate"), Some(8000.0)),
             "approximate"
         );
-        assert_eq!(
-            derive_tracking_source(Some("active"), Some(15.0)),
-            "gps"
-        );
+        assert_eq!(derive_tracking_source(Some("active"), Some(15.0)), "gps");
         assert_eq!(
             derive_tracking_source(Some("active"), Some(9000.0)),
             "approximate"
@@ -2878,8 +2886,7 @@ mod tests {
 
     #[test]
     fn person_tracking_producer_scope_rejects_admin_for_guard_entities() {
-        let result =
-            enforce_person_tracking_producer_scope("admin", "admin-1", "guard", "admin-1");
+        let result = enforce_person_tracking_producer_scope("admin", "admin-1", "guard", "admin-1");
         assert!(matches!(result, Err(AppError::Forbidden(_))));
     }
 
@@ -2896,8 +2903,7 @@ mod tests {
     #[test]
     fn person_tracking_producer_scope_enforces_guard_self_guard_entity() {
         assert!(
-            enforce_person_tracking_producer_scope("guard", "guard-1", "guard", "guard-1")
-                .is_ok()
+            enforce_person_tracking_producer_scope("guard", "guard-1", "guard", "guard-1").is_ok()
         );
 
         let wrong_entity_type =
@@ -2911,15 +2917,13 @@ mod tests {
 
     #[test]
     fn person_tracking_producer_scope_enforces_supervisor_self_user_entity() {
-        assert!(
-            enforce_person_tracking_producer_scope(
-                "supervisor",
-                "supervisor-1",
-                "user",
-                "supervisor-1"
-            )
-            .is_ok()
-        );
+        assert!(enforce_person_tracking_producer_scope(
+            "supervisor",
+            "supervisor-1",
+            "user",
+            "supervisor-1"
+        )
+        .is_ok());
 
         let wrong_entity_type = enforce_person_tracking_producer_scope(
             "supervisor",

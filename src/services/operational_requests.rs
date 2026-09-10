@@ -652,7 +652,7 @@ async fn transition_request(
     })?;
 
     let row = sqlx::query(
-        r#"SELECT requester_id, request_type, status, resource_type, resource_id
+        r#"SELECT requester_id, request_type, status, resource_type, resource_id, subject
            FROM operational_requests WHERE id = $1 FOR UPDATE"#,
     )
     .bind(request_id)
@@ -666,6 +666,7 @@ async fn transition_request(
     let from_status: String = row.get("status");
     let resource_type: Option<String> = row.get("resource_type");
     let resource_id: Option<String> = row.get("resource_id");
+    let subject: String = row.get("subject");
 
     let to_status = match action {
         "approve" if role_rank >= 2 && from_status == "pending" => "approved",
@@ -756,13 +757,65 @@ async fn transition_request(
     )
     .await?;
 
+    let (notification_title, notification_message) = match to_status {
+        "approved" => (
+            "Request Approved",
+            format!("Your operational request \"{}\" was approved.", subject),
+        ),
+        "rejected" => (
+            "Request Denied",
+            format!(
+                "Your operational request \"{}\" was denied.{}",
+                subject,
+                reason
+                    .as_deref()
+                    .map(|value| format!(" Reason: {}", value))
+                    .unwrap_or_default()
+            ),
+        ),
+        "needs_correction" => (
+            "Request Needs Correction",
+            format!(
+                "Your operational request \"{}\" needs correction.{}",
+                subject,
+                reason
+                    .as_deref()
+                    .map(|value| format!(" Note: {}", value))
+                    .unwrap_or_default()
+            ),
+        ),
+        "completed" => (
+            "Request Completed",
+            format!("Your operational request \"{}\" was completed.", subject),
+        ),
+        "cancelled" => (
+            "Request Cancelled",
+            format!("Your operational request \"{}\" was cancelled.", subject),
+        ),
+        "in_progress" => (
+            "Request In Progress",
+            format!(
+                "Work has started on your operational request \"{}\".",
+                subject
+            ),
+        ),
+        _ => (
+            "Operational Request Updated",
+            format!(
+                "Your operational request \"{}\" is now {}.",
+                subject,
+                to_status.replace('_', " ")
+            ),
+        ),
+    };
+
     notify_user(
         &mut transaction,
         &requester_id,
         request_id,
         &format!("operational_request_{}", to_status),
-        "Operational Request Updated",
-        &format!("Your request is now {}.", to_status.replace('_', " ")),
+        notification_title,
+        &notification_message,
     )
     .await?;
 

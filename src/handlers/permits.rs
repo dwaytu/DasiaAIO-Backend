@@ -80,13 +80,12 @@ pub async fn create_guard_permit(
     }
 
     if let Some(ref firearm_id) = payload.firearm_id {
-        let firearm_exists = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM firearms WHERE id = $1 LIMIT 1",
-        )
-        .bind(firearm_id)
-        .fetch_optional(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+        let firearm_exists =
+            sqlx::query_scalar::<_, String>("SELECT id FROM firearms WHERE id = $1 LIMIT 1")
+                .bind(firearm_id)
+                .fetch_optional(db.as_ref())
+                .await
+                .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
         if firearm_exists.is_none() {
             return Err(AppError::BadRequest(
                 "Firearm ID does not exist".to_string(),

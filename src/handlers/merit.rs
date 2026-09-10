@@ -1,4 +1,4 @@
-﻿use axum::{
+use axum::{
     extract::{Path, State},
     http::HeaderMap,
     http::StatusCode,
@@ -423,4 +423,3 @@ pub async fn get_overtime_candidates(
         }).collect::<Vec<_>>()
     })))
 }
-
