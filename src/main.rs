@@ -1911,6 +1911,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         services::shift_alert_service::run_shift_alert_loop(shift_alert_pool).await;
     });
 
+    // Deliver persisted notifications through configured external channels.
+    // The worker is deliberately best-effort and never runs inside request transactions.
+    let notification_delivery_pool = db.clone();
+    tokio::spawn(async move {
+        services::notification_delivery::run_notification_delivery_loop(notification_delivery_pool)
+            .await;
+    });
+
     let listener =
         tokio::net::TcpListener::bind(format!("{}:{}", config.server_host, config.server_port))
             .await?;

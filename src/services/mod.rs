@@ -4,6 +4,7 @@ pub mod guard_prediction_service;
 pub mod incident_severity_classifier;
 pub mod incident_summary_service;
 pub mod mdr_import_service;
+pub mod notification_delivery;
 pub mod operational_requests;
 pub mod replacement_scoring_service;
 pub mod shift_alert_service;

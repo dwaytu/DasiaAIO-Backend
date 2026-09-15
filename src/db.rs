@@ -1291,6 +1291,40 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         ))
     })?;
 
+    // External notification delivery is asynchronous so approval and operational
+    // workflows remain available when an email or push provider is unavailable.
+    for migration in [
+        "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS email_sent_at TIMESTAMPTZ",
+        "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS push_sent_at TIMESTAMPTZ",
+        "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS delivery_attempts INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS delivery_last_attempt_at TIMESTAMPTZ",
+        "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS delivery_last_error TEXT",
+    ] {
+        sqlx::query(migration).execute(pool).await.map_err(|e| {
+            AppError::DatabaseError(format!("Notification delivery migration failed '{}': {}", migration, e))
+        })?;
+    }
+
+    // Do not backfill external delivery for historical in-app notifications when
+    // this worker is introduced or a new environment is provisioned.
+    sqlx::query(
+        "UPDATE notifications
+         SET email_sent_at = CURRENT_TIMESTAMP,
+             push_sent_at = CURRENT_TIMESTAMP,
+             delivery_last_attempt_at = CURRENT_TIMESTAMP
+         WHERE delivery_attempts = 0
+           AND email_sent_at IS NULL
+           AND push_sent_at IS NULL",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to initialize historical notification delivery state: {}",
+            e
+        ))
+    })?;
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS operational_requests (
