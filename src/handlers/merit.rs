@@ -17,6 +17,15 @@ use crate::{
     utils,
 };
 
+fn validate_evaluation_rating(rating: f64) -> AppResult<()> {
+    if !rating.is_finite() || !(1.0..=5.0).contains(&rating) {
+        return Err(AppError::BadRequest(
+            "Rating must be between 1 and 5".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 // Calculate merit score for a guard based on performance metrics
 pub async fn calculate_merit_score(
     State(db): State<Arc<PgPool>>,
@@ -322,11 +331,82 @@ pub async fn submit_client_evaluation(
     headers: HeaderMap,
     Json(payload): Json<CreateClientEvaluationRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
-    let _claims = utils::require_min_role(&headers, "supervisor")?;
+    let claims = utils::require_min_role(&headers, "supervisor")?;
 
-    if payload.rating < 0.0 || payload.rating > 5.0 {
+    validate_evaluation_rating(payload.rating)?;
+
+    let guard_exists = sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM users
+               WHERE id = $1
+                 AND LOWER(BTRIM(role)) = 'guard'
+                 AND COALESCE(status, 'active') = 'active'
+                 AND verified = true
+                 AND COALESCE(approval_status, 'approved') = 'approved'
+           )"#,
+    )
+    .bind(&payload.guard_id)
+    .fetch_one(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to validate guard: {}", e)))?;
+
+    if !guard_exists {
         return Err(AppError::BadRequest(
-            "Rating must be between 0 and 5".to_string(),
+            "Evaluation target must be an active, approved guard".to_string(),
+        ));
+    }
+
+    if let Some(shift_id) = payload.shift_id.as_deref() {
+        let shift_matches = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM shifts WHERE id = $1 AND guard_id = $2)",
+        )
+        .bind(shift_id)
+        .bind(&payload.guard_id)
+        .fetch_one(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to validate shift: {}", e)))?;
+
+        if !shift_matches {
+            return Err(AppError::BadRequest(
+                "Selected shift does not belong to the evaluated guard".to_string(),
+            ));
+        }
+    }
+
+    if let Some(mission_id) = payload.mission_id.as_deref() {
+        let mission_exists =
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM trips WHERE id = $1)")
+                .bind(mission_id)
+                .fetch_one(db.as_ref())
+                .await
+                .map_err(|e| {
+                    AppError::DatabaseError(format!("Failed to validate mission: {}", e))
+                })?;
+
+        if !mission_exists {
+            return Err(AppError::BadRequest(
+                "Selected mission does not exist".to_string(),
+            ));
+        }
+    }
+
+    let evaluator = sqlx::query_as::<_, (String, String)>(
+        "SELECT COALESCE(NULLIF(full_name, ''), username), LOWER(BTRIM(role)) FROM users WHERE id = $1",
+    )
+    .bind(&claims.sub)
+    .fetch_optional(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to load evaluator identity: {}", e)))?
+    .ok_or_else(|| AppError::Unauthorized("Evaluator account no longer exists".to_string()))?;
+
+    let comment = payload
+        .comment
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if comment.is_some_and(|value| value.len() > 2000) {
+        return Err(AppError::BadRequest(
+            "Evaluation comment must be 2000 characters or fewer".to_string(),
         ));
     }
 
@@ -340,10 +420,10 @@ pub async fn submit_client_evaluation(
     .bind(&payload.guard_id)
     .bind(&payload.shift_id)
     .bind(&payload.mission_id)
-    .bind(&payload.evaluator_name)
-    .bind(&payload.evaluator_role)
+    .bind(&evaluator.0)
+    .bind(&evaluator.1)
     .bind(payload.rating)
-    .bind(&payload.comment)
+    .bind(comment)
     .execute(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create evaluation: {}", e)))?;
@@ -422,4 +502,24 @@ pub async fn get_overtime_candidates(
             })
         }).collect::<Vec<_>>()
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_evaluation_rating;
+
+    #[test]
+    fn evaluation_rating_accepts_the_documented_scale() {
+        assert!(validate_evaluation_rating(1.0).is_ok());
+        assert!(validate_evaluation_rating(3.5).is_ok());
+        assert!(validate_evaluation_rating(5.0).is_ok());
+    }
+
+    #[test]
+    fn evaluation_rating_rejects_invalid_values() {
+        assert!(validate_evaluation_rating(0.0).is_err());
+        assert!(validate_evaluation_rating(5.1).is_err());
+        assert!(validate_evaluation_rating(f64::NAN).is_err());
+        assert!(validate_evaluation_rating(f64::INFINITY).is_err());
+    }
 }

@@ -1457,6 +1457,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         )
         .route(
+            "/api/analytics/evaluations",
+            get(handlers::analytics::get_evaluation_analytics).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_analytics_view),
+            ),
+        )
+        .route(
             "/api/analytics/mission-status",
             put(handlers::analytics::update_mission_status)
                 .route_layer(axum_middleware::from_fn(

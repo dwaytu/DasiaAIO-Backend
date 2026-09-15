@@ -793,7 +793,8 @@ pub struct CreateClientEvaluationRequest {
     pub shift_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mission_id: Option<String>,
-    pub evaluator_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluator_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evaluator_role: Option<String>,
     pub rating: f64,

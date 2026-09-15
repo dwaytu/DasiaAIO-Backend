@@ -1020,6 +1020,18 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create attendance table: {}", e)))?;
 
+    for analytics_index in &[
+        "CREATE INDEX IF NOT EXISTS idx_shifts_analytics_window ON shifts(start_time, end_time, status, guard_id)",
+        "CREATE INDEX IF NOT EXISTS idx_attendance_shift_guard_times ON attendance(shift_id, guard_id, check_in_time, check_out_time)",
+    ] {
+        sqlx::query(analytics_index)
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                AppError::DatabaseError(format!("Failed to create attendance analytics index: {}", e))
+            })?;
+    }
+
     // Create armored_cars table
     sqlx::query(
         r#"
@@ -1482,6 +1494,15 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         AppError::DatabaseError(format!("Failed to create client_evaluations table: {}", e))
     })?;
 
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_client_evaluations_created_guard ON client_evaluations(created_at DESC, guard_id)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create evaluation analytics index: {}", e))
+    })?;
+
     // Create punctuality_records table
     sqlx::query(
         r#"
@@ -1503,6 +1524,15 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .await
     .map_err(|e| {
         AppError::DatabaseError(format!("Failed to create punctuality_records table: {}", e))
+    })?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_punctuality_guard_scheduled_status ON punctuality_records(guard_id, scheduled_start_time, status)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create punctuality analytics index: {}", e))
     })?;
 
     // Create training_records table

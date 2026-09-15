@@ -1,6 +1,6 @@
 use axum::extract::Query;
 use axum::{extract::State, http::HeaderMap, Json};
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use chrono::{DateTime, Days, FixedOffset, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
@@ -8,6 +8,9 @@ use std::sync::Arc;
 
 use crate::{
     error::{AppError, AppResult},
+    services::analytics_service::{
+        EvaluationAnalytics, EvaluationAnalyticsResponse, EvaluationTrendPoint,
+    },
     utils,
 };
 
@@ -19,6 +22,8 @@ pub struct AnalyticsResponse {
     pub mission_stats: MissionStats,
     pub attendance_analytics: AttendanceAnalytics,
     pub attendance_trend: Vec<AttendanceTrendPoint>,
+    pub evaluation_analytics: EvaluationAnalytics,
+    pub evaluation_trend: Vec<EvaluationTrendPoint>,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,6 +78,7 @@ pub struct ResourceUtilization {
     pub vehicles_unavailable: i64,
     pub guards_on_duty: i64,
     pub guards_available: i64,
+    pub guards_unavailable: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -193,13 +199,14 @@ fn parse_report_date(
         ))
     })?;
 
-    Ok((
-        Some(DateTime::<Utc>::from_naive_utc_and_offset(
-            naive_boundary,
-            Utc,
-        )),
-        Some(date.to_string()),
-    ))
+    let manila_offset = FixedOffset::east_opt(8 * 60 * 60)
+        .ok_or_else(|| AppError::InternalServerError("Invalid reporting timezone".to_string()))?;
+    let boundary = manila_offset
+        .from_local_datetime(&naive_boundary)
+        .single()
+        .ok_or_else(|| AppError::BadRequest(format!("{} is ambiguous", field_name)))?;
+
+    Ok((Some(boundary.with_timezone(&Utc)), Some(date.to_string())))
 }
 
 fn round_metric(value: f64) -> f64 {
@@ -266,74 +273,28 @@ pub async fn get_analytics(
     let _claims = utils::require_min_role(&headers, "supervisor")?;
     let period_days = query.days.unwrap_or(30).clamp(7, 90);
 
-    // Overview stats
-    let total_guards = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM users WHERE role = 'guard' AND status = 'active'",
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(0);
-
-    let active_guards = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(DISTINCT guard_id) FROM shifts 
-         WHERE status = 'in_progress' OR status = 'scheduled'",
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(0);
+    let resource_snapshot =
+        crate::services::analytics_service::fetch_resource_snapshot(db.as_ref()).await?;
 
     let total_missions = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trips")
         .fetch_one(db.as_ref())
         .await
-        .unwrap_or(0);
+        .map_err(|e| AppError::DatabaseError(format!("Failed to count missions: {}", e)))?;
 
     let completed_missions =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trips WHERE status = 'completed'")
             .fetch_one(db.as_ref())
             .await
-            .unwrap_or(0);
+            .map_err(|e| {
+                AppError::DatabaseError(format!("Failed to count completed missions: {}", e))
+            })?;
 
     let active_missions = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM trips WHERE status = 'in_progress' OR status = 'scheduled'",
     )
     .fetch_one(db.as_ref())
     .await
-    .unwrap_or(0);
-
-    let total_firearms = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM firearms")
-        .fetch_one(db.as_ref())
-        .await
-        .unwrap_or(0);
-
-    let allocated_firearms =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM firearms WHERE status = 'allocated'")
-            .fetch_one(db.as_ref())
-            .await
-            .unwrap_or(0);
-
-    let available_firearms =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM firearms WHERE status = 'available'")
-            .fetch_one(db.as_ref())
-            .await
-            .unwrap_or(0);
-
-    let total_vehicles = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM armored_cars")
-        .fetch_one(db.as_ref())
-        .await
-        .unwrap_or(0);
-
-    let deployed_vehicles =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM armored_cars WHERE status = 'deployed'")
-            .fetch_one(db.as_ref())
-            .await
-            .unwrap_or(0);
-
-    let available_vehicles = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM armored_cars WHERE status = 'available'",
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(0);
+    .map_err(|e| AppError::DatabaseError(format!("Failed to count active missions: {}", e)))?;
 
     // Performance metrics
     let mission_completion_rate = if total_missions > 0 {
@@ -348,72 +309,52 @@ pub async fn get_analytics(
     )
     .fetch_one(db.as_ref())
     .await
-    .unwrap_or(None)
+    .map_err(|e| AppError::DatabaseError(format!("Failed to calculate mission duration: {}", e)))?
     .unwrap_or(0.0);
 
-    let total_shifts =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM shifts WHERE status = 'completed'")
-            .fetch_one(db.as_ref())
-            .await
-            .unwrap_or(0);
-
-    let attended_shifts = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(DISTINCT shift_id) FROM attendance WHERE check_in_time IS NOT NULL",
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(0);
-
-    let guard_attendance_rate = if total_shifts > 0 {
-        (attended_shifts as f64 / total_shifts as f64) * 100.0
-    } else {
-        100.0
-    };
-
-    let firearm_availability_rate = if total_firearms > 0 {
-        (available_firearms as f64 / total_firearms as f64) * 100.0
+    let firearm_availability_rate = if resource_snapshot.total_firearms > 0 {
+        (resource_snapshot.firearms_available as f64 / resource_snapshot.total_firearms as f64)
+            * 100.0
     } else {
         0.0
     };
 
-    let vehicle_utilization_rate = if total_vehicles > 0 {
-        (deployed_vehicles as f64 / total_vehicles as f64) * 100.0
+    let vehicle_utilization_rate = if resource_snapshot.total_vehicles > 0 {
+        (resource_snapshot.vehicles_deployed as f64 / resource_snapshot.total_vehicles as f64)
+            * 100.0
     } else {
         0.0
     };
-
-    // Resource utilization
-    let firearms_available = available_firearms;
-    let firearms_unavailable = total_firearms - firearms_available;
-    let vehicles_available = available_vehicles;
-    let vehicles_unavailable = total_vehicles - vehicles_available;
-    let guards_available = total_guards - active_guards;
 
     // Mission stats
     let total_missions_this_month = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM trips 
-         WHERE EXTRACT(MONTH FROM start_time) = EXTRACT(MONTH FROM CURRENT_TIMESTAMP)
-         AND EXTRACT(YEAR FROM start_time) = EXTRACT(YEAR FROM CURRENT_TIMESTAMP)",
+         WHERE EXTRACT(MONTH FROM timezone('Asia/Manila', start_time)) = EXTRACT(MONTH FROM timezone('Asia/Manila', CURRENT_TIMESTAMP))
+         AND EXTRACT(YEAR FROM timezone('Asia/Manila', start_time)) = EXTRACT(YEAR FROM timezone('Asia/Manila', CURRENT_TIMESTAMP))",
     )
     .fetch_one(db.as_ref())
     .await
-    .unwrap_or(0);
+    .map_err(|e| AppError::DatabaseError(format!("Failed to count monthly missions: {}", e)))?;
 
     let completed_missions_this_month = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM trips 
          WHERE status = 'completed'
-         AND EXTRACT(MONTH FROM start_time) = EXTRACT(MONTH FROM CURRENT_TIMESTAMP)
-         AND EXTRACT(YEAR FROM start_time) = EXTRACT(YEAR FROM CURRENT_TIMESTAMP)",
+         AND EXTRACT(MONTH FROM timezone('Asia/Manila', start_time)) = EXTRACT(MONTH FROM timezone('Asia/Manila', CURRENT_TIMESTAMP))
+         AND EXTRACT(YEAR FROM timezone('Asia/Manila', start_time)) = EXTRACT(YEAR FROM timezone('Asia/Manila', CURRENT_TIMESTAMP))",
     )
     .fetch_one(db.as_ref())
     .await
-    .unwrap_or(0);
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to count monthly completed missions: {}", e))
+    })?;
 
     let pending_missions =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trips WHERE status = 'scheduled'")
             .fetch_one(db.as_ref())
             .await
-            .unwrap_or(0);
+            .map_err(|e| {
+                AppError::DatabaseError(format!("Failed to count pending missions: {}", e))
+            })?;
 
     let average_guards_per_mission = sqlx::query_scalar::<_, Option<f64>>(
         "SELECT AVG(guard_count) FROM (
@@ -426,15 +367,20 @@ pub async fn get_analytics(
     )
     .fetch_one(db.as_ref())
     .await
-    .unwrap_or(None)
+    .map_err(|e| AppError::DatabaseError(format!("Failed to calculate guards per mission: {}", e)))?
     .unwrap_or(0.0);
 
     let attendance_row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
-        "WITH scoped_shifts AS (
+        "WITH bounds AS (
+            SELECT
+                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
+                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
+        ), scoped_shifts AS (
             SELECT id, start_time, end_time
             FROM shifts
-            WHERE start_time >= CURRENT_DATE - ($1::BIGINT * INTERVAL '1 day')
-              AND start_time < CURRENT_DATE + INTERVAL '1 day'
+            CROSS JOIN bounds
+            WHERE start_time >= bounds.starts_at
+              AND start_time < bounds.ends_at
         )
         SELECT
             COUNT(*)::BIGINT,
@@ -468,8 +414,13 @@ pub async fn get_analytics(
     };
 
     let attendance_trend = sqlx::query_as::<_, AttendanceTrendPoint>(
-        "SELECT
-            DATE(s.start_time) AS date,
+        "WITH bounds AS (
+            SELECT
+                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
+                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
+        )
+        SELECT
+            DATE(timezone('Asia/Manila', s.start_time)) AS date,
             COUNT(*)::BIGINT AS scheduled_shifts,
             COUNT(*) FILTER (WHERE EXISTS (
                 SELECT 1 FROM attendance a
@@ -484,44 +435,50 @@ pub async fn get_analytics(
                 WHERE a.shift_id = s.id AND a.check_in_time IS NOT NULL
             ))::BIGINT AS no_shows
         FROM shifts s
-        WHERE s.start_time >= CURRENT_DATE - ($1::BIGINT * INTERVAL '1 day')
-          AND s.start_time < CURRENT_DATE + INTERVAL '1 day'
-        GROUP BY DATE(s.start_time)
-        ORDER BY DATE(s.start_time) ASC",
+        CROSS JOIN bounds
+        WHERE s.start_time >= bounds.starts_at
+          AND s.start_time < bounds.ends_at
+        GROUP BY DATE(timezone('Asia/Manila', s.start_time))
+        ORDER BY DATE(timezone('Asia/Manila', s.start_time)) ASC",
     )
     .bind(period_days)
     .fetch_all(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to fetch attendance trend: {}", e)))?;
 
+    let evaluation_report =
+        crate::services::analytics_service::fetch_evaluation_analytics(db.as_ref(), period_days)
+            .await?;
+
     let response = AnalyticsResponse {
         overview: OverviewStats {
-            total_guards,
-            active_guards,
+            total_guards: resource_snapshot.total_guards,
+            active_guards: resource_snapshot.guards_on_duty,
             total_missions,
             completed_missions,
             active_missions,
-            total_firearms,
-            allocated_firearms,
-            total_vehicles,
-            deployed_vehicles,
+            total_firearms: resource_snapshot.total_firearms,
+            allocated_firearms: resource_snapshot.firearms_in_use,
+            total_vehicles: resource_snapshot.total_vehicles,
+            deployed_vehicles: resource_snapshot.vehicles_deployed,
         },
         performance_metrics: PerformanceMetrics {
             mission_completion_rate,
             average_mission_duration,
-            guard_attendance_rate,
+            guard_attendance_rate: round_metric(attendance_rate),
             firearm_availability_rate,
             vehicle_utilization_rate,
         },
         resource_utilization: ResourceUtilization {
-            firearms_in_use: allocated_firearms,
-            firearms_available,
-            firearms_unavailable,
-            vehicles_deployed: deployed_vehicles,
-            vehicles_available,
-            vehicles_unavailable,
-            guards_on_duty: active_guards,
-            guards_available,
+            firearms_in_use: resource_snapshot.firearms_in_use,
+            firearms_available: resource_snapshot.firearms_available,
+            firearms_unavailable: resource_snapshot.firearms_unavailable(),
+            vehicles_deployed: resource_snapshot.vehicles_deployed,
+            vehicles_available: resource_snapshot.vehicles_available,
+            vehicles_unavailable: resource_snapshot.vehicles_unavailable(),
+            guards_on_duty: resource_snapshot.guards_on_duty,
+            guards_available: resource_snapshot.guards_available,
+            guards_unavailable: resource_snapshot.guards_unavailable(),
         },
         mission_stats: MissionStats {
             total_missions_this_month,
@@ -540,8 +497,23 @@ pub async fn get_analytics(
             attendance_rate: round_metric(attendance_rate),
         },
         attendance_trend,
+        evaluation_analytics: evaluation_report.summary,
+        evaluation_trend: evaluation_report.trend,
     };
 
+    Ok(Json(response))
+}
+
+pub async fn get_evaluation_analytics(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Query(query): Query<AnalyticsQuery>,
+) -> AppResult<Json<EvaluationAnalyticsResponse>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+    let period_days = query.days.unwrap_or(30).clamp(7, 90);
+    let response =
+        crate::services::analytics_service::fetch_evaluation_analytics(db.as_ref(), period_days)
+            .await?;
     Ok(Json(response))
 }
 
@@ -569,7 +541,10 @@ pub async fn get_guard_performance_report(
                 id,
                 COALESCE(NULLIF(full_name, ''), username) AS guard_name
             FROM users
-            WHERE LOWER(role) = 'guard'
+            WHERE LOWER(BTRIM(role)) = 'guard'
+              AND COALESCE(status, 'active') = 'active'
+              AND verified = true
+              AND COALESCE(approval_status, 'approved') = 'approved'
         ), attendance_by_shift AS (
             SELECT
                 shift_id,
@@ -587,8 +562,16 @@ pub async fn get_guard_performance_report(
                     WHERE COALESCE(abs.checked_out, false) OR s.status = 'completed'
                 )::BIGINT AS completed_shifts,
                 COUNT(*) FILTER (
-                    WHERE NOT COALESCE(abs.checked_in, false) AND s.end_time < CURRENT_TIMESTAMP
-                )::BIGINT AS inferred_no_shows
+                    WHERE EXISTS (
+                        SELECT 1 FROM punctuality_records no_show
+                        WHERE no_show.shift_id = s.id
+                          AND no_show.guard_id = s.guard_id
+                          AND no_show.status = 'no_show'
+                    ) OR (
+                        NOT COALESCE(abs.checked_in, false)
+                        AND s.end_time < CURRENT_TIMESTAMP
+                    )
+                )::BIGINT AS no_shows
             FROM shifts s
             LEFT JOIN attendance_by_shift abs ON abs.shift_id = s.id AND abs.guard_id = s.guard_id
             WHERE ($1::TIMESTAMPTZ IS NULL OR s.start_time >= $1)
@@ -597,8 +580,9 @@ pub async fn get_guard_performance_report(
         ), punctuality_metrics AS (
             SELECT
                 guard_id,
+                COUNT(*) FILTER (WHERE status IN ('early', 'on_time'))::BIGINT AS on_time_check_ins,
                 COUNT(*) FILTER (WHERE status = 'late')::BIGINT AS late_check_ins,
-                COUNT(*) FILTER (WHERE status = 'no_show')::BIGINT AS recorded_no_shows
+                COUNT(*) FILTER (WHERE status IN ('early', 'on_time', 'late', 'no_show'))::BIGINT AS tracked_punctuality
             FROM punctuality_records
             WHERE ($1::TIMESTAMPTZ IS NULL OR scheduled_start_time >= $1)
               AND ($2::TIMESTAMPTZ IS NULL OR scheduled_start_time < $2)
@@ -650,21 +634,33 @@ pub async fn get_guard_performance_report(
             )::DOUBLE PRECISION AS attendance_rate,
             COALESCE(pm.late_check_ins, 0)::BIGINT AS late_check_ins,
             COALESCE(sm.completed_shifts, 0)::BIGINT AS completed_shifts,
-            GREATEST(
-                COALESCE(pm.recorded_no_shows, 0),
-                COALESCE(sm.inferred_no_shows, 0)
-            )::BIGINT AS no_shows,
+            COALESCE(sm.no_shows, 0)::BIGINT AS no_shows,
             COALESCE(im.incident_reports_submitted, 0)::BIGINT AS incident_reports_submitted,
             ROUND(COALESCE(em.average_client_rating, 0)::NUMERIC, 2)::DOUBLE PRECISION AS average_client_rating,
             COALESCE(em.evaluation_count, 0)::BIGINT AS evaluation_count,
-            ROUND(COALESCE(gms.overall_score, 0)::NUMERIC, 2)::DOUBLE PRECISION AS merit_score,
+            ROUND((
+                (
+                    CASE
+                        WHEN COALESCE(sm.total_shifts, 0) > 0
+                        THEN (COALESCE(sm.attended_shifts, 0)::DOUBLE PRECISION / sm.total_shifts::DOUBLE PRECISION) * 100.0
+                        ELSE 0.0
+                    END * 0.30
+                ) + (
+                    CASE
+                        WHEN COALESCE(pm.tracked_punctuality, 0) > 0
+                        THEN (COALESCE(pm.on_time_check_ins, 0)::DOUBLE PRECISION / pm.tracked_punctuality::DOUBLE PRECISION) * 100.0
+                        ELSE 0.0
+                    END * 0.35
+                ) + (
+                    (COALESCE(em.average_client_rating, 0) / 5.0) * 100.0 * 0.35
+                )
+            )::NUMERIC, 2)::DOUBLE PRECISION AS merit_score,
             COALESCE(rm.replacement_frequency, 0)::BIGINT AS replacement_frequency
         FROM guard_base gb
         LEFT JOIN shift_metrics sm ON sm.guard_id = gb.id
         LEFT JOIN punctuality_metrics pm ON pm.guard_id = gb.id
         LEFT JOIN incident_metrics im ON im.guard_id = gb.id
         LEFT JOIN evaluation_metrics em ON em.guard_id = gb.id
-        LEFT JOIN guard_merit_scores gms ON gms.guard_id = gb.id
         LEFT JOIN replacement_metrics rm ON rm.guard_id = gb.id
         ORDER BY merit_score DESC, attendance_rate DESC, gb.guard_name ASC
         "#,
