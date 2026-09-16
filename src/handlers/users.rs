@@ -134,6 +134,7 @@ pub struct PendingApprovalUser {
     pub address: Option<String>,
     pub verified: bool,
     pub approval_status: String,
+    pub created_by_name: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -214,6 +215,12 @@ pub async fn create_user_by_actor(
 
     let user_id = utils::generate_id();
     let hashed_password = utils::hash_password(&payload.password).await?;
+    let requires_approval = actor_role == "supervisor" && target_role == "guard";
+    let approval_status = if requires_approval {
+        "pending"
+    } else {
+        "approved"
+    };
 
     sqlx::query(
         r#"INSERT INTO users (
@@ -224,7 +231,10 @@ pub async fn create_user_by_actor(
         VALUES (
             $1, $2, $3, $4, $5, $6, $7,
             $8, $9, $10, $11,
-            TRUE, 'approved', $12, CURRENT_TIMESTAMP, $13
+            TRUE, $12,
+            CASE WHEN $12 = 'approved' THEN $13 ELSE NULL END,
+            CASE WHEN $12 = 'approved' THEN CURRENT_TIMESTAMP ELSE NULL END,
+            $13
         )"#,
     )
     .bind(&user_id)
@@ -238,19 +248,63 @@ pub async fn create_user_by_actor(
     .bind(&payload.license_issued_date)
     .bind(&payload.license_expiry_date)
     .bind(&payload.address)
-    .bind(&claims.sub)
+    .bind(approval_status)
     .bind(&claims.sub)
     .execute(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create user: {}", e)))?;
 
+    if requires_approval {
+        let reviewer_ids = match sqlx::query_scalar::<_, String>(
+            r#"SELECT id
+               FROM users
+               WHERE LOWER(role) IN ('admin', 'superadmin')
+                 AND verified = TRUE
+                 AND COALESCE(approval_status, 'approved') = 'approved'"#,
+        )
+        .fetch_all(db.as_ref())
+        .await
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!("Failed to load guard approval reviewers: {}", error);
+                Vec::new()
+            }
+        };
+
+        for reviewer_id in reviewer_ids {
+            let notification_id = utils::generate_id();
+            if let Err(error) = sqlx::query(
+                "INSERT INTO notifications (id, user_id, title, message, type, related_shift_id, read) VALUES ($1, $2, $3, $4, $5, NULL, false)",
+            )
+            .bind(&notification_id)
+            .bind(&reviewer_id)
+            .bind("Guard Account Pending Approval")
+            .bind(format!(
+                "A supervisor created a guard account for {}. Review the license details before approving access.",
+                payload.full_name
+            ))
+            .bind("approval_request")
+            .execute(db.as_ref())
+            .await
+            {
+                tracing::warn!("Failed to create guard approval notification: {}", error);
+            }
+        }
+    }
+
     Ok((
         StatusCode::CREATED,
         Json(json!({
-            "message": "User created successfully",
+            "message": if requires_approval {
+                "Guard account created and submitted for admin approval"
+            } else {
+                "User created successfully"
+            },
             "userId": user_id,
             "role": target_role,
-            "approvalStatus": "approved"
+            "approvalStatus": approval_status,
+            "requiresApproval": requires_approval
         })),
     ))
 }
@@ -316,18 +370,21 @@ pub async fn get_pending_guard_approvals(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
-    let _claims = utils::require_min_role(&headers, "supervisor")?;
+    let _claims = utils::require_min_role(&headers, "admin")?;
 
     let pending = sqlx::query_as::<_, PendingApprovalUser>(
         r#"SELECT
-            id, email, username, role, full_name, phone_number,
-            license_number, license_issued_date, license_expiry_date, address,
-            verified, COALESCE(approval_status, 'approved') AS approval_status,
-            created_at
-        FROM users
-        WHERE COALESCE(approval_status, 'approved') = 'pending'
-          AND LOWER(role) IN ('guard')
-        ORDER BY created_at ASC"#,
+            applicant.id, applicant.email, applicant.username, applicant.role,
+            applicant.full_name, applicant.phone_number, applicant.license_number,
+            applicant.license_issued_date, applicant.license_expiry_date, applicant.address,
+            applicant.verified, COALESCE(applicant.approval_status, 'approved') AS approval_status,
+            creator.full_name AS created_by_name, applicant.created_at
+        FROM users applicant
+        INNER JOIN users creator ON creator.id = applicant.created_by
+        WHERE COALESCE(applicant.approval_status, 'approved') = 'pending'
+          AND LOWER(applicant.role) = 'guard'
+          AND LOWER(creator.role) = 'supervisor'
+        ORDER BY applicant.created_at ASC"#,
     )
     .fetch_all(db.as_ref())
     .await
@@ -345,7 +402,7 @@ pub async fn update_guard_approval_status(
     Path(id): Path<String>,
     Json(payload): Json<GuardApprovalRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let claims = utils::require_min_role(&headers, "supervisor")?;
+    let claims = utils::require_min_role(&headers, "admin")?;
 
     let action = payload.action.trim().to_lowercase();
     let new_status = match action.as_str() {
@@ -358,15 +415,35 @@ pub async fn update_guard_approval_status(
         }
     };
 
+    let rejection_reason = payload
+        .reason
+        .as_ref()
+        .map(|reason| reason.trim())
+        .filter(|reason| !reason.is_empty());
+    if new_status == "rejected" && rejection_reason.is_none() {
+        return Err(AppError::BadRequest(
+            "A rejection reason is required".to_string(),
+        ));
+    }
+
     let user = sqlx::query(
-        r#"UPDATE users
+        r#"UPDATE users AS applicant
            SET approval_status = $1,
                approved_by = $2,
                approval_date = CURRENT_TIMESTAMP,
                updated_at = CURRENT_TIMESTAMP
-           WHERE id = $3
-             AND LOWER(role) IN ('guard')
-           RETURNING id, email, username, full_name, COALESCE(approval_status, 'approved') AS approval_status"#,
+           WHERE applicant.id = $3
+             AND LOWER(applicant.role) = 'guard'
+             AND COALESCE(applicant.approval_status, 'approved') = 'pending'
+             AND EXISTS (
+                 SELECT 1
+                 FROM users creator
+                 WHERE creator.id = applicant.created_by
+                   AND LOWER(creator.role) = 'supervisor'
+             )
+           RETURNING applicant.id, applicant.email, applicant.username, applicant.full_name,
+                     applicant.created_by,
+                     COALESCE(applicant.approval_status, 'approved') AS approval_status"#,
     )
     .bind(new_status)
     .bind(&claims.sub)
@@ -385,20 +462,18 @@ pub async fn update_guard_approval_status(
     let target_username: String = user
         .try_get("username")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse target username: {}", e)))?;
+    let creator_id: Option<String> = user
+        .try_get("created_by")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse account creator: {}", e)))?;
 
     let notification_title = if new_status == "approved" {
-        "Account Approved"
+        "Guard Account Approved"
     } else {
-        "Account Update"
+        "Guard Account Rejected"
     };
     let notification_message = if new_status == "approved" {
         "Your guard account has been approved. You can now log in.".to_string()
-    } else if let Some(reason) = payload
-        .reason
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
+    } else if let Some(reason) = rejection_reason {
         format!("Your guard account was not approved. Reason: {}", reason)
     } else {
         "Your guard account was not approved. Please contact an administrator for details."
@@ -417,6 +492,35 @@ pub async fn update_guard_approval_status(
     .execute(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create approval notification: {}", e)))?;
+
+    if let Some(creator_id) = creator_id.filter(|creator_id| creator_id != &target_user_id) {
+        let creator_notification_id = utils::generate_id();
+        let creator_message = if new_status == "approved" {
+            format!(
+                "The guard account for {} was approved and is now active.",
+                target_username
+            )
+        } else if let Some(reason) = rejection_reason {
+            format!(
+                "The guard account for {} was rejected. Reason: {}",
+                target_username, reason
+            )
+        } else {
+            format!("The guard account for {} was rejected.", target_username)
+        };
+
+        sqlx::query(
+            "INSERT INTO notifications (id, user_id, title, message, type, related_shift_id, read) VALUES ($1, $2, $3, $4, $5, NULL, false)",
+        )
+        .bind(&creator_notification_id)
+        .bind(creator_id)
+        .bind(notification_title)
+        .bind(creator_message)
+        .bind("account_approval")
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to notify account creator: {}", e)))?;
+    }
 
     Ok(Json(json!({
         "message": if new_status == "approved" { "Guard account approved" } else { "Guard account rejected" },

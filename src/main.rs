@@ -226,13 +226,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         // Auth routes
         .route(
-            "/api/register",
-            post(handlers::auth::register).route_layer(axum_middleware::from_fn_with_state(
-                auth_rate_limiter.clone(),
-                middleware::rate_limit::auth_rate_limit,
-            )),
-        )
-        .route(
             "/api/login",
             post(handlers::auth::login).route_layer(axum_middleware::from_fn_with_state(
                 auth_rate_limiter.clone(),
@@ -293,13 +286,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         )
         // Auth routes with /auth prefix (alternative URIs)
-        .route(
-            "/api/auth/register",
-            post(handlers::auth::register).route_layer(axum_middleware::from_fn_with_state(
-                auth_rate_limiter.clone(),
-                middleware::rate_limit::auth_rate_limit,
-            )),
-        )
         .route(
             "/api/auth/login",
             post(handlers::auth::login).route_layer(axum_middleware::from_fn_with_state(

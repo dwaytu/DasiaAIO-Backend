@@ -296,7 +296,6 @@ pub fn role_permissions(role: &str) -> &'static [&'static str] {
         "supervisor" => &[
             "create_user",
             "update_user",
-            "approve_guard_registration",
             "manage_firearms",
             "allocate_firearm",
             "manage_armored_cars",
@@ -671,6 +670,14 @@ mod tests {
         assert!(!has_permission("supervisor", "review_operational_requests"));
         assert!(has_permission("admin", "review_operational_requests"));
         assert!(has_permission("superadmin", "review_operational_requests"));
+    }
+
+    #[test]
+    fn only_admin_roles_can_approve_guard_registrations() {
+        assert!(has_permission("admin", "approve_guard_registration"));
+        assert!(has_permission("superadmin", "approve_guard_registration"));
+        assert!(!has_permission("supervisor", "approve_guard_registration"));
+        assert!(!has_permission("guard", "approve_guard_registration"));
     }
 
     #[test]

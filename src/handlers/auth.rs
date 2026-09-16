@@ -1,8 +1,4 @@
-use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    Json,
-};
+use axum::{extract::State, http::HeaderMap, Json};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
 use sqlx::{PgPool, Row};
@@ -11,8 +7,8 @@ use std::sync::Arc;
 use crate::{
     error::{AppError, AppResult},
     models::{
-        CreateUserRequest, ForgotPasswordRequest, LoginRequest, RefreshTokenRequest,
-        ResendCodeRequest, ResetPasswordRequest, VerifyEmailRequest, VerifyResetCodeRequest,
+        ForgotPasswordRequest, LoginRequest, RefreshTokenRequest, ResendCodeRequest,
+        ResetPasswordRequest, VerifyEmailRequest, VerifyResetCodeRequest,
     },
     utils::{self, verify_password},
 };
@@ -388,148 +384,6 @@ async fn log_security_event(
     {
         tracing::error!(error = %err, action_key = %action_key, "failed to persist auth security event");
     }
-}
-
-pub async fn register(
-    State(db): State<Arc<PgPool>>,
-    Json(payload): Json<CreateUserRequest>,
-) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
-    tracing::info!("Register request received for user: {}", payload.email);
-
-    let requested_role = utils::normalize_role(&payload.role);
-
-    // Validate required fields
-    if payload.email.is_empty()
-        || payload.password.is_empty()
-        || payload.username.is_empty()
-        || payload.full_name.is_empty()
-        || payload.phone_number.is_empty()
-        || payload.license_number.is_none()
-        || payload.license_issued_date.is_none()
-        || payload.license_expiry_date.is_none()
-    {
-        return Err(AppError::BadRequest(
-            "All fields are required for guard self-registration".to_string(),
-        ));
-    }
-
-    // Validate email and password strength
-    utils::validate_email(&payload.email)?;
-    utils::validate_password_strength(&payload.password)?;
-
-    // Validate role
-    if requested_role != "guard" {
-        return Err(AppError::BadRequest(
-            "Public registration only supports guard accounts".to_string(),
-        ));
-    }
-
-    // Check if user exists
-    let existing_user = sqlx::query("SELECT id FROM users WHERE email = $1")
-        .bind(&payload.email)
-        .fetch_optional(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
-
-    if existing_user.is_some() {
-        return Err(AppError::Conflict("User already exists".to_string()));
-    }
-
-    // Hash password
-    let hashed_password = utils::hash_password(&payload.password).await?;
-
-    // Generate user ID and confirmation code
-    let user_id = utils::generate_id();
-    let confirmation_code = utils::generate_confirmation_code();
-    let expires_at = chrono::Utc::now() + Duration::minutes(10);
-
-    // Email verification is mandatory for guard self-registration.
-    let resend_api_key = std::env::var("RESEND_API_KEY").unwrap_or_default();
-    if resend_api_key.is_empty() {
-        return Err(AppError::InternalServerError(
-            "Registration is temporarily unavailable because email verification is not configured"
-                .to_string(),
-        ));
-    }
-
-    // Create user
-    sqlx::query(
-        r#"INSERT INTO users (id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, verified, approval_status, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', NULL)"#
-    )
-    .bind(&user_id)
-    .bind(&payload.email)
-    .bind(&payload.username)
-    .bind(&hashed_password)
-    .bind(&requested_role)
-    .bind(&payload.full_name)
-    .bind(&payload.phone_number)
-    .bind(&payload.license_number)
-    .bind(&payload.license_issued_date)
-    .bind(&payload.license_expiry_date)
-    .bind(&payload.address)
-    .bind(false)
-    .execute(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create user: {}", e)))?;
-
-    // Notify reviewers (superadmin/admin/supervisor) that a guard registration is waiting for approval.
-    let reviewer_ids = sqlx::query_scalar::<_, String>(
-        r#"SELECT id
-           FROM users
-           WHERE LOWER(role) IN ('superadmin', 'admin', 'supervisor')
-             AND verified = TRUE
-             AND COALESCE(approval_status, 'approved') = 'approved'"#,
-    )
-    .fetch_all(db.as_ref())
-    .await
-    .unwrap_or_default();
-
-    for reviewer_id in reviewer_ids {
-        let notification_id = utils::generate_id();
-        if let Err(e) = sqlx::query(
-            "INSERT INTO notifications (id, user_id, title, message, type, related_shift_id, read) VALUES ($1, $2, $3, $4, $5, NULL, false)",
-        )
-        .bind(&notification_id)
-        .bind(&reviewer_id)
-        .bind("Guard Registration Pending Approval")
-        .bind(format!(
-            "New guard registration submitted by {} ({}) and is waiting for approval.",
-            payload.full_name, payload.email
-        ))
-        .bind("approval_request")
-        .execute(db.as_ref())
-        .await
-        {
-            tracing::warn!("Failed to create reviewer notification: {}", e);
-        }
-    }
-
-    // Create verification record
-    let verification_id = utils::generate_id();
-    sqlx::query(
-        "INSERT INTO verifications (id, user_id, code, expires_at) VALUES ($1, $2, $3, $4)",
-    )
-    .bind(&verification_id)
-    .bind(&user_id)
-    .bind(&confirmation_code)
-    .bind(expires_at)
-    .execute(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to create verification: {}", e)))?;
-
-    utils::send_confirmation_email(&resend_api_key, &payload.email, &confirmation_code).await?;
-
-    tracing::info!("Verification email sent to {}", payload.email);
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({
-            "message": "Registration submitted. Check your email for confirmation code, then wait for supervisor/admin approval.",
-            "userId": user_id,
-            "email": payload.email,
-            "requiresVerification": true
-        })),
-    ))
 }
 
 pub async fn verify_email(

@@ -865,7 +865,6 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         // supervisor
         ("supervisor", "create_user"),
         ("supervisor", "update_user"),
-        ("supervisor", "approve_guard_registration"),
         ("supervisor", "manage_firearms"),
         ("supervisor", "allocate_firearm"),
         ("supervisor", "manage_armored_cars"),
@@ -933,6 +932,23 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .map_err(|e| {
         AppError::DatabaseError(format!(
             "Failed to remove supervisor request review permission: {}",
+            e
+        ))
+    })?;
+
+    sqlx::query(
+        r#"DELETE FROM role_permissions rp
+           USING roles r, permissions p
+           WHERE rp.role_id = r.id
+             AND rp.permission_id = p.id
+             AND p.permission_key = 'approve_guard_registration'
+             AND r.role_key = 'supervisor'"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to remove supervisor guard approval permission: {}",
             e
         ))
     })?;

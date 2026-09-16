@@ -65,26 +65,6 @@ pub struct User {
     pub updated_at: DateTime<Utc>,
 }
 
-// User creation request
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub struct CreateUserRequest {
-    pub email: String,
-    pub password: String,
-    pub username: String,
-    pub role: String,
-    pub full_name: String,
-    pub phone_number: String,
-    pub license_number: Option<String>,
-    #[serde(default, with = "option_date_format")]
-    pub license_issued_date: Option<DateTime<Utc>>,
-    #[serde(default, with = "option_date_format")]
-    pub license_expiry_date: Option<DateTime<Utc>>,
-    pub address: Option<String>,
-    pub admin_code: Option<String>,
-}
-
 // User response (without password)
 #[derive(Debug, Serialize)]
 pub struct UserResponse {
