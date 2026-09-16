@@ -150,6 +150,37 @@ pub async fn mark_notification_read(
     })))
 }
 
+// Mark one notification as unread for its owner.
+pub async fn mark_notification_unread(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Path(notification_id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    let notif_user_id =
+        sqlx::query_scalar::<_, String>("SELECT user_id FROM notifications WHERE id = $1")
+            .bind(&notification_id)
+            .fetch_optional(db.as_ref())
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+            .ok_or_else(|| AppError::NotFound("Notification not found".to_string()))?;
+
+    let _claims = utils::require_self_or_min_role(&headers, &notif_user_id, "supervisor")?;
+
+    sqlx::query(
+        "UPDATE notifications SET read = false, updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+    )
+    .bind(&notification_id)
+    .execute(db.as_ref())
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to mark notification as unread: {}", e))
+    })?;
+
+    Ok(Json(json!({
+        "message": "Notification marked as unread"
+    })))
+}
+
 // Mark all notifications as read for a user
 pub async fn mark_all_read(
     State(db): State<Arc<PgPool>>,
@@ -168,6 +199,28 @@ pub async fn mark_all_read(
 
     Ok(Json(json!({
         "message": "All notifications marked as read",
+        "updated": result.rows_affected()
+    })))
+}
+
+// Mark all notifications as unread for a user.
+pub async fn mark_all_unread(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_self_or_min_role(&headers, &user_id, "supervisor")?;
+
+    let result = sqlx::query(
+        "UPDATE notifications SET read = false, updated_at = CURRENT_TIMESTAMP WHERE user_id = $1 AND read = true",
+    )
+    .bind(&user_id)
+    .execute(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to mark notifications as unread: {}", e)))?;
+
+    Ok(Json(json!({
+        "message": "All notifications marked as unread",
         "updated": result.rows_affected()
     })))
 }

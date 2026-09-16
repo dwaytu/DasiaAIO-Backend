@@ -1403,6 +1403,18 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         AppError::DatabaseError(format!("Failed to create operational_requests table: {}", e))
     })?;
 
+    for migration in [
+        "ALTER TABLE operational_requests ADD COLUMN IF NOT EXISTS archived_by VARCHAR(36) REFERENCES users(id) ON DELETE SET NULL",
+        "ALTER TABLE operational_requests ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP WITH TIME ZONE",
+    ] {
+        sqlx::query(migration).execute(pool).await.map_err(|e| {
+            AppError::DatabaseError(format!(
+                "Operational request archive migration failed '{}': {}",
+                migration, e
+            ))
+        })?;
+    }
+
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS operational_request_events (

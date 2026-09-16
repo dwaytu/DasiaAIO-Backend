@@ -300,6 +300,7 @@ pub async fn get_guards(
                   profile_photo, verified, last_seen_at, created_at, updated_at
            FROM users
            WHERE LOWER(role) = 'guard'
+             AND verified = true
              AND COALESCE(approval_status, 'approved') = 'approved'
            ORDER BY full_name ASC"#,
     )

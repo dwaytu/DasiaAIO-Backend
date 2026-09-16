@@ -24,6 +24,7 @@ pub struct OperationalRequestQuery {
     pub requester: Option<String>,
     pub date_from: Option<String>,
     pub date_to: Option<String>,
+    pub include_archived: Option<bool>,
     pub page: Option<i64>,
     #[serde(alias = "page_size")]
     pub page_size: Option<i64>,
@@ -62,6 +63,7 @@ pub async fn list_requests(
             requester: query.requester,
             date_from: query.date_from,
             date_to: query.date_to,
+            include_archived: query.include_archived,
             page: query.page,
             page_size: query.page_size,
         },
@@ -133,6 +135,18 @@ decision_handler!(return_for_correction, return_for_correction);
 decision_handler!(cancel_request, cancel_request);
 decision_handler!(start_request, start_request);
 decision_handler!(complete_request, complete_request);
+
+pub async fn archive_request(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let actor = claims(&headers)?;
+    let request =
+        operational_requests::archive_request(db.as_ref(), &actor.sub, &actor.role, &request_id)
+            .await?;
+    Ok(Json(json!({ "request": request })))
+}
 
 pub async fn resubmit_request(
     State(db): State<Arc<PgPool>>,

@@ -819,8 +819,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
         )
         .route(
+            "/api/users/:user_id/notifications/mark-all-unread",
+            put(handlers::notifications::mark_all_unread)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_authenticated,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
             "/api/notifications/:notification_id/read",
             put(handlers::notifications::mark_notification_read)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_authenticated,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/notifications/:notification_id/unread",
+            put(handlers::notifications::mark_notification_unread)
                 .route_layer(axum_middleware::from_fn(
                     middleware::authz::require_authenticated,
                 ))
@@ -1054,6 +1076,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(handlers::operational_requests::get_events).route_layer(axum_middleware::from_fn(
                 middleware::authz::require_authenticated,
             )),
+        )
+        .route(
+            "/api/operational-requests/:id/archive",
+            post(handlers::operational_requests::archive_request)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_operational_request_review,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
         )
         .route(
             "/api/operational-requests/:id/resubmit",

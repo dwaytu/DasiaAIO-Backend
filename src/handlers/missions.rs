@@ -20,6 +20,9 @@ pub struct MissionAssignmentRequest {
     pub guards_required: i32,
     pub vehicles_required: i32,
     pub firearms_required: i32,
+    pub guard_id: Option<String>,
+    pub firearm_id: Option<String>,
+    pub vehicle_id: Option<String>,
     pub date: String,
     pub start_time: String,
     pub end_time: String,
@@ -82,6 +85,13 @@ pub async fn assign_mission(
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
+    if payload.guards_required < 0 || payload.vehicles_required < 0 || payload.firearms_required < 0
+    {
+        return Err(AppError::BadRequest(
+            "Resource quantities cannot be negative".to_string(),
+        ));
+    }
+
     use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 
     // Parse date (YYYY-MM-DD format from HTML date input)
@@ -114,7 +124,7 @@ pub async fn assign_mission(
         ));
     }
 
-    let duration = (end_time - start_time).num_hours() as f64;
+    let duration = (end_time - start_time).num_minutes() as f64 / 60.0;
 
     // 1. Find available guards
     #[derive(sqlx::FromRow)]
@@ -127,7 +137,8 @@ pub async fn assign_mission(
     let guards = sqlx::query_as::<_, GuardRow>(
         "SELECT id, full_name, username FROM users 
          WHERE role IN ('guard') 
-         AND verified = true 
+         AND verified = true
+         AND ($4::TEXT IS NULL OR users.id = $4)
          AND NOT EXISTS (
              SELECT 1
              FROM shifts s
@@ -141,6 +152,7 @@ pub async fn assign_mission(
     .bind(start_time)
     .bind(end_time)
     .bind(payload.guards_required as i64)
+    .bind(payload.guard_id.as_deref())
     .fetch_all(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to query guards: {}", e)))?;
@@ -162,11 +174,15 @@ pub async fn assign_mission(
     }
 
     let firearms = sqlx::query_as::<_, FirearmRow>(
-        "SELECT id, name, model FROM firearms 
-         WHERE status = 'available' 
+        "SELECT id, name, model FROM firearms
+         WHERE status = 'available'
+           AND validity_date IS NOT NULL
+           AND validity_date > CURRENT_TIMESTAMP
+           AND ($2::TEXT IS NULL OR id = $2)
          LIMIT $1",
     )
     .bind(payload.firearms_required as i64)
+    .bind(payload.firearm_id.as_deref())
     .fetch_all(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to query firearms: {}", e)))?;
@@ -188,8 +204,9 @@ pub async fn assign_mission(
     }
 
     let vehicles = sqlx::query_as::<_, VehicleRow>(
-        "SELECT id, model, passenger_capacity FROM armored_cars 
-         WHERE status IN ('operational', 'available') 
+        "SELECT id, model, passenger_capacity FROM armored_cars
+         WHERE status IN ('operational', 'available')
+         AND ($4::TEXT IS NULL OR armored_cars.id = $4)
          AND NOT EXISTS (
              SELECT 1
              FROM trips t
@@ -203,6 +220,7 @@ pub async fn assign_mission(
     .bind(start_time)
     .bind(end_time)
     .bind(payload.vehicles_required as i64)
+    .bind(payload.vehicle_id.as_deref())
     .fetch_all(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to query vehicles: {}", e)))?;

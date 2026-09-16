@@ -98,12 +98,19 @@ WITH report AS (
         fa.allocation_date,
         fa.expected_return_date,
         p.id AS permit_id,
-        p.permit_type,
-        p.expiry_date AS permit_expiry_date,
-        p.status AS permit_status,
+        COALESCE(p.permit_type, CASE WHEN f.validity_date IS NOT NULL THEN 'Firearm license' END) AS permit_type,
+        COALESCE(p.expiry_date, f.validity_date) AS permit_expiry_date,
+        COALESCE(
+            p.status,
+            CASE
+                WHEN f.validity_date IS NULL THEN NULL
+                WHEN f.validity_date <= NOW() THEN 'expired'
+                ELSE 'active'
+            END
+        ) AS permit_status,
         CASE
-            WHEN p.expiry_date IS NULL THEN NULL
-            ELSE CEIL(EXTRACT(EPOCH FROM (p.expiry_date - NOW())) / 86400.0)::BIGINT
+            WHEN COALESCE(p.expiry_date, f.validity_date) IS NULL THEN NULL
+            ELSE CEIL(EXTRACT(EPOCH FROM (COALESCE(p.expiry_date, f.validity_date) - NOW())) / 86400.0)::BIGINT
         END AS permit_days_remaining,
         fm.id AS maintenance_id,
         fm.maintenance_type,
@@ -111,9 +118,12 @@ WITH report AS (
         fm.status AS maintenance_status,
         CASE
             WHEN f.status = 'maintenance' OR fm.status IN ('pending', 'in_progress') THEN 'maintenance'
-            WHEN p.id IS NULL AND fa.id IS NOT NULL THEN 'no_permit'
+            WHEN f.validity_date IS NULL THEN 'no_permit'
+            WHEN f.validity_date <= NOW() THEN 'expired'
+            WHEN fa.id IS NOT NULL AND p.id IS NULL THEN 'no_permit'
             WHEN p.status IN ('expired', 'revoked') OR p.expiry_date <= NOW() THEN 'expired'
-            WHEN p.expiry_date <= NOW() + ($1::BIGINT * INTERVAL '1 day') THEN 'expiring_soon'
+            WHEN f.validity_date <= NOW() + ($1::BIGINT * INTERVAL '1 day')
+              OR p.expiry_date <= NOW() + ($1::BIGINT * INTERVAL '1 day') THEN 'expiring_soon'
             WHEN fa.id IS NOT NULL THEN 'allocated'
             ELSE 'compliant'
         END AS compliance_status
@@ -218,14 +228,27 @@ pub async fn create_expiry_notifications(
 
     let candidates = sqlx::query(
         r#"
-        SELECT f.id AS firearm_id, f.serial_number, f.model,
-               p.expiry_date,
-               CASE WHEN p.expiry_date <= NOW() THEN 'expired' ELSE 'expiring_soon' END AS issue
-        FROM firearms f
-        JOIN guard_firearm_permits p ON p.firearm_id = f.id
-        WHERE p.status IN ('active', 'expired')
-          AND p.expiry_date <= NOW() + ($1::BIGINT * INTERVAL '1 day')
-        ORDER BY p.expiry_date ASC
+        SELECT candidates.firearm_id, candidates.serial_number, candidates.model,
+               candidates.expiry_date, candidates.issue
+        FROM (
+            SELECT f.id AS firearm_id, f.serial_number, f.model,
+                   f.validity_date AS expiry_date,
+                   CASE WHEN f.validity_date <= NOW() THEN 'expired' ELSE 'expiring_soon' END AS issue
+            FROM firearms f
+            WHERE f.validity_date IS NOT NULL
+              AND f.validity_date <= NOW() + ($1::BIGINT * INTERVAL '1 day')
+
+            UNION ALL
+
+            SELECT f.id AS firearm_id, f.serial_number, f.model,
+                   p.expiry_date,
+                   CASE WHEN p.expiry_date <= NOW() THEN 'expired' ELSE 'expiring_soon' END AS issue
+            FROM firearms f
+            JOIN guard_firearm_permits p ON p.firearm_id = f.id
+            WHERE p.status IN ('active', 'expired')
+              AND p.expiry_date <= NOW() + ($1::BIGINT * INTERVAL '1 day')
+        ) candidates
+        ORDER BY candidates.expiry_date ASC
         "#,
     )
     .bind(days)

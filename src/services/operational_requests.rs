@@ -31,6 +31,7 @@ pub struct RequestListFilters {
     pub requester: Option<String>,
     pub date_from: Option<String>,
     pub date_to: Option<String>,
+    pub include_archived: Option<bool>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
 }
@@ -469,7 +470,8 @@ pub async fn list_requests(
         page_size: filters.page_size,
     };
     let (page, page_size, offset) = utils::resolve_pagination(pagination, 25, 100);
-    let elevated = utils::role_rank(actor_role).unwrap_or_default() >= 2;
+    let full_access = utils::role_rank(actor_role).unwrap_or_default() >= 3;
+    let include_archived = full_access && filters.include_archived.unwrap_or(false);
 
     let total = sqlx::query_scalar::<_, i64>(
         r#"SELECT COUNT(*) FROM operational_requests
@@ -481,16 +483,18 @@ pub async fn list_requests(
                  SELECT id FROM users WHERE full_name ILIKE $6 OR username ILIKE $6 OR email ILIKE $6
              ))
              AND ($7::date IS NULL OR created_at >= $7::date)
-             AND ($8::date IS NULL OR created_at < ($8::date + INTERVAL '1 day'))"#,
+             AND ($8::date IS NULL OR created_at < ($8::date + INTERVAL '1 day'))
+             AND ($9::boolean OR archived_at IS NULL)"#,
     )
     .bind(status.as_deref())
     .bind(request_type.as_deref())
-    .bind(elevated)
+    .bind(full_access)
     .bind(actor_id)
     .bind(priority.as_deref())
     .bind(requester.as_deref())
     .bind(date_from)
     .bind(date_to)
+    .bind(include_archived)
     .fetch_one(pool)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to count requests: {}", e)))?;
@@ -501,7 +505,8 @@ pub async fn list_requests(
                   o.resource_type, o.resource_id, o.subject, o.reason, o.details,
                   o.priority, o.client_site_id, o.shift_id, o.operational_event_key,
                   o.reviewer_id, o.reviewed_at, o.decision_reason,
-                  o.fulfilled_by, o.fulfilled_at, o.created_at, o.updated_at
+                  o.fulfilled_by, o.fulfilled_at, o.archived_by, o.archived_at,
+                  o.created_at, o.updated_at
            FROM operational_requests o
            JOIN users u ON u.id = o.requester_id
            WHERE ($1::text IS NULL OR o.status = $1)
@@ -513,19 +518,21 @@ pub async fn list_requests(
              ))
              AND ($7::date IS NULL OR o.created_at >= $7::date)
              AND ($8::date IS NULL OR o.created_at < ($8::date + INTERVAL '1 day'))
+             AND ($9::boolean OR o.archived_at IS NULL)
            ORDER BY
              CASE o.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
              o.created_at DESC
-           LIMIT $9 OFFSET $10"#,
+           LIMIT $10 OFFSET $11"#,
     )
     .bind(status.as_deref())
     .bind(request_type.as_deref())
-    .bind(elevated)
+    .bind(full_access)
     .bind(actor_id)
     .bind(priority.as_deref())
     .bind(requester.as_deref())
     .bind(date_from)
     .bind(date_to)
+    .bind(include_archived)
     .bind(page_size)
     .bind(offset)
     .fetch_all(pool)
@@ -552,7 +559,8 @@ pub async fn get_request(
                   o.resource_type, o.resource_id, o.subject, o.reason, o.details,
                   o.priority, o.client_site_id, o.shift_id, o.operational_event_key,
                   o.reviewer_id, o.reviewed_at, o.decision_reason,
-                  o.fulfilled_by, o.fulfilled_at, o.created_at, o.updated_at
+                  o.fulfilled_by, o.fulfilled_at, o.archived_by, o.archived_at,
+                  o.created_at, o.updated_at
            FROM operational_requests o
            JOIN users u ON u.id = o.requester_id
            WHERE o.id = $1"#,
@@ -563,7 +571,13 @@ pub async fn get_request(
     .map_err(|e| AppError::DatabaseError(format!("Failed to load request: {}", e)))?
     .ok_or_else(|| AppError::NotFound("Operational request not found".to_string()))?;
 
-    if utils::role_rank(actor_role).unwrap_or_default() < 2 && request.requester_id != actor_id {
+    let full_access = utils::role_rank(actor_role).unwrap_or_default() >= 3;
+    if request.archived_at.is_some() && !full_access {
+        return Err(AppError::NotFound(
+            "Operational request not found".to_string(),
+        ));
+    }
+    if !full_access && request.requester_id != actor_id {
         return Err(AppError::NotFound(
             "Operational request not found".to_string(),
         ));
@@ -579,19 +593,66 @@ pub async fn get_events(
 ) -> AppResult<Vec<OperationalRequestEvent>> {
     get_request(pool, actor_id, actor_role, request_id).await?;
 
-    sqlx::query_as::<_, OperationalRequestEvent>(
+    let full_access = utils::role_rank(actor_role).unwrap_or_default() >= 3;
+    let query = if full_access {
         r#"SELECT e.id, e.request_id, e.actor_user_id,
                   COALESCE(u.full_name, u.username) AS actor_name,
                   e.from_status, e.to_status, e.comment, e.metadata, e.created_at
            FROM operational_request_events e
            LEFT JOIN users u ON u.id = e.actor_user_id
            WHERE e.request_id = $1
-           ORDER BY e.created_at ASC"#,
+           ORDER BY e.created_at ASC"#
+    } else {
+        r#"SELECT e.id, e.request_id, e.actor_user_id,
+                  COALESCE(u.full_name, u.username) AS actor_name,
+                  e.from_status, e.to_status, e.comment, e.metadata, e.created_at
+           FROM operational_request_events e
+           LEFT JOIN users u ON u.id = e.actor_user_id
+           WHERE e.request_id = $1
+             AND e.to_status IN ('approved', 'needs_correction', 'rejected')
+           ORDER BY e.created_at ASC"#
+    };
+
+    sqlx::query_as::<_, OperationalRequestEvent>(query)
+        .bind(request_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to load request history: {}", e)))
+}
+
+pub async fn archive_request(
+    pool: &PgPool,
+    actor_id: &str,
+    actor_role: &str,
+    request_id: &str,
+) -> AppResult<OperationalRequest> {
+    if utils::role_rank(actor_role).unwrap_or_default() < 3 {
+        return Err(AppError::Forbidden(
+            "Only administrators can clear operational requests".to_string(),
+        ));
+    }
+
+    let result = sqlx::query(
+        r#"UPDATE operational_requests
+           SET archived_by = $1, archived_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+           WHERE id = $2
+             AND archived_at IS NULL
+             AND status IN ('approved', 'rejected', 'completed', 'cancelled')"#,
     )
+    .bind(actor_id)
     .bind(request_id)
-    .fetch_all(pool)
+    .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to load request history: {}", e)))
+    .map_err(|e| AppError::DatabaseError(format!("Failed to clear operational request: {}", e)))?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::Conflict(
+            "Only an uncleared approved, rejected, completed, or cancelled request can be cleared"
+                .to_string(),
+        ));
+    }
+
+    get_request(pool, actor_id, actor_role, request_id).await
 }
 
 pub async fn get_my_resources(

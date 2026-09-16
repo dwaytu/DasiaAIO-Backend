@@ -632,6 +632,8 @@ pub struct OperationalRequest {
     pub decision_reason: Option<String>,
     pub fulfilled_by: Option<String>,
     pub fulfilled_at: Option<DateTime<Utc>>,
+    pub archived_by: Option<String>,
+    pub archived_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
