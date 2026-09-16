@@ -624,6 +624,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             title VARCHAR(255) NOT NULL,
             description TEXT NOT NULL,
             location VARCHAR(255) NOT NULL,
+            site_name VARCHAR(255),
             reported_by VARCHAR(36) NOT NULL,
             status VARCHAR(32) NOT NULL DEFAULT 'open',
             priority VARCHAR(32) NOT NULL DEFAULT 'medium',
@@ -638,6 +639,13 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .execute(pool)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create incidents table: {}", e)))?;
+
+    sqlx::query("ALTER TABLE incidents ADD COLUMN IF NOT EXISTS site_name VARCHAR(255)")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to add incident site name column: {}", e))
+        })?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_incidents_status_priority_created ON incidents (status, priority, created_at DESC)"
@@ -828,7 +836,6 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         ("superadmin", "view_support_tickets"),
         ("superadmin", "create_support_ticket"),
         ("superadmin", "manage_notifications"),
-        ("superadmin", "create_operational_request"),
         ("superadmin", "view_operational_requests"),
         ("superadmin", "review_operational_requests"),
         ("superadmin", "fulfill_operational_requests"),
@@ -850,7 +857,6 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         ("admin", "view_support_tickets"),
         ("admin", "create_support_ticket"),
         ("admin", "manage_notifications"),
-        ("admin", "create_operational_request"),
         ("admin", "view_operational_requests"),
         ("admin", "review_operational_requests"),
         ("admin", "fulfill_operational_requests"),
@@ -873,7 +879,6 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         ("supervisor", "manage_notifications"),
         ("supervisor", "create_operational_request"),
         ("supervisor", "view_operational_requests"),
-        ("supervisor", "review_operational_requests"),
         ("supervisor", "view_merit"),
         ("supervisor", "manage_merit"),
         // guard
@@ -896,6 +901,41 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to seed role permissions: {}", e)))?;
     }
+
+    // Keep the request workflow aligned for databases created before role separation.
+    sqlx::query(
+        r#"DELETE FROM role_permissions rp
+           USING roles r, permissions p
+           WHERE rp.role_id = r.id
+             AND rp.permission_id = p.id
+             AND p.permission_key = 'create_operational_request'
+             AND r.role_key IN ('admin', 'superadmin')"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to remove elevated request creation permission: {}",
+            e
+        ))
+    })?;
+
+    sqlx::query(
+        r#"DELETE FROM role_permissions rp
+           USING roles r, permissions p
+           WHERE rp.role_id = r.id
+             AND rp.permission_id = p.id
+             AND p.permission_key = 'review_operational_requests'
+             AND r.role_key = 'supervisor'"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to remove supervisor request review permission: {}",
+            e
+        ))
+    })?;
 
     // Create verifications table
     sqlx::query(

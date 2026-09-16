@@ -326,7 +326,7 @@ async fn notify_reviewers(
 ) -> AppResult<()> {
     let reviewer_ids = sqlx::query_scalar::<_, String>(
         r#"SELECT id FROM users
-           WHERE LOWER(BTRIM(role)) IN ('supervisor', 'admin', 'superadmin')
+           WHERE LOWER(BTRIM(role)) IN ('admin', 'superadmin')
              AND id <> $1
              AND COALESCE(approval_status, 'approved') = 'approved'
              AND COALESCE(status, 'active') = 'active'"#,
@@ -356,6 +356,15 @@ pub async fn create_request(
     requester_role: &str,
     payload: CreateOperationalRequest,
 ) -> AppResult<OperationalRequest> {
+    if !matches!(
+        utils::normalize_role(requester_role).as_str(),
+        "guard" | "supervisor"
+    ) {
+        return Err(AppError::Forbidden(
+            "Only guards and supervisors can submit operational requests".to_string(),
+        ));
+    }
+
     let ValidatedCreation {
         request_type,
         priority,
@@ -669,9 +678,9 @@ async fn transition_request(
     let subject: String = row.get("subject");
 
     let to_status = match action {
-        "approve" if role_rank >= 2 && from_status == "pending" => "approved",
-        "reject" if role_rank >= 2 && from_status == "pending" => "rejected",
-        "return_for_correction" if role_rank >= 2 && from_status == "pending" => "needs_correction",
+        "approve" if role_rank >= 3 && from_status == "pending" => "approved",
+        "reject" if role_rank >= 3 && from_status == "pending" => "rejected",
+        "return_for_correction" if role_rank >= 3 && from_status == "pending" => "needs_correction",
         "start" if role_rank >= 3 && from_status == "approved" => "in_progress",
         "complete"
             if role_rank >= 3 && matches!(from_status.as_str(), "approved" | "in_progress") =>
@@ -902,6 +911,15 @@ pub async fn resubmit_request(
     request_id: &str,
     payload: ResubmitOperationalRequest,
 ) -> AppResult<OperationalRequest> {
+    if !matches!(
+        utils::normalize_role(actor_role).as_str(),
+        "guard" | "supervisor"
+    ) {
+        return Err(AppError::Forbidden(
+            "Only guards and supervisors can resubmit operational requests".to_string(),
+        ));
+    }
+
     let subject = required_text(&payload.subject, "Subject", 255)?;
     let reason = required_text(&payload.reason, "Reason", 2_000)?;
     let details = optional_text(payload.details.as_deref(), "Details", 4_000)?;

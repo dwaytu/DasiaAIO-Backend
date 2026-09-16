@@ -484,6 +484,7 @@ pub struct Incident {
     pub title: String,
     pub description: String,
     pub location: String,
+    pub site_name: Option<String>,
     pub reported_by: String,
     pub reported_by_name: Option<String>,
     pub status: String,
@@ -498,6 +499,7 @@ pub struct CreateIncidentRequest {
     pub title: String,
     pub description: String,
     pub location: String,
+    pub site_name: Option<String>,
     pub priority: String,
 }
 

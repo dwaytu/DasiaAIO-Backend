@@ -264,7 +264,6 @@ pub fn role_permissions(role: &str) -> &'static [&'static str] {
             "view_support_tickets",
             "create_support_ticket",
             "manage_notifications",
-            "create_operational_request",
             "view_operational_requests",
             "review_operational_requests",
             "fulfill_operational_requests",
@@ -288,7 +287,6 @@ pub fn role_permissions(role: &str) -> &'static [&'static str] {
             "view_support_tickets",
             "create_support_ticket",
             "manage_notifications",
-            "create_operational_request",
             "view_operational_requests",
             "review_operational_requests",
             "fulfill_operational_requests",
@@ -312,7 +310,6 @@ pub fn role_permissions(role: &str) -> &'static [&'static str] {
             "manage_notifications",
             "create_operational_request",
             "view_operational_requests",
-            "review_operational_requests",
             "view_merit",
             "manage_merit",
         ],
@@ -529,8 +526,9 @@ pub async fn send_confirmation_email(api_key: &str, to_email: &str, code: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        can_manage_role, extract_requester_with_proxy_trust, normalize_authenticated_role,
-        verify_refresh_token, verify_token, RefreshTokenClaims, TokenClaims,
+        can_manage_role, extract_requester_with_proxy_trust, has_permission,
+        normalize_authenticated_role, verify_refresh_token, verify_token, RefreshTokenClaims,
+        TokenClaims,
     };
     use crate::error::AppError;
     use axum::http::{HeaderMap, HeaderValue};
@@ -661,6 +659,18 @@ mod tests {
         assert!(!can_manage_role("supervisor", " SUPERVISOR "));
         assert!(!can_manage_role("unknown", "guard"));
         assert!(!can_manage_role("superadmin", "unknown"));
+    }
+
+    #[test]
+    fn operational_request_permissions_follow_requester_and_reviewer_roles() {
+        assert!(has_permission("guard", "create_operational_request"));
+        assert!(has_permission("supervisor", "create_operational_request"));
+        assert!(!has_permission("admin", "create_operational_request"));
+        assert!(!has_permission("superadmin", "create_operational_request"));
+
+        assert!(!has_permission("supervisor", "review_operational_requests"));
+        assert!(has_permission("admin", "review_operational_requests"));
+        assert!(has_permission("superadmin", "review_operational_requests"));
     }
 
     #[test]

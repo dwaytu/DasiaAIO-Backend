@@ -1059,7 +1059,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/operational-requests/:id/resubmit",
             post(handlers::operational_requests::resubmit_request)
                 .route_layer(axum_middleware::from_fn(
-                    middleware::authz::require_authenticated,
+                    middleware::authz::require_operational_request_creation,
                 ))
                 .route_layer(axum_middleware::from_fn_with_state(
                     db.clone(),

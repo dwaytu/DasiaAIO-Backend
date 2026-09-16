@@ -51,17 +51,24 @@ pub async fn create_incident(
     }
 
     let priority = normalize_priority(&payload.priority)?;
+    let site_name = payload
+        .site_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let incident_id = utils::generate_id();
 
     sqlx::query(
         r#"INSERT INTO incidents (
-               id, title, description, location, reported_by, status, priority
-           ) VALUES ($1, $2, $3, $4, $5, 'open', $6)"#,
+               id, title, description, location, site_name, reported_by, status, priority
+           ) VALUES ($1, $2, $3, $4, $5, $6, 'open', $7)"#,
     )
     .bind(&incident_id)
     .bind(payload.title.trim())
     .bind(payload.description.trim())
     .bind(payload.location.trim())
+    .bind(site_name)
     .bind(&claims.sub)
     .bind(priority)
     .execute(db.as_ref())
@@ -104,6 +111,7 @@ pub async fn get_incidents(
                    i.title,
                    i.description,
                    i.location,
+                   i.site_name,
                    i.reported_by,
                    COALESCE(NULLIF(u.full_name, ''), u.username) AS reported_by_name,
                    i.status,
@@ -138,6 +146,7 @@ pub async fn get_incidents(
                    i.title,
                    i.description,
                    i.location,
+                   i.site_name,
                    i.reported_by,
                    COALESCE(NULLIF(u.full_name, ''), u.username) AS reported_by_name,
                    i.status,
@@ -194,6 +203,7 @@ pub async fn get_active_incidents(
                                i.title,
                                i.description,
                                i.location,
+                               i.site_name,
                                i.reported_by,
                                COALESCE(NULLIF(u.full_name, ''), u.username) AS reported_by_name,
                                i.status,
@@ -238,6 +248,7 @@ pub async fn get_active_incidents(
                                i.title,
                                i.description,
                                i.location,
+                               i.site_name,
                                i.reported_by,
                                COALESCE(NULLIF(u.full_name, ''), u.username) AS reported_by_name,
                                i.status,
