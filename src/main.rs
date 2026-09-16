@@ -1773,6 +1773,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
         )
         .route(
+            "/api/mdr/export",
+            get(handlers::mdr::export_current_resources).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_mdr_management,
+            )),
+        )
+        .route(
+            "/api/mdr/resources",
+            delete(handlers::mdr::clear_current_resources)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_mdr_management,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
             "/api/mdr/batches",
             get(handlers::mdr::get_batches).route_layer(axum_middleware::from_fn(
                 middleware::authz::require_mdr_management,

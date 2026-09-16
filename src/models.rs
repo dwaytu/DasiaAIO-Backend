@@ -54,6 +54,7 @@ pub struct User {
     pub role: String,
     pub full_name: String,
     pub phone_number: String,
+    pub guard_number: Option<i32>,
     pub license_number: Option<String>,
     pub license_issued_date: Option<DateTime<Utc>>,
     pub license_expiry_date: Option<DateTime<Utc>>,
@@ -74,6 +75,7 @@ pub struct UserResponse {
     pub role: String,
     pub full_name: String,
     pub phone_number: String,
+    pub guard_number: Option<i32>,
     pub profile_photo: Option<String>,
     pub last_seen_at: Option<DateTime<Utc>>,
 }
@@ -87,6 +89,7 @@ impl From<User> for UserResponse {
             role: user.role,
             full_name: user.full_name,
             phone_number: user.phone_number,
+            guard_number: user.guard_number,
             profile_photo: user.profile_photo,
             last_seen_at: user.last_seen_at,
         }

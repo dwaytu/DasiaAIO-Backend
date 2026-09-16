@@ -1,6 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use crate::{
     error::{AppError, AppResult},
     models::{MdrImportBatch, MdrStagingRow},
-    services::mdr_import_service,
+    services::{mdr_import_service, mdr_resource_service},
     utils,
 };
 
@@ -207,6 +208,78 @@ pub async fn import_mdr(
             "ambiguous": summary.ambiguous,
             "errors": summary.errors,
             "pending": 0,
+        }
+    })))
+}
+
+/// GET /api/mdr/export
+pub async fn export_current_resources(
+    State(pool): State<Arc<PgPool>>,
+    headers: axum::http::HeaderMap,
+) -> AppResult<axum::response::Response> {
+    let claims = utils::require_min_role(&headers, "admin")?;
+    let export = mdr_resource_service::export_current_resources(pool.as_ref()).await?;
+
+    insert_mdr_audit_event(
+        pool.as_ref(),
+        Some(&claims.sub),
+        "mdr.resources.export",
+        "mdr_resources",
+        "current",
+        "success",
+        None,
+        json!({
+            "guards": export.counts.guards,
+            "firearms": export.counts.firearms,
+            "vehicles": export.counts.vehicles,
+        }),
+    )
+    .await;
+
+    Ok((
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"sentinel-mdr-resources.csv\"",
+            ),
+        ],
+        export.csv,
+    )
+        .into_response())
+}
+
+/// DELETE /api/mdr/resources
+pub async fn clear_current_resources(
+    State(pool): State<Arc<PgPool>>,
+    headers: axum::http::HeaderMap,
+) -> AppResult<Json<serde_json::Value>> {
+    let claims = utils::require_min_role(&headers, "admin")?;
+    let counts = mdr_resource_service::clear_current_resources(pool.as_ref()).await?;
+
+    insert_mdr_audit_event(
+        pool.as_ref(),
+        Some(&claims.sub),
+        "mdr.resources.clear",
+        "mdr_resources",
+        "current",
+        "success",
+        Some("Admin or superadmin cleared all guard, firearm, and vehicle records."),
+        json!({
+            "guards": counts.guards,
+            "firearms": counts.firearms,
+            "vehicles": counts.vehicles,
+        }),
+    )
+    .await;
+
+    Ok(Json(json!({
+        "status": "cleared",
+        "deleted": {
+            "guards": counts.guards,
+            "firearms": counts.firearms,
+            "vehicles": counts.vehicles,
         }
     })))
 }
