@@ -92,6 +92,7 @@ pub struct ResolveRequest {
     pub matched_guard_id: Option<String>,
     pub matched_firearm_id: Option<String>,
     pub matched_client_id: Option<String>,
+    pub resolution_note: Option<String>,
 }
 
 /// POST /api/mdr/import
@@ -129,6 +130,15 @@ pub async fn import_mdr(
 
     for row in &all_rows {
         let row_id = utils::generate_id();
+        let initial_match_status = if row
+            .section
+            .as_deref()
+            .is_some_and(|section| section.trim().eq_ignore_ascii_case("armored"))
+        {
+            "ignored"
+        } else {
+            "pending"
+        };
         sqlx::query(
             r#"INSERT INTO mdr_staging_rows (
                 id, batch_id, sheet_name, row_number, section,
@@ -145,7 +155,7 @@ pub async fn import_mdr(
                 $12, $13,
                 $14, $15, $16, $17, $18,
                 $19, $20, $21,
-                $22, $23, 'pending'
+                $22, $23, $24
             )"#,
         )
         .bind(&row_id)
@@ -171,6 +181,7 @@ pub async fn import_mdr(
         .bind(&row.lic_reg_name)
         .bind(&row.pullout_status)
         .bind(&row.fa_remarks)
+        .bind(initial_match_status)
         .execute(pool.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to insert staging row: {}", e)))?;
@@ -393,27 +404,84 @@ pub async fn resolve_staging_row(
     Path(id): Path<String>,
     Json(body): Json<ResolveRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    if !matches!(body.match_status.as_str(), "matched" | "new") {
+    if !matches!(body.match_status.as_str(), "matched" | "new" | "ignored") {
         return Err(AppError::BadRequest(
-            "match_status must be 'matched' or 'new'".to_string(),
+            "match_status must be 'matched', 'new', or 'ignored'".to_string(),
         ));
     }
 
-    let updated_batch_id = sqlx::query_scalar::<_, String>(
-        "UPDATE mdr_staging_rows SET match_status = $1, matched_guard_id = $2, matched_firearm_id = $3, matched_client_id = $4 WHERE id = $5 RETURNING batch_id",
+    let resolution_note = body
+        .resolution_note
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty())
+        .map(str::to_string);
+
+    if resolution_note
+        .as_deref()
+        .is_some_and(|note| note.len() > 500)
+    {
+        return Err(AppError::BadRequest(
+            "resolution_note must be 500 characters or fewer".to_string(),
+        ));
+    }
+
+    let row_context = sqlx::query_as::<_, (String, String, Option<serde_json::Value>)>(
+        "SELECT batch_id, match_status, validation_errors FROM mdr_staging_rows WHERE id = $1",
     )
-    .bind(&body.match_status)
-    .bind(&body.matched_guard_id)
-    .bind(&body.matched_firearm_id)
-    .bind(&body.matched_client_id)
     .bind(&id)
     .fetch_optional(pool.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-    let Some(batch_id) = updated_batch_id else {
+    let Some((batch_id, previous_status, validation_errors)) = row_context else {
         return Err(AppError::NotFound("Staging row not found".to_string()));
     };
+
+    let batch_status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM mdr_import_batches WHERE id = $1")
+            .bind(&batch_id)
+            .fetch_optional(pool.as_ref())
+            .await
+            .map_err(|e| AppError::DatabaseError(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("MDR batch not found".to_string()))?;
+
+    if !matches!(batch_status.as_str(), "staging" | "reviewing") {
+        return Err(AppError::BadRequest(
+            "Only staging or reviewing batches can be resolved".to_string(),
+        ));
+    }
+
+    if previous_status == "error" && resolution_note.is_none() {
+        return Err(AppError::BadRequest(
+            "A resolution note is required when resolving an error row".to_string(),
+        ));
+    }
+
+    let (matched_guard_id, matched_firearm_id, matched_client_id, next_errors) =
+        if body.match_status == "ignored" {
+            (None, None, None, validation_errors)
+        } else {
+            (
+                body.matched_guard_id.clone(),
+                body.matched_firearm_id.clone(),
+                body.matched_client_id.clone(),
+                None,
+            )
+        };
+
+    sqlx::query(
+        "UPDATE mdr_staging_rows SET match_status = $1, matched_guard_id = $2, matched_firearm_id = $3, matched_client_id = $4, validation_errors = $5 WHERE id = $6",
+    )
+    .bind(&body.match_status)
+    .bind(&matched_guard_id)
+    .bind(&matched_firearm_id)
+    .bind(&matched_client_id)
+    .bind(&next_errors)
+    .bind(&id)
+    .execute(pool.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
     mdr_import_service::refresh_batch_statistics(pool.as_ref(), &batch_id).await?;
 
@@ -428,13 +496,14 @@ pub async fn resolve_staging_row(
         "mdr_staging_row",
         &id,
         "success",
-        None,
+        resolution_note.as_deref(),
         json!({
             "batchId": batch_id,
+            "previousStatus": previous_status,
             "matchStatus": body.match_status,
-            "matchedGuardId": body.matched_guard_id,
-            "matchedFirearmId": body.matched_firearm_id,
-            "matchedClientId": body.matched_client_id,
+            "matchedGuardId": matched_guard_id,
+            "matchedFirearmId": matched_firearm_id,
+            "matchedClientId": matched_client_id,
         }),
     )
     .await;

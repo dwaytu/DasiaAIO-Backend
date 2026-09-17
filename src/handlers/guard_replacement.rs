@@ -3,6 +3,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
+use serde::Deserialize;
 use serde_json::json;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         Attendance, CheckInRequest, CheckOutRequest, CreateShiftRequest, RequestReplacementRequest,
-        SetAvailabilityRequest, Shift,
+        SetAvailabilityRequest, SetShiftReadinessRequest, Shift,
     },
     utils,
 };
@@ -49,6 +50,31 @@ fn is_approved_guard(role: &str, verified: bool, approval_status: &str) -> bool 
     utils::normalize_role(role) == "guard"
         && verified
         && approval_status.trim().eq_ignore_ascii_case("approved")
+}
+
+const READINESS_ITEMS: [&str; 3] = ["uniform", "firearm", "endorsement_form"];
+
+fn normalize_readiness_items(items: &[String]) -> AppResult<Vec<String>> {
+    let mut normalized = Vec::with_capacity(items.len());
+
+    for item in items {
+        let key = item.trim().to_ascii_lowercase();
+        if !READINESS_ITEMS.contains(&key.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "Unknown readiness item '{}'.",
+                item
+            )));
+        }
+        if normalized.iter().any(|existing| existing == &key) {
+            return Err(AppError::BadRequest(format!(
+                "Readiness item '{}' was submitted more than once.",
+                item
+            )));
+        }
+        normalized.push(key);
+    }
+
+    Ok(normalized)
 }
 
 async fn require_approved_guard(db: &PgPool, guard_id: &str) -> AppResult<()> {
@@ -151,26 +177,24 @@ pub async fn create_shift(
     ))
 }
 
-pub async fn check_in(
-    State(db): State<Arc<PgPool>>,
-    headers: HeaderMap,
-    Json(payload): Json<CheckInRequest>,
-) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
-    if payload.guard_id.is_empty() || payload.shift_id.is_empty() {
-        return Err(AppError::BadRequest(
-            "Guard ID and Shift ID are required".to_string(),
-        ));
-    }
+pub(crate) struct CheckInResult {
+    pub attendance_id: String,
+    pub already_recorded: bool,
+}
 
-    let _claims = utils::require_self_or_min_role(&headers, &payload.guard_id, "supervisor")?;
-
+pub(crate) async fn record_check_in(
+    db: &PgPool,
+    guard_id: &str,
+    shift_id: &str,
+    source: &str,
+) -> AppResult<CheckInResult> {
     let mut tx = db
         .begin()
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to start check-in: {}", e)))?;
 
     let shift_guard = sqlx::query("SELECT guard_id FROM shifts WHERE id = $1 FOR UPDATE")
-        .bind(&payload.shift_id)
+        .bind(shift_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
@@ -180,7 +204,7 @@ pub async fn check_in(
         .try_get("guard_id")
         .map_err(|e| AppError::DatabaseError(format!("Failed to parse shift guard: {}", e)))?;
 
-    if assigned_guard_id != payload.guard_id {
+    if assigned_guard_id != guard_id {
         return Err(AppError::Forbidden(
             "Guard can only check in for their assigned shift".to_string(),
         ));
@@ -192,7 +216,7 @@ pub async fn check_in(
          ORDER BY check_in_time ASC, created_at ASC \
          LIMIT 1",
     )
-    .bind(&payload.shift_id)
+    .bind(shift_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to check attendance: {}", e)))?;
@@ -205,7 +229,7 @@ pub async fn check_in(
             AppError::DatabaseError(format!("Failed to parse attendance guard: {}", e))
         })?;
 
-        if attendance_guard_id != payload.guard_id {
+        if attendance_guard_id != guard_id {
             return Err(AppError::Conflict(
                 "Shift already has attendance recorded for a different guard".to_string(),
             ));
@@ -215,23 +239,21 @@ pub async fn check_in(
             .await
             .map_err(|e| AppError::DatabaseError(format!("Failed to complete check-in: {}", e)))?;
 
-        return Ok((
-            StatusCode::OK,
-            Json(json!({
-                "message": "Check-in already recorded",
-                "attendanceId": attendance_id
-            })),
-        ));
+        return Ok(CheckInResult {
+            attendance_id,
+            already_recorded: true,
+        });
     }
 
     let attendance_id = utils::generate_id();
 
     sqlx::query(
-        "INSERT INTO attendance (id, guard_id, shift_id, check_in_time, status) VALUES ($1, $2, $3, CURRENT_TIMESTAMP, 'checked_in')"
+        "INSERT INTO attendance (id, guard_id, shift_id, check_in_time, status, check_in_source) VALUES ($1, $2, $3, CURRENT_TIMESTAMP, 'checked_in', $4)"
     )
     .bind(&attendance_id)
-    .bind(&payload.guard_id)
-    .bind(&payload.shift_id)
+    .bind(guard_id)
+    .bind(shift_id)
+    .bind(source)
     .execute(&mut *tx)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to record check-in: {}", e)))?;
@@ -251,8 +273,8 @@ pub async fn check_in(
          WHERE s.id = $3"
     )
     .bind(&punctuality_id)
-    .bind(&payload.guard_id)
-    .bind(&payload.shift_id)
+    .bind(guard_id)
+    .bind(shift_id)
     .execute(&mut *tx)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to record punctuality: {}", e)))?;
@@ -261,11 +283,36 @@ pub async fn check_in(
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to complete check-in: {}", e)))?;
 
+    Ok(CheckInResult {
+        attendance_id,
+        already_recorded: false,
+    })
+}
+
+pub async fn check_in(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Json(payload): Json<CheckInRequest>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    if payload.guard_id.is_empty() || payload.shift_id.is_empty() {
+        return Err(AppError::BadRequest(
+            "Guard ID and Shift ID are required".to_string(),
+        ));
+    }
+
+    let _claims = utils::require_self_or_min_role(&headers, &payload.guard_id, "supervisor")?;
+    let result =
+        record_check_in(db.as_ref(), &payload.guard_id, &payload.shift_id, "manual").await?;
+
     Ok((
-        StatusCode::CREATED,
+        if result.already_recorded {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
         Json(json!({
-            "message": "Check-in recorded successfully",
-            "attendanceId": attendance_id
+            "message": if result.already_recorded { "Check-in already recorded" } else { "Check-in recorded successfully" },
+            "attendanceId": result.attendance_id
         })),
     ))
 }
@@ -564,13 +611,35 @@ pub async fn set_availability(
 
     let _claims = utils::require_self_or_min_role(&headers, &payload.guard_id, "supervisor")?;
 
-    // Check if guard exists
-    sqlx::query("SELECT id FROM users WHERE id = $1")
+    // Availability is a guard status. Supervisors can update it for operations,
+    // but the target account must still be a guard.
+    let guard_role = sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = $1")
         .bind(&payload.guard_id)
         .fetch_optional(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("Guard not found".to_string()))?;
+
+    if utils::normalize_role(&guard_role) != "guard" {
+        return Err(AppError::BadRequest(
+            "Availability can only be set for guard accounts".to_string(),
+        ));
+    }
+
+    if let (Some(from), Some(to)) = (payload.available_from, payload.available_to) {
+        if to <= from {
+            return Err(AppError::BadRequest(
+                "availableTo must be later than availableFrom".to_string(),
+            ));
+        }
+    }
+
+    let available = payload.available.unwrap_or(true);
+    let notes = payload
+        .notes
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
     // Check if availability record exists
     let existing = sqlx::query(
@@ -585,10 +654,14 @@ pub async fn set_availability(
         // Update existing record
         sqlx::query(
             "UPDATE guard_availability 
-             SET available = $1, updated_at = CURRENT_TIMESTAMP 
-             WHERE guard_id = $2",
+             SET available = $1, available_from = $2, available_to = $3, notes = $4,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE guard_id = $5",
         )
-        .bind(payload.available.unwrap_or(true))
+        .bind(available)
+        .bind(payload.available_from)
+        .bind(payload.available_to)
+        .bind(notes)
         .bind(&payload.guard_id)
         .execute(db.as_ref())
         .await
@@ -596,15 +669,20 @@ pub async fn set_availability(
     } else {
         // Create new record
         let id = utils::generate_id();
-        sqlx::query("INSERT INTO guard_availability (id, guard_id, available) VALUES ($1, $2, $3)")
-            .bind(&id)
-            .bind(&payload.guard_id)
-            .bind(payload.available.unwrap_or(true))
-            .execute(db.as_ref())
-            .await
-            .map_err(|e| {
-                AppError::DatabaseError(format!("Failed to create availability: {}", e))
-            })?;
+        sqlx::query(
+            "INSERT INTO guard_availability
+             (id, guard_id, available, available_from, available_to, notes)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&id)
+        .bind(&payload.guard_id)
+        .bind(available)
+        .bind(payload.available_from)
+        .bind(payload.available_to)
+        .bind(notes)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to create availability: {}", e)))?;
     }
 
     Ok(Json(json!({
@@ -718,8 +796,11 @@ pub async fn accept_replacement(
 // Get guard availability
 pub async fn get_guard_availability(
     State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
     Path(guard_id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _claims = utils::require_self_or_min_role(&headers, &guard_id, "supervisor")?;
+
     let availability = sqlx::query(
         "SELECT id, guard_id, available, available_from, available_to, notes, created_at, updated_at 
          FROM guard_availability 
@@ -748,6 +829,155 @@ pub async fn get_guard_availability(
             "notes": null
         })))
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadinessQuery {
+    pub shift_id: String,
+}
+
+async fn verify_guard_shift(db: &PgPool, guard_id: &str, shift_id: &str) -> AppResult<()> {
+    let guard_role = sqlx::query_scalar::<_, String>(
+        "SELECT u.role
+         FROM shifts s
+         JOIN users u ON u.id = s.guard_id
+         WHERE s.id = $1 AND s.guard_id = $2",
+    )
+    .bind(shift_id)
+    .bind(guard_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to verify assigned shift: {}", e)))?
+    .ok_or_else(|| AppError::NotFound("Assigned shift not found".to_string()))?;
+
+    if utils::normalize_role(&guard_role) != "guard" {
+        return Err(AppError::BadRequest(
+            "Readiness can only be recorded for guard shifts".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+pub async fn get_guard_shift_readiness(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Path(guard_id): Path<String>,
+    Query(query): Query<ReadinessQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    if guard_id.is_empty() || query.shift_id.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Guard ID and shift ID are required".to_string(),
+        ));
+    }
+
+    let _claims = utils::require_self_or_min_role(&headers, &guard_id, "supervisor")?;
+    verify_guard_shift(db.as_ref(), &guard_id, &query.shift_id).await?;
+
+    let row = sqlx::query(
+        "SELECT checked_items, notes, updated_at
+         FROM guard_shift_readiness
+         WHERE guard_id = $1 AND shift_id = $2
+         LIMIT 1",
+    )
+    .bind(&guard_id)
+    .bind(&query.shift_id)
+    .fetch_optional(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to load shift readiness: {}", e)))?;
+
+    let (checked_items, notes, updated_at) = match row {
+        Some(row) => {
+            let value = row
+                .try_get::<serde_json::Value, _>("checked_items")
+                .map_err(|e| {
+                    AppError::DatabaseError(format!("Failed to parse readiness items: {}", e))
+                })?;
+            let items = serde_json::from_value::<Vec<String>>(value).map_err(|e| {
+                AppError::DatabaseError(format!("Failed to decode readiness items: {}", e))
+            })?;
+            let notes = row.try_get::<Option<String>, _>("notes").map_err(|e| {
+                AppError::DatabaseError(format!("Failed to parse readiness notes: {}", e))
+            })?;
+            let updated_at = row
+                .try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+                .map_err(|e| {
+                    AppError::DatabaseError(format!("Failed to parse readiness timestamp: {}", e))
+                })?;
+            (items, notes, Some(updated_at))
+        }
+        None => (Vec::new(), None, None),
+    };
+    let ready = checked_items.len() == READINESS_ITEMS.len();
+
+    Ok(Json(json!({
+        "shiftId": query.shift_id,
+        "guardId": guard_id,
+        "checkedItems": checked_items,
+        "ready": ready,
+        "notes": notes,
+        "updatedAt": updated_at,
+        "requiredItems": READINESS_ITEMS,
+    })))
+}
+
+pub async fn set_guard_shift_readiness(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Json(payload): Json<SetShiftReadinessRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    if payload.guard_id.trim().is_empty() || payload.shift_id.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Guard ID and shift ID are required".to_string(),
+        ));
+    }
+
+    let _claims = utils::require_self_or_min_role(&headers, &payload.guard_id, "supervisor")?;
+    let checked_items = normalize_readiness_items(&payload.checked_items)?;
+    verify_guard_shift(db.as_ref(), &payload.guard_id, &payload.shift_id).await?;
+
+    let notes = payload
+        .notes
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if notes.is_some_and(|value| value.chars().count() > 1000) {
+        return Err(AppError::BadRequest(
+            "Readiness notes cannot exceed 1000 characters".to_string(),
+        ));
+    }
+
+    let checked_items_json = serde_json::to_value(&checked_items).map_err(|e| {
+        AppError::InternalServerError(format!("Failed to encode readiness items: {}", e))
+    })?;
+
+    sqlx::query(
+        "INSERT INTO guard_shift_readiness
+         (id, shift_id, guard_id, checked_items, notes)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (shift_id, guard_id)
+         DO UPDATE SET checked_items = EXCLUDED.checked_items,
+                       notes = EXCLUDED.notes,
+                       updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(utils::generate_id())
+    .bind(&payload.shift_id)
+    .bind(&payload.guard_id)
+    .bind(checked_items_json)
+    .bind(notes)
+    .execute(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to save shift readiness: {}", e)))?;
+    let ready = checked_items.len() == READINESS_ITEMS.len();
+
+    Ok(Json(json!({
+        "message": "Shift readiness saved successfully",
+        "shiftId": payload.shift_id,
+        "guardId": payload.guard_id,
+        "checkedItems": checked_items,
+        "ready": ready,
+    })))
 }
 
 pub async fn get_guard_shifts(
@@ -825,6 +1055,10 @@ pub async fn get_all_shifts(
         end_time: chrono::DateTime<chrono::Utc>,
         client_site: String,
         status: String,
+        availability_available: Option<bool>,
+        availability_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+        readiness_ready: Option<bool>,
+        readiness_updated_at: Option<chrono::DateTime<chrono::Utc>>,
         created_at: chrono::DateTime<chrono::Utc>,
         updated_at: chrono::DateTime<chrono::Utc>,
     }
@@ -835,10 +1069,26 @@ pub async fn get_all_shifts(
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
     let shifts = sqlx::query_as::<_, ShiftWithGuard>(
-        "SELECT s.id, s.guard_id, u.full_name as guard_name, u.username as guard_username, 
-         s.start_time, s.end_time, s.client_site, s.status, s.created_at, s.updated_at 
-         FROM shifts s 
-         JOIN users u ON s.guard_id = u.id 
+        "SELECT s.id, s.guard_id, u.full_name as guard_name, u.username as guard_username,
+         s.start_time, s.end_time, s.client_site, s.status,
+         ga.available AS availability_available,
+         ga.updated_at AS availability_updated_at,
+         CASE WHEN gsr.checked_items IS NULL THEN NULL
+              WHEN jsonb_typeof(gsr.checked_items) <> 'array' THEN false
+              ELSE jsonb_array_length(gsr.checked_items) = 3 END AS readiness_ready,
+         gsr.updated_at AS readiness_updated_at,
+         s.created_at, s.updated_at
+         FROM shifts s
+         JOIN users u ON s.guard_id = u.id
+         LEFT JOIN LATERAL (
+             SELECT available, updated_at
+             FROM guard_availability
+             WHERE guard_id = s.guard_id
+             ORDER BY updated_at DESC
+             LIMIT 1
+         ) ga ON true
+         LEFT JOIN guard_shift_readiness gsr
+           ON gsr.shift_id = s.id AND gsr.guard_id = s.guard_id
          ORDER BY s.start_time DESC
          LIMIT $1 OFFSET $2",
     )
@@ -962,7 +1212,7 @@ pub async fn delete_shift(
 
 #[cfg(test)]
 mod tests {
-    use super::is_approved_guard;
+    use super::{is_approved_guard, normalize_readiness_items};
 
     #[test]
     fn approved_guard_check_rejects_wrong_role_or_status() {
@@ -971,5 +1221,20 @@ mod tests {
         assert!(!is_approved_guard("admin", true, "approved"));
         assert!(!is_approved_guard("guard", false, "approved"));
         assert!(!is_approved_guard("guard", true, "pending"));
+    }
+
+    #[test]
+    fn readiness_items_are_whitelisted_and_deduplicated() {
+        let valid = vec!["uniform".to_string(), " ENDORSEMENT_FORM ".to_string()];
+        assert_eq!(
+            normalize_readiness_items(&valid).expect("valid readiness items"),
+            vec!["uniform", "endorsement_form"]
+        );
+
+        let unknown = vec!["keys".to_string()];
+        assert!(normalize_readiness_items(&unknown).is_err());
+
+        let duplicate = vec!["uniform".to_string(), "UNIFORM".to_string()];
+        assert!(normalize_readiness_items(&duplicate).is_err());
     }
 }

@@ -11,8 +11,8 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         ArmoredCar, AssignDriverRequest, CarAllocation, CarMaintenance, CreateArmoredCarRequest,
-        CreateMaintenanceRequest, CreateTripRequest, DriverAssignment, EndTripRequest,
-        IssueCarRequest, ReturnCarRequest, Trip, UpdateArmoredCarRequest,
+        CreateMaintenanceRequest, CreateTripRequest, EndTripRequest, IssueCarRequest,
+        ReturnCarRequest, Trip, UpdateArmoredCarRequest,
     },
     utils,
 };
@@ -40,24 +40,43 @@ pub async fn add_armored_car(
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
-    if payload.license_plate.is_empty() || payload.vin.is_empty() || payload.model.is_empty() {
-        return Err(AppError::BadRequest(
-            "License plate, VIN, and model are required".to_string(),
-        ));
+    let ac_number = payload.license_plate.trim();
+    if ac_number.is_empty() {
+        return Err(AppError::BadRequest("A/C number is required".to_string()));
     }
 
     let id = utils::generate_id();
+    // The legacy table still requires these columns, but they are no longer
+    // part of the vehicle workflow. Keep supplied values for old API clients
+    // and use private placeholders for the A/C-only form.
+    let vin = payload
+        .vin
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("AC-{}", id));
+    let model = payload
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Not provided");
+    let manufacturer = payload
+        .manufacturer
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Not provided");
 
     sqlx::query(
-        "INSERT INTO armored_cars (id, license_plate, vin, model, manufacturer, capacity_kg, passenger_capacity, registration_expiry, insurance_expiry, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+        "INSERT INTO armored_cars (id, license_plate, vin, model, manufacturer, capacity_kg, passenger_capacity, registration_expiry, insurance_expiry, status) VALUES ($1, $2, $3, $4, $5, 0, 4, $6, $7, $8)"
     )
     .bind(&id)
-    .bind(&payload.license_plate)
-    .bind(&payload.vin)
-    .bind(&payload.model)
-    .bind(&payload.manufacturer)
-    .bind(payload.capacity_kg)
-    .bind(payload.passenger_capacity.unwrap_or(4))
+    .bind(ac_number)
+    .bind(vin)
+    .bind(model)
+    .bind(manufacturer)
     .bind(&payload.registration_expiry)
     .bind(&payload.insurance_expiry)
     .bind("available")
@@ -380,6 +399,21 @@ pub async fn get_car_maintenance_records(
 
 // ========== Driver Assignment Management ==========
 
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+pub struct DriverAssignmentDetails {
+    pub id: String,
+    pub car_id: String,
+    pub vehicle_number: String,
+    pub guard_id: String,
+    pub guard_name: Option<String>,
+    pub guard_number: Option<i32>,
+    pub assignment_date: chrono::DateTime<chrono::Utc>,
+    pub end_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub status: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 pub async fn assign_driver(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
@@ -387,7 +421,52 @@ pub async fn assign_driver(
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
+    if payload.car_id.trim().is_empty() || payload.guard_id.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Vehicle and guard are required".to_string(),
+        ));
+    }
+
+    let vehicle_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM armored_cars WHERE id = $1 AND status NOT IN ('maintenance', 'inactive'))",
+    )
+    .bind(&payload.car_id)
+    .fetch_one(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to verify vehicle: {}", e)))?;
+
+    if !vehicle_exists {
+        return Err(AppError::BadRequest(
+            "Vehicle not found or unavailable for assignment".to_string(),
+        ));
+    }
+
+    let guard_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND LOWER(role) = 'guard' AND verified = true AND COALESCE(approval_status, 'approved') = 'approved')",
+    )
+    .bind(&payload.guard_id)
+    .fetch_one(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to verify guard: {}", e)))?;
+
+    if !guard_exists {
+        return Err(AppError::BadRequest(
+            "Guard not found or not approved".to_string(),
+        ));
+    }
+
     let id = utils::generate_id();
+
+    // A driver can operate one vehicle at a time, and each vehicle has one
+    // current driver. Close either previous assignment before creating the new one.
+    sqlx::query(
+        "UPDATE driver_assignments SET end_date = CURRENT_TIMESTAMP, status = 'inactive', updated_at = CURRENT_TIMESTAMP WHERE status = 'active' AND (car_id = $1 OR guard_id = $2)",
+    )
+    .bind(&payload.car_id)
+    .bind(&payload.guard_id)
+    .execute(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to close previous driver assignment: {}", e)))?;
 
     sqlx::query(
         "INSERT INTO driver_assignments (id, car_id, guard_id, status) VALUES ($1, $2, $3, $4)",
@@ -431,9 +510,9 @@ pub async fn unassign_driver(
 pub async fn get_car_drivers(
     State(db): State<Arc<PgPool>>,
     Path(car_id): Path<String>,
-) -> AppResult<Json<Vec<DriverAssignment>>> {
-    let drivers = sqlx::query_as::<_, DriverAssignment>(
-        "SELECT id, car_id, guard_id, assignment_date, end_date, status, created_at, updated_at FROM driver_assignments WHERE car_id = $1 ORDER BY assignment_date DESC"
+) -> AppResult<Json<Vec<DriverAssignmentDetails>>> {
+    let drivers = sqlx::query_as::<_, DriverAssignmentDetails>(
+        "SELECT da.id, da.car_id, ac.license_plate AS vehicle_number, da.guard_id, u.full_name AS guard_name, u.guard_number, da.assignment_date, da.end_date, da.status, da.created_at, da.updated_at FROM driver_assignments da JOIN armored_cars ac ON ac.id = da.car_id JOIN users u ON u.id = da.guard_id WHERE da.car_id = $1 ORDER BY da.assignment_date DESC"
     )
     .bind(&car_id)
     .fetch_all(db.as_ref())
@@ -441,6 +520,22 @@ pub async fn get_car_drivers(
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
     Ok(Json(drivers))
+}
+
+pub async fn get_all_driver_assignments(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+) -> AppResult<Json<Vec<DriverAssignmentDetails>>> {
+    let _claims = utils::require_min_role(&headers, "supervisor")?;
+
+    let assignments = sqlx::query_as::<_, DriverAssignmentDetails>(
+        "SELECT da.id, da.car_id, ac.license_plate AS vehicle_number, da.guard_id, u.full_name AS guard_name, u.guard_number, da.assignment_date, da.end_date, da.status, da.created_at, da.updated_at FROM driver_assignments da JOIN armored_cars ac ON ac.id = da.car_id JOIN users u ON u.id = da.guard_id WHERE da.status = 'active' AND da.end_date IS NULL ORDER BY ac.license_plate ASC",
+    )
+    .fetch_all(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to fetch driver assignments: {}", e)))?;
+
+    Ok(Json(assignments))
 }
 
 // ========== Trip Management ==========

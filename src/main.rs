@@ -438,6 +438,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     middleware::audit::audit_write_requests,
                 )),
         )
+        .route(
+            "/api/user/:id/password",
+            post(handlers::users::set_guard_password)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_manage_guard_passwords,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/user/:id/password/change",
+            post(handlers::users::change_own_password)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_authenticated,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
         // User routes with /users prefix (alternative URIs)
         .route(
             "/api/users/:id",
@@ -468,10 +490,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
         )
         .route(
+            "/api/users/:id/password",
+            post(handlers::users::set_guard_password)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_manage_guard_passwords,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/users/:id/password/change",
+            post(handlers::users::change_own_password)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_authenticated,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
             "/api/guards",
             get(handlers::users::get_guards).route_layer(axum_middleware::from_fn(
                 middleware::authz::require_authenticated,
             )),
+        )
+        .route(
+            "/api/guards/compliance-report",
+            get(handlers::guard_compliance::get_compliance_report).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_authenticated),
+            ),
+        )
+        .route(
+            "/api/guards/compliance-notifications",
+            post(handlers::guard_compliance::create_expiry_notifications)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_authenticated,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
         )
         .route(
             "/api/users/:id/profile-photo",
@@ -768,6 +829,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(handlers::guard_replacement::get_guard_availability).route_layer(
                 axum_middleware::from_fn(middleware::authz::require_authenticated),
             ),
+        )
+        .route(
+            "/api/guard-replacement/guard/:guard_id/readiness",
+            get(handlers::guard_replacement::get_guard_shift_readiness).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_authenticated),
+            ),
+        )
+        .route(
+            "/api/guard-replacement/readiness",
+            axum::routing::put(handlers::guard_replacement::set_guard_shift_readiness)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_authenticated,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
         )
         // Notification routes (restructured to avoid route conflicts)
         .route(
@@ -1177,7 +1255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route(
             "/api/merit/evaluations/submit",
-            post(handlers::merit::submit_client_evaluation)
+            post(handlers::merit::submit_guard_evaluation)
                 .route_layer(axum_middleware::from_fn(
                     middleware::authz::require_merit_manage,
                 ))
@@ -1342,6 +1420,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(handlers::armored_cars::get_car_drivers).route_layer(axum_middleware::from_fn(
                 middleware::authz::require_armored_car_management,
             )),
+        )
+        .route(
+            "/api/driver-assignments",
+            get(handlers::armored_cars::get_all_driver_assignments).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_armored_car_management),
+            ),
         )
         // Trip management routes
         .route(
@@ -1603,6 +1687,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/tracking/client-sites",
             post(handlers::tracking::create_client_site)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_tracking_access,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
+            "/api/tracking/client-sites/with-geofence",
+            post(handlers::tracking::create_client_site_with_geofence)
                 .route_layer(axum_middleware::from_fn(
                     middleware::authz::require_tracking_access,
                 ))

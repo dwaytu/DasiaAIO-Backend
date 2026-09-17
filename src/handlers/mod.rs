@@ -12,6 +12,7 @@ pub mod firearm_compliance;
 pub mod firearm_maintenance;
 pub mod firearms;
 pub mod guard_assignments;
+pub mod guard_compliance;
 pub mod guard_replacement;
 pub mod health;
 pub mod incidents;

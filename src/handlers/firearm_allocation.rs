@@ -9,7 +9,10 @@ use std::sync::Arc;
 
 use crate::{
     error::{AppError, AppResult},
-    models::{FirearmAllocation, GuardAllocationView, IssueFirearmRequest, ReturnFirearmRequest},
+    models::{
+        AllocationListView, FirearmAllocation, GuardAllocationView, IssueFirearmRequest,
+        ReturnFirearmRequest,
+    },
     utils,
 };
 
@@ -226,8 +229,17 @@ pub async fn get_active_allocations(
 pub async fn get_all_allocations(
     State(db): State<Arc<PgPool>>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let allocations = sqlx::query_as::<_, FirearmAllocation>(
-        "SELECT id, guard_id, firearm_id, allocation_date, return_date, status, created_at, updated_at FROM firearm_allocations ORDER BY allocation_date DESC"
+    let allocations = sqlx::query_as::<_, AllocationListView>(
+        r#"
+        SELECT fa.id, fa.guard_id, fa.firearm_id, fa.allocation_date, fa.return_date, fa.status, fa.created_at, fa.updated_at,
+               u.full_name AS guard_name,
+               f.serial_number AS firearm_serial_number,
+               f.model AS firearm_model
+        FROM firearm_allocations fa
+        LEFT JOIN users u ON u.id = fa.guard_id
+        LEFT JOIN firearms f ON f.id = fa.firearm_id
+        ORDER BY fa.allocation_date DESC
+        "#,
     )
     .fetch_all(db.as_ref())
     .await

@@ -161,6 +161,19 @@ pub struct CreateManagedUserRequest {
     pub address: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetGuardPasswordRequest {
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeOwnPasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
 pub async fn create_user_by_actor(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
@@ -680,6 +693,129 @@ pub async fn update_user(
 
     Ok(Json(json!({
         "message": "User updated successfully"
+    })))
+}
+
+pub async fn set_guard_password(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<SetGuardPasswordRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let claims = utils::require_min_role(&headers, "admin")?;
+    let actor_role = utils::normalize_role(&claims.role);
+    if !utils::has_permission(&actor_role, "manage_guard_passwords") {
+        return Err(AppError::Forbidden(
+            "Only admin and superadmin accounts can change guard passwords".to_string(),
+        ));
+    }
+
+    let password = payload.password.trim();
+    if password.is_empty() {
+        return Err(AppError::BadRequest(
+            "A temporary password is required".to_string(),
+        ));
+    }
+    utils::validate_password_strength(password)?;
+
+    let target = sqlx::query("SELECT role FROM users WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+        .ok_or_else(|| AppError::NotFound("Guard account not found".to_string()))?;
+    let target_role: String = target
+        .try_get("role")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse target role: {}", e)))?;
+    if utils::normalize_role(&target_role) != "guard" {
+        return Err(AppError::Forbidden(
+            "This action is limited to guard accounts".to_string(),
+        ));
+    }
+
+    let password_hash = utils::hash_password(password).await?;
+    let updated = sqlx::query(
+        "UPDATE users SET password = $1, must_change_password = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+    )
+    .bind(&password_hash)
+    .bind(&id)
+    .execute(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to change guard password: {}", e)))?;
+
+    if updated.rows_affected() == 0 {
+        return Err(AppError::NotFound("Guard account not found".to_string()));
+    }
+
+    sqlx::query(
+        "UPDATE refresh_token_sessions SET revoked_at = NOW(), last_used_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(&id)
+    .execute(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to revoke guard sessions: {}", e)))?;
+
+    Ok(Json(json!({
+        "message": "Temporary password set. The guard must choose a new password after signing in.",
+        "userId": id,
+        "mustChangePassword": true
+    })))
+}
+
+pub async fn change_own_password(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<ChangeOwnPasswordRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let claims = utils::verify_token(&utils::extract_bearer_token(&headers)?)?;
+    if claims.sub != id {
+        return Err(AppError::Forbidden(
+            "You can only change your own password".to_string(),
+        ));
+    }
+
+    let current_password = payload.current_password.trim();
+    let new_password = payload.new_password.trim();
+    if current_password.is_empty() || new_password.is_empty() {
+        return Err(AppError::BadRequest(
+            "Current password and new password are required".to_string(),
+        ));
+    }
+    if current_password == new_password {
+        return Err(AppError::BadRequest(
+            "New password must be different from the current password".to_string(),
+        ));
+    }
+    utils::validate_password_strength(new_password)?;
+
+    let user = sqlx::query("SELECT password FROM users WHERE id = $1")
+        .bind(&id)
+        .fetch_optional(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
+    let password_hash: String = user
+        .try_get("password")
+        .map_err(|e| AppError::DatabaseError(format!("Failed to parse password hash: {}", e)))?;
+    if !utils::verify_password(current_password, &password_hash).await? {
+        return Err(AppError::Unauthorized(
+            "Current password is incorrect".to_string(),
+        ));
+    }
+
+    let new_password_hash = utils::hash_password(new_password).await?;
+    sqlx::query(
+        "UPDATE users SET password = $1, must_change_password = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+    )
+    .bind(&new_password_hash)
+    .bind(&id)
+    .execute(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to update password: {}", e)))?;
+
+    Ok(Json(json!({
+        "message": "Password changed successfully"
     })))
 }
 

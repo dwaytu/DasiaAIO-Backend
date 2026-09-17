@@ -76,6 +76,9 @@ pub struct UserResponse {
     pub full_name: String,
     pub phone_number: String,
     pub guard_number: Option<i32>,
+    pub license_number: Option<String>,
+    pub license_issued_date: Option<DateTime<Utc>>,
+    pub license_expiry_date: Option<DateTime<Utc>>,
     pub profile_photo: Option<String>,
     pub last_seen_at: Option<DateTime<Utc>>,
 }
@@ -90,6 +93,9 @@ impl From<User> for UserResponse {
             full_name: user.full_name,
             phone_number: user.phone_number,
             guard_number: user.guard_number,
+            license_number: user.license_number,
+            license_issued_date: user.license_issued_date,
+            license_expiry_date: user.license_expiry_date,
             profile_photo: user.profile_photo,
             last_seen_at: user.last_seen_at,
         }
@@ -204,6 +210,22 @@ pub struct FirearmAllocation {
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AllocationListView {
+    pub id: String,
+    pub guard_id: String,
+    pub firearm_id: String,
+    pub allocation_date: DateTime<Utc>,
+    pub return_date: Option<DateTime<Utc>>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub guard_name: Option<String>,
+    pub firearm_serial_number: Option<String>,
+    pub firearm_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -343,6 +365,16 @@ pub struct SetAvailabilityRequest {
     pub available_to: Option<DateTime<Utc>>,
     pub notes: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetShiftReadinessRequest {
+    pub guard_id: String,
+    pub shift_id: String,
+    #[serde(default)]
+    pub checked_items: Vec<String>,
+    pub notes: Option<String>,
+}
 // Armored Car models
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ArmoredCar {
@@ -366,11 +398,12 @@ pub struct ArmoredCar {
 #[serde(rename_all = "camelCase")]
 pub struct CreateArmoredCarRequest {
     pub license_plate: String,
-    pub vin: String,
-    pub model: String,
-    pub manufacturer: String,
-    pub capacity_kg: i32,
-    pub passenger_capacity: Option<i32>,
+    #[serde(default)]
+    pub vin: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub manufacturer: Option<String>,
     pub registration_expiry: Option<DateTime<Utc>>,
     pub insurance_expiry: Option<DateTime<Utc>>,
 }

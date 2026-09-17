@@ -85,7 +85,7 @@ pub async fn calculate_merit_score(
         0.0
     };
 
-    // 3. Calculate Client Rating (average of all evaluations)
+    // 3. Calculate the evaluator rating (average of supervisor/admin evaluations)
     let (avg_rating, eval_count): (Option<f64>, Option<i64>) = sqlx::query_as(
         "SELECT CAST(AVG(rating) AS FLOAT8), COUNT(*)::int8 FROM client_evaluations WHERE guard_id = $1"
     )
@@ -233,7 +233,22 @@ pub async fn get_guard_merit_score(
 ) -> AppResult<Json<MeritScoreResponse>> {
     let _claims = utils::require_self_or_min_role(&headers, &guard_id, "supervisor")?;
 
-    let merit_score: GuardMeritScore = sqlx::query_as(
+    let guard_name: Option<String> = sqlx::query_scalar(
+        "SELECT COALESCE(full_name, username) FROM users
+         WHERE id = $1
+           AND LOWER(BTRIM(COALESCE(role, ''))) = 'guard'
+           AND COALESCE(status, 'active') = 'active'
+           AND verified = true
+           AND COALESCE(approval_status, 'approved') = 'approved'",
+    )
+    .bind(&guard_id)
+    .fetch_optional(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+
+    let guard_name = guard_name.ok_or_else(|| AppError::NotFound("Guard not found".to_string()))?;
+
+    let merit_score: Option<GuardMeritScore> = sqlx::query_as(
         "SELECT id, guard_id, CAST(attendance_score AS FLOAT8), CAST(punctuality_score AS FLOAT8), 
                 CAST(client_rating AS FLOAT8), CAST(overall_score AS FLOAT8), rank, 
                 total_shifts_completed, on_time_count, late_count, no_show_count, 
@@ -244,34 +259,46 @@ pub async fn get_guard_merit_score(
     .bind(&guard_id)
     .fetch_optional(db.as_ref())
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
-    .ok_or_else(|| AppError::NotFound("Merit score not found".to_string()))?;
+    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
-    let guard_name: Option<String> =
-        sqlx::query_scalar("SELECT full_name FROM users WHERE id = $1")
-            .bind(&guard_id)
-            .fetch_optional(db.as_ref())
-            .await
-            .ok()
-            .flatten();
-
-    Ok(Json(MeritScoreResponse {
-        guard_id,
-        guard_name,
-        overall_score: merit_score.overall_score,
-        rank: merit_score.rank,
-        attendance_score: merit_score.attendance_score,
-        punctuality_score: merit_score.punctuality_score,
-        client_rating: merit_score.client_rating,
-        stats: MeritStats {
-            total_shifts: merit_score.total_shifts_completed.unwrap_or(0),
-            on_time_count: merit_score.on_time_count.unwrap_or(0),
-            late_count: merit_score.late_count.unwrap_or(0),
-            no_show_count: merit_score.no_show_count.unwrap_or(0),
-            evaluations: merit_score.evaluation_count.unwrap_or(0),
-            average_rating: merit_score.average_client_rating.unwrap_or(0.0),
+    let response = match merit_score {
+        Some(merit_score) => MeritScoreResponse {
+            guard_id,
+            guard_name: Some(guard_name),
+            overall_score: merit_score.overall_score,
+            rank: merit_score.rank,
+            attendance_score: merit_score.attendance_score,
+            punctuality_score: merit_score.punctuality_score,
+            client_rating: merit_score.client_rating,
+            stats: MeritStats {
+                total_shifts: merit_score.total_shifts_completed.unwrap_or(0),
+                on_time_count: merit_score.on_time_count.unwrap_or(0),
+                late_count: merit_score.late_count.unwrap_or(0),
+                no_show_count: merit_score.no_show_count.unwrap_or(0),
+                evaluations: merit_score.evaluation_count.unwrap_or(0),
+                average_rating: merit_score.average_client_rating.unwrap_or(0.0),
+            },
         },
-    }))
+        None => MeritScoreResponse {
+            guard_id,
+            guard_name: Some(guard_name),
+            overall_score: 0.0,
+            rank: Some("Not evaluated".to_string()),
+            attendance_score: 0.0,
+            punctuality_score: 0.0,
+            client_rating: 0.0,
+            stats: MeritStats {
+                total_shifts: 0,
+                on_time_count: 0,
+                late_count: 0,
+                no_show_count: 0,
+                evaluations: 0,
+                average_rating: 0.0,
+            },
+        },
+    };
+
+    Ok(Json(response))
 }
 
 // Get all guards ranked by merit score
@@ -282,14 +309,18 @@ pub async fn get_ranked_guards(
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
     let guards = sqlx::query_as::<_, (String, String, f64, Option<String>, i32, i32, f64)>(
-        "SELECT gms.guard_id, u.full_name, CAST(gms.overall_score AS FLOAT8), gms.rank, 
-                gms.on_time_count, 
-                COALESCE(gms.on_time_count + gms.late_count + gms.no_show_count, 0) as total_tracked,
-                CAST(gms.average_client_rating AS FLOAT8)
-         FROM guard_merit_scores gms
-         JOIN users u ON gms.guard_id = u.id
-         WHERE u.role IN ('guard')
-         ORDER BY gms.overall_score DESC, u.full_name"
+        "SELECT u.id, COALESCE(u.full_name, u.username),
+                COALESCE(gms.overall_score, 0)::FLOAT8, gms.rank,
+                COALESCE(gms.on_time_count, 0),
+                COALESCE(gms.on_time_count, 0) + COALESCE(gms.late_count, 0) + COALESCE(gms.no_show_count, 0),
+                COALESCE(gms.average_client_rating, 0)::FLOAT8
+         FROM users u
+         LEFT JOIN guard_merit_scores gms ON gms.guard_id = u.id
+         WHERE LOWER(BTRIM(COALESCE(u.role, ''))) = 'guard'
+           AND COALESCE(u.status, 'active') = 'active'
+           AND u.verified = true
+           AND COALESCE(u.approval_status, 'approved') = 'approved'
+         ORDER BY COALESCE(gms.overall_score, 0) DESC, COALESCE(u.full_name, u.username)"
     )
     .fetch_all(db.as_ref())
     .await
@@ -311,7 +342,7 @@ pub async fn get_ranked_guards(
                     guard_id,
                     guard_name: Some(guard_name),
                     overall_score: score,
-                    merit_rank: rank,
+                    merit_rank: rank.or_else(|| Some("Not evaluated".to_string())),
                     on_time_percentage: on_time_pct,
                     client_rating: rating,
                 }
@@ -325,12 +356,14 @@ pub async fn get_ranked_guards(
     })))
 }
 
-// Submit client evaluation for a guard
-pub async fn submit_client_evaluation(
+// Submit a supervisor/admin evaluation for a guard.
+// The legacy client_evaluations table is retained so existing records remain available.
+pub async fn submit_guard_evaluation(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
     Json(payload): Json<CreateClientEvaluationRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    // Only supervisors, admins, and superadmins may create evaluations.
     let claims = utils::require_min_role(&headers, "supervisor")?;
 
     validate_evaluation_rating(payload.rating)?;

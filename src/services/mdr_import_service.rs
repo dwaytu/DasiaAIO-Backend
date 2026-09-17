@@ -114,6 +114,18 @@ fn derive_firearm_name(
     )
 }
 
+fn duplicateable_license(value: &str) -> Option<String> {
+    let normalized = normalize_optional_text(&Some(value.to_string()))?;
+    if !normalized
+        .chars()
+        .any(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+
+    Some(normalized.to_uppercase())
+}
+
 fn validate_staging_row(
     row: &crate::models::MdrStagingRow,
     has_duplicate_license: bool,
@@ -133,7 +145,10 @@ fn validate_staging_row(
     let serial_number = normalize_optional_text(&row.serial_number);
     let contact_number = normalize_optional_text(&row.contact_number);
 
-    let requires_guard = !matches!(section.as_str(), "equipment" | "returned");
+    let requires_guard = !matches!(
+        section.as_str(),
+        "equipment" | "returned" | "vault" | "history"
+    );
     let requires_client = matches!(
         section.as_str(),
         "clients" | "tower" | "backup" | "pullout" | "armored"
@@ -159,15 +174,17 @@ fn validate_staging_row(
         }
     }
 
-    if let Some(ref expiry) = row.license_expiry {
-        if !expiry.trim().is_empty() && !parse_mdr_date(expiry) {
-            issues.push("License expiry has an invalid date format.".to_string());
+    if section != "history" {
+        if let Some(ref expiry) = row.license_expiry {
+            if !expiry.trim().is_empty() && !parse_mdr_date(expiry) {
+                issues.push("License expiry has an invalid date format.".to_string());
+            }
         }
-    }
 
-    if let Some(ref validity) = row.firearm_validity {
-        if !validity.trim().is_empty() && !parse_mdr_date(validity) {
-            issues.push("Firearm validity has an invalid date format.".to_string());
+        if let Some(ref validity) = row.firearm_validity {
+            if !validity.trim().is_empty() && !parse_mdr_date(validity) {
+                issues.push("Firearm validity has an invalid date format.".to_string());
+            }
         }
     }
 
@@ -293,12 +310,28 @@ pub async fn match_staging_rows(pool: &PgPool, batch_id: &str) -> AppResult<Matc
     let mut serial_counts: HashMap<String, i32> = HashMap::new();
 
     for row in &rows {
-        if let Some(license) = normalize_optional_text(&row.license_number) {
-            *license_counts.entry(license.to_uppercase()).or_insert(0) += 1;
-        }
+        let section = row
+            .section
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("clients")
+            .to_lowercase();
+        let is_historical = matches!(section.as_str(), "pullout" | "returned" | "history");
 
-        if let Some(serial) = normalize_optional_text(&row.serial_number) {
-            *serial_counts.entry(serial.to_uppercase()).or_insert(0) += 1;
+        // Pull-out and returned sheets are historical records. The same license or
+        // serial can legitimately appear in the current roster and those histories.
+        if !is_historical && section != "armored" {
+            if let Some(license) = row
+                .license_number
+                .as_deref()
+                .and_then(duplicateable_license)
+            {
+                *license_counts.entry(license).or_insert(0) += 1;
+            }
+
+            if let Some(serial) = normalize_optional_text(&row.serial_number) {
+                *serial_counts.entry(serial.to_uppercase()).or_insert(0) += 1;
+            }
         }
     }
 
@@ -309,24 +342,41 @@ pub async fn match_staging_rows(pool: &PgPool, batch_id: &str) -> AppResult<Matc
         let mut client_id: Option<String> = None;
         let mut validation_errors: Option<serde_json::Value> = None;
 
-        let duplicate_license = normalize_optional_text(&row.license_number)
-            .map(|license| {
-                license_counts
-                    .get(&license.to_uppercase())
-                    .copied()
-                    .unwrap_or(0)
-                    > 1
-            })
-            .unwrap_or(false);
-        let duplicate_serial = normalize_optional_text(&row.serial_number)
-            .map(|serial| {
-                serial_counts
-                    .get(&serial.to_uppercase())
-                    .copied()
-                    .unwrap_or(0)
-                    > 1
-            })
-            .unwrap_or(false);
+        let section = row
+            .section
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("clients")
+            .to_lowercase();
+        if section == "armored" {
+            sqlx::query(
+                "UPDATE mdr_staging_rows SET match_status = 'ignored', matched_guard_id = NULL, matched_firearm_id = NULL, matched_client_id = NULL, validation_errors = $1 WHERE id = $2",
+            )
+            .bind(json!(["Armored vehicle rows are ignored. Add vehicles manually in Resource Management."]))
+            .bind(&row.id)
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Failed to ignore armored MDR row: {}", e)))?;
+            continue;
+        }
+        let is_historical = matches!(section.as_str(), "pullout" | "returned" | "history");
+        let duplicate_license = !is_historical
+            && row
+                .license_number
+                .as_deref()
+                .and_then(duplicateable_license)
+                .map(|license| license_counts.get(&license).copied().unwrap_or(0) > 1)
+                .unwrap_or(false);
+        let duplicate_serial = !is_historical
+            && normalize_optional_text(&row.serial_number)
+                .map(|serial| {
+                    serial_counts
+                        .get(&serial.to_uppercase())
+                        .copied()
+                        .unwrap_or(0)
+                        > 1
+                })
+                .unwrap_or(false);
         let row_issues = validate_staging_row(row, duplicate_license, duplicate_serial);
         if !row_issues.is_empty() {
             status = "error";
@@ -397,12 +447,13 @@ pub async fn match_staging_rows(pool: &PgPool, batch_id: &str) -> AppResult<Matc
 
             if let Some(ref client_name) = row.client_name {
                 if !client_name.trim().is_empty() {
-                    let client_matches: Vec<(String,)> =
-                        sqlx::query_as("SELECT id FROM clients WHERE UPPER(name) = UPPER($1)")
-                            .bind(client_name.trim())
-                            .fetch_all(pool)
-                            .await
-                            .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+                    let client_matches: Vec<(String,)> = sqlx::query_as(
+                        "SELECT id FROM clients WHERE UPPER(BTRIM(name)) = UPPER(BTRIM($1))",
+                    )
+                    .bind(client_name.trim())
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
                     if client_matches.len() == 1 {
                         client_id = Some(client_matches[0].0.clone());
@@ -412,6 +463,8 @@ pub async fn match_staging_rows(pool: &PgPool, batch_id: &str) -> AppResult<Matc
 
             if row.section.as_deref() != Some("equipment")
                 && row.section.as_deref() != Some("returned")
+                && row.section.as_deref() != Some("vault")
+                && row.section.as_deref() != Some("history")
             {
                 if row
                     .guard_name
@@ -524,7 +577,17 @@ pub async fn commit_batch(
     let mut created_clients: HashMap<String, String> = HashMap::new();
 
     for row in &rows {
+        if row.match_status == "ignored" {
+            continue;
+        }
+
         let section = row.section.as_deref().unwrap_or("clients");
+
+        // Vehicles are managed manually. Keep this guard for batches created by
+        // older server versions or direct API clients that still submit armored rows.
+        if section.trim().eq_ignore_ascii_case("armored") {
+            continue;
+        }
 
         let effective_client_id = if let Some(ref client_name) = row.client_name {
             let normalized_name = client_name.trim().to_uppercase();
@@ -539,22 +602,49 @@ pub async fn commit_batch(
             } else if let Some(batch_client_id) = created_clients.get(&normalized_name) {
                 Some(batch_client_id.clone())
             } else if !normalized_name.is_empty() {
-                let client_id = utils::generate_id();
-                sqlx::query(
-                    "INSERT INTO clients (id, name, address, phone, client_number, branch, is_active) VALUES ($1, $2, $3, $4, $5, $6, true)",
+                // Workbook rows may be stale or may have been matched before
+                // the current client matching rules were applied. Reuse the
+                // existing no-branch client before attempting an insert.
+                let existing_client_id: Option<String> = sqlx::query_scalar(
+                    "SELECT id FROM clients WHERE UPPER(BTRIM(name)) = UPPER(BTRIM($1)) AND COALESCE(branch, '') = '' LIMIT 1",
                 )
-                .bind(&client_id)
                 .bind(client_name.trim())
-                .bind(&row.client_address)
-                .bind(&row.contact_number)
-                .bind(row.client_number)
-                .bind(Option::<&str>::None)
-                .execute(&mut *tx)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|e| AppError::DatabaseError(e.to_string()))?;
-                summary.clients_created += 1;
-                created_clients.insert(normalized_name, client_id.clone());
-                Some(client_id)
+
+                if let Some(client_id) = existing_client_id {
+                    sqlx::query(
+                        "UPDATE clients SET address = COALESCE($1, address), phone = COALESCE($2, phone), client_number = COALESCE($3, client_number), is_active = true, updated_at = NOW() WHERE id = $4",
+                    )
+                    .bind(&row.client_address)
+                    .bind(&row.contact_number)
+                    .bind(row.client_number)
+                    .bind(&client_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+                    summary.clients_updated += 1;
+                    created_clients.insert(normalized_name, client_id.clone());
+                    Some(client_id)
+                } else {
+                    let client_id = utils::generate_id();
+                    sqlx::query(
+                        "INSERT INTO clients (id, name, address, phone, client_number, branch, is_active) VALUES ($1, $2, $3, $4, $5, $6, true)",
+                    )
+                    .bind(&client_id)
+                    .bind(client_name.trim())
+                    .bind(&row.client_address)
+                    .bind(&row.contact_number)
+                    .bind(row.client_number)
+                    .bind(Option::<&str>::None)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+                    summary.clients_created += 1;
+                    created_clients.insert(normalized_name, client_id.clone());
+                    Some(client_id)
+                }
             } else {
                 None
             }
@@ -602,21 +692,48 @@ pub async fn commit_batch(
                         _ => "available",
                     };
 
-                    let existing_car = sqlx::query_as::<_, (String, String)>(
-                        "SELECT id, status FROM armored_cars WHERE UPPER(license_plate) = UPPER($1) OR UPPER(vin) = UPPER($2) LIMIT 1",
+                    let existing_by_plate = sqlx::query_as::<_, (String, String, String, String)>(
+                        "SELECT id, status, license_plate, vin FROM armored_cars WHERE UPPER(BTRIM(license_plate)) = UPPER(BTRIM($1)) LIMIT 1",
                     )
                     .bind(&normalized_plate)
-                    .bind(&provided_vin)
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-                    let effective_car_id = if let Some((car_id, previous_status)) = existing_car {
+                    let existing_by_vin = sqlx::query_as::<_, (String, String, String, String)>(
+                        "SELECT id, status, license_plate, vin FROM armored_cars WHERE UPPER(BTRIM(vin)) = UPPER(BTRIM($1)) LIMIT 1",
+                    )
+                    .bind(&provided_vin)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+                    let existing_by_vin_id = existing_by_vin.as_ref().map(|car| car.0.clone());
+                    // Prefer a plate match. If the workbook pairs that plate
+                    // with a VIN belonging to another vehicle, keep the
+                    // selected vehicle's existing VIN instead of violating a
+                    // unique constraint or silently merging two vehicles.
+                    let existing_car = existing_by_plate.or(existing_by_vin);
+
+                    let effective_car_id = if let Some((
+                        car_id,
+                        previous_status,
+                        _existing_plate,
+                        existing_vin,
+                    )) = existing_car
+                    {
+                        let effective_vin = if existing_by_vin_id
+                            .as_deref()
+                            .is_some_and(|other_id| other_id != car_id)
+                        {
+                            existing_vin
+                        } else {
+                            provided_vin.clone()
+                        };
                         sqlx::query(
                             "UPDATE armored_cars SET license_plate = $1, vin = $2, model = $3, manufacturer = $4, status = $5, updated_at = NOW() WHERE id = $6",
                         )
                         .bind(&normalized_plate)
-                        .bind(&provided_vin)
+                        .bind(&effective_vin)
                         .bind(&model)
                         .bind(&manufacturer)
                         .bind(next_status)
@@ -750,6 +867,7 @@ pub async fn commit_batch(
                     }
                 }
             }
+            "history" => {}
             "pullout" => {
                 if let Some(ref guard_id) = row.matched_guard_id {
                     let transition_id = utils::generate_id();
@@ -866,13 +984,16 @@ pub async fn commit_batch(
                     .firearm_validity
                     .as_ref()
                     .and_then(|value| parse_mdr_datetime(value));
+                let normalized_license = normalize_optional_text(&row.license_number);
 
                 let effective_guard_id = if let Some(ref guard_id) = row.matched_guard_id {
                     sqlx::query(
-                        "UPDATE users SET guard_number = COALESCE($1, guard_number), phone_number = COALESCE($2, phone_number), lic_reg_name = $3, mdr_batch_id = $4, status = CASE WHEN $6 THEN 'inactive' ELSE status END, updated_at = NOW() WHERE id = $5",
+                        "UPDATE users SET email = CASE WHEN email LIKE '%@sentinel.local' THEN '' ELSE email END, guard_number = COALESCE($1, guard_number), phone_number = COALESCE($2, phone_number), license_number = COALESCE($3, license_number), license_expiry_date = COALESCE($4, license_expiry_date), lic_reg_name = $5, mdr_batch_id = $6, status = CASE WHEN $8 THEN 'inactive' ELSE status END, updated_at = NOW() WHERE id = $7",
                     )
                     .bind(row.guard_number)
                     .bind(&row.contact_number)
+                    .bind(&normalized_license)
+                    .bind(parsed_license_expiry.clone())
                     .bind(&row.lic_reg_name)
                     .bind(batch_id)
                     .bind(guard_id)
@@ -884,7 +1005,6 @@ pub async fn commit_batch(
                     Some(guard_id.clone())
                 } else if let Some(ref guard_name) = row.guard_name {
                     if !guard_name.trim().is_empty() {
-                        let normalized_license = normalize_optional_text(&row.license_number);
                         let username_base = guard_name
                             .trim()
                             .to_lowercase()
@@ -908,7 +1028,8 @@ pub async fn commit_batch(
                         } else {
                             username_base
                         };
-                        let email = format!("{}@sentinel.local", username);
+                        let legacy_import_email = format!("{}@sentinel.local", username);
+                        let email = "";
                         let guard_status = if guard_license_expired {
                             "inactive"
                         } else {
@@ -925,10 +1046,10 @@ pub async fn commit_batch(
                             .map_err(|e| AppError::DatabaseError(e.to_string()))?
                         } else {
                             sqlx::query_scalar::<_, String>(
-                                "SELECT id FROM users WHERE username = $1 OR email = $2 LIMIT 1",
+                                "SELECT id FROM users WHERE username = $1 OR (mdr_batch_id IS NOT NULL AND email = $2) LIMIT 1",
                             )
                             .bind(&username)
-                            .bind(&email)
+                            .bind(&legacy_import_email)
                             .fetch_optional(&mut *tx)
                             .await
                             .map_err(|e| AppError::DatabaseError(e.to_string()))?
@@ -936,7 +1057,7 @@ pub async fn commit_batch(
 
                         if let Some(existing_guard_id) = existing_guard_id {
                             sqlx::query(
-                                "UPDATE users SET full_name = COALESCE($2, full_name), phone_number = COALESCE($3, phone_number), license_number = COALESCE($4, license_number), license_expiry_date = COALESCE($5, license_expiry_date), guard_number = COALESCE($6, guard_number), lic_reg_name = COALESCE($7, lic_reg_name), mdr_batch_id = $8, status = CASE WHEN $9 THEN 'inactive' ELSE status END, updated_at = NOW() WHERE id = $1",
+                                "UPDATE users SET email = CASE WHEN email = $10 THEN '' ELSE email END, full_name = COALESCE($2, full_name), phone_number = COALESCE($3, phone_number), license_number = COALESCE($4, license_number), license_expiry_date = COALESCE($5, license_expiry_date), guard_number = COALESCE($6, guard_number), lic_reg_name = COALESCE($7, lic_reg_name), mdr_batch_id = $8, status = CASE WHEN $9 THEN 'inactive' ELSE status END, updated_at = NOW() WHERE id = $1",
                             )
                             .bind(&existing_guard_id)
                             .bind(Some(guard_name.trim()))
@@ -947,6 +1068,7 @@ pub async fn commit_batch(
                             .bind(&row.lic_reg_name)
                             .bind(batch_id)
                             .bind(guard_license_expired)
+                            .bind(&legacy_import_email)
                             .execute(&mut *tx)
                             .await
                             .map_err(|e| AppError::DatabaseError(e.to_string()))?;
@@ -954,15 +1076,19 @@ pub async fn commit_batch(
                             Some(existing_guard_id)
                         } else {
                             let guard_id = utils::generate_id();
-                            let temp_password = crate::utils::hash_password("changeme123!").await?;
+                            let import_password_seed = crate::utils::generate_id();
+                            let temp_password =
+                                format!("Import-{}-aA1!", &import_password_seed[..8]);
+                            let temp_password_hash =
+                                crate::utils::hash_password(&temp_password).await?;
 
                             sqlx::query(
-                                "INSERT INTO users (id, email, username, password, role, full_name, phone_number, license_number, license_expiry_date, guard_number, status, lic_reg_name, mdr_batch_id, verified) VALUES ($1, $2, $3, $4, 'guard', $5, $6, $7, $8, $9, $10, $11, $12, true)",
+                                "INSERT INTO users (id, email, username, password, role, full_name, phone_number, license_number, license_expiry_date, guard_number, status, lic_reg_name, mdr_batch_id, verified, must_change_password) VALUES ($1, $2, $3, $4, 'guard', $5, $6, $7, $8, $9, $10, $11, $12, true, true)",
                             )
                             .bind(&guard_id)
-                            .bind(&email)
+                            .bind(email)
                             .bind(&username)
-                            .bind(&temp_password)
+                            .bind(&temp_password_hash)
                             .bind(guard_name.trim())
                             .bind(row.contact_number.as_deref().unwrap_or(""))
                             .bind(&normalized_license)

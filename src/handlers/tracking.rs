@@ -17,6 +17,7 @@ use tokio::sync::broadcast;
 
 use crate::{
     error::{AppError, AppResult},
+    handlers::guard_replacement,
     utils,
 };
 
@@ -342,6 +343,18 @@ pub struct UpsertClientSiteRequest {
     pub is_active: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct CreateClientSiteWithGeofenceRequest {
+    pub name: String,
+    pub address: Option<String>,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub is_active: Option<bool>,
+    pub geofence_radius_km: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeofenceVertex {
@@ -637,14 +650,94 @@ struct RecentTrackPoint {
     longitude: f64,
 }
 
+struct GeofenceEvaluationResult {
+    transitions: Vec<serde_json::Value>,
+    automatic_check_ins: Vec<serde_json::Value>,
+}
+
+async fn auto_check_in_for_site(
+    db: &PgPool,
+    guard_id: &str,
+    site_id: &str,
+    site_name: &str,
+) -> AppResult<Vec<serde_json::Value>> {
+    let shifts = sqlx::query(
+        r#"SELECT s.id
+           FROM shifts s
+           WHERE s.guard_id = $1
+             AND s.status IN ('scheduled', 'in_progress')
+             AND s.start_time - INTERVAL '1 hour' <= CURRENT_TIMESTAMP
+             AND s.end_time > CURRENT_TIMESTAMP
+             AND (
+                 LOWER(TRIM(s.client_site)) = LOWER(TRIM($2))
+                 OR LOWER(TRIM(s.client_site)) = LOWER(TRIM($3))
+             )
+           ORDER BY s.start_time ASC"#,
+    )
+    .bind(guard_id)
+    .bind(site_name)
+    .bind(site_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to find active geofenced shifts: {}", e))
+    })?;
+
+    let mut automatic_check_ins = Vec::new();
+
+    for shift in shifts {
+        let shift_id: String = shift.try_get("id").map_err(|e| {
+            AppError::DatabaseError(format!("Failed to parse geofenced shift: {}", e))
+        })?;
+
+        let result =
+            guard_replacement::record_check_in(db, guard_id, &shift_id, "geofence").await?;
+        if result.already_recorded {
+            continue;
+        }
+
+        let message = format!(
+            "Automatic check-in recorded for your shift at '{}' after entering its geofence.",
+            site_name
+        );
+        let notification_id = utils::generate_id();
+        sqlx::query(
+            r#"INSERT INTO notifications (id, user_id, title, message, type, read)
+               VALUES ($1, $2, 'Automatic Check-In', $3, 'attendance', false)"#,
+        )
+        .bind(&notification_id)
+        .bind(guard_id)
+        .bind(&message)
+        .execute(db)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to notify automatic check-in: {}", e))
+        })?;
+
+        automatic_check_ins.push(json!({
+            "attendanceId": result.attendance_id,
+            "shiftId": shift_id,
+            "siteId": site_id,
+            "siteName": site_name,
+            "source": "geofence",
+            "message": message,
+        }));
+    }
+
+    Ok(automatic_check_ins)
+}
+
 async fn evaluate_geofence_transitions(
     db: &PgPool,
     entity_type: &str,
     entity_id: &str,
     label: Option<&str>,
-) -> AppResult<Vec<serde_json::Value>> {
+) -> AppResult<GeofenceEvaluationResult> {
     if !is_guard_entity(entity_type) {
-        return Ok(Vec::new());
+        return Ok(GeofenceEvaluationResult {
+            transitions: Vec::new(),
+            automatic_check_ins: Vec::new(),
+        });
     }
 
     let recent_points = sqlx::query_as::<_, RecentTrackPoint>(
@@ -663,12 +756,15 @@ async fn evaluate_geofence_transitions(
         AppError::DatabaseError(format!("Failed to fetch geofence comparison points: {}", e))
     })?;
 
-    if recent_points.len() < 2 {
-        return Ok(Vec::new());
+    if recent_points.is_empty() {
+        return Ok(GeofenceEvaluationResult {
+            transitions: Vec::new(),
+            automatic_check_ins: Vec::new(),
+        });
     }
 
     let current = &recent_points[0];
-    let previous = &recent_points[1];
+    let previous = recent_points.get(1);
 
     let zones = sqlx::query_as::<_, GeofenceEvaluationZone>(
         r#"SELECT
@@ -692,7 +788,10 @@ async fn evaluate_geofence_transitions(
     .map_err(|e| AppError::DatabaseError(format!("Failed to fetch geofence zones: {}", e)))?;
 
     if zones.is_empty() {
-        return Ok(Vec::new());
+        return Ok(GeofenceEvaluationResult {
+            transitions: Vec::new(),
+            automatic_check_ins: Vec::new(),
+        });
     }
 
     let leadership = sqlx::query_as::<_, LeadershipRecipient>(
@@ -706,6 +805,7 @@ async fn evaluate_geofence_transitions(
     .map_err(|e| AppError::DatabaseError(format!("Failed to fetch geofence recipients: {}", e)))?;
 
     let mut transitions = Vec::new();
+    let mut automatic_check_ins = Vec::new();
     let guard_label = label.unwrap_or(entity_id);
 
     for zone in zones {
@@ -723,30 +823,41 @@ async fn evaluate_geofence_transitions(
             zone.site_longitude,
         );
 
-        let previous_distance = haversine_km(
-            previous.latitude,
-            previous.longitude,
-            zone.site_latitude,
-            zone.site_longitude,
-        );
-
-        let (current_inside, previous_inside, zone_radius) = if zone_type == "polygon" {
+        let (current_inside, zone_radius, previous_inside) = if zone_type == "polygon" {
             let Some(vertices) = parse_polygon_points(zone.polygon_points.clone()) else {
                 continue;
             };
 
             (
                 point_in_polygon(current.latitude, current.longitude, &vertices),
-                point_in_polygon(previous.latitude, previous.longitude, &vertices),
                 None,
+                previous.map(|point| point_in_polygon(point.latitude, point.longitude, &vertices)),
             )
         } else {
             let radius_km = zone.radius_km.unwrap_or(CLIENT_PROXIMITY_RADIUS_KM);
+            let previous_inside = previous.map(|point| {
+                haversine_km(
+                    point.latitude,
+                    point.longitude,
+                    zone.site_latitude,
+                    zone.site_longitude,
+                ) <= radius_km
+            });
             (
                 current_distance <= radius_km,
-                previous_distance <= radius_km,
                 Some(radius_km),
+                previous_inside,
             )
+        };
+
+        if current_inside && zone.geofence_id.is_some() {
+            automatic_check_ins.extend(
+                auto_check_in_for_site(db, entity_id, &zone.site_id, &zone.site_name).await?,
+            );
+        }
+
+        let Some(previous_inside) = previous_inside else {
+            continue;
         };
 
         if current_inside == previous_inside {
@@ -853,7 +964,10 @@ async fn evaluate_geofence_transitions(
         }));
     }
 
-    Ok(transitions)
+    Ok(GeofenceEvaluationResult {
+        transitions,
+        automatic_check_ins,
+    })
 }
 
 async fn evaluate_and_send_proximity_alerts(db: &PgPool) -> AppResult<(usize, usize)> {
@@ -1067,14 +1181,29 @@ async fn fetch_map_snapshot(
                    selected.heading,
                    selected.speed_kph,
                    selected.accuracy_meters,
-                   selected.recorded_at,
-                   shift_ctx.shift_id,
+                    selected.recorded_at,
+                    driver_assignment.car_id AS assigned_vehicle_id,
+                    driver_assignment.guard_id AS assigned_guard_id,
+                    driver_assignment.vehicle_number AS assigned_vehicle_number,
+                    shift_ctx.shift_id,
                    shift_ctx.shift_status,
                    shift_ctx.shift_start_time,
                    shift_ctx.shift_end_time,
                    shift_ctx.shift_client_site
-               FROM selected
-               LEFT JOIN LATERAL (
+                FROM selected
+                LEFT JOIN LATERAL (
+                    SELECT da.car_id, da.guard_id, ac.license_plate AS vehicle_number
+                    FROM driver_assignments da
+                    JOIN armored_cars ac ON ac.id = da.car_id
+                    WHERE selected.entity_type = 'guard'
+                      AND da.guard_id = selected.entity_id
+                      AND da.status = 'active'
+                      AND da.end_date IS NULL
+                      AND ac.status NOT IN ('maintenance', 'inactive')
+                    ORDER BY da.assignment_date DESC
+                    LIMIT 1
+                ) driver_assignment ON true
+                LEFT JOIN LATERAL (
                    SELECT
                        s.id AS shift_id,
                        s.status AS shift_status,
@@ -1158,14 +1287,29 @@ async fn fetch_map_snapshot(
                    selected.heading,
                    selected.speed_kph,
                    selected.accuracy_meters,
-                   selected.recorded_at,
-                   shift_ctx.shift_id,
+                    selected.recorded_at,
+                    driver_assignment.car_id AS assigned_vehicle_id,
+                    driver_assignment.guard_id AS assigned_guard_id,
+                    driver_assignment.vehicle_number AS assigned_vehicle_number,
+                    shift_ctx.shift_id,
                    shift_ctx.shift_status,
                    shift_ctx.shift_start_time,
                    shift_ctx.shift_end_time,
                    shift_ctx.shift_client_site
-               FROM selected
-               LEFT JOIN LATERAL (
+                FROM selected
+                LEFT JOIN LATERAL (
+                    SELECT da.car_id, da.guard_id, ac.license_plate AS vehicle_number
+                    FROM driver_assignments da
+                    JOIN armored_cars ac ON ac.id = da.car_id
+                    WHERE selected.entity_type = 'guard'
+                      AND da.guard_id = selected.entity_id
+                      AND da.status = 'active'
+                      AND da.end_date IS NULL
+                      AND ac.status NOT IN ('maintenance', 'inactive')
+                    ORDER BY da.assignment_date DESC
+                    LIMIT 1
+                ) driver_assignment ON true
+                LEFT JOIN LATERAL (
                    SELECT
                        s.id AS shift_id,
                        s.status AS shift_status,
@@ -1262,6 +1406,32 @@ async fn fetch_map_snapshot(
             let entity_type = row
                 .try_get::<String, _>("entity_type")
                 .unwrap_or_default();
+            let raw_entity_id = row
+                .try_get::<String, _>("entity_id")
+                .unwrap_or_default();
+            let assigned_vehicle_id = row
+                .try_get::<Option<String>, _>("assigned_vehicle_id")
+                .unwrap_or(None);
+            let assigned_guard_id = row
+                .try_get::<Option<String>, _>("assigned_guard_id")
+                .unwrap_or(None);
+            let assigned_vehicle_number = row
+                .try_get::<Option<String>, _>("assigned_vehicle_number")
+                .unwrap_or(None);
+            let display_entity_type = if entity_type == "guard" && assigned_vehicle_id.is_some() {
+                "vehicle"
+            } else {
+                entity_type.as_str()
+            };
+            let display_entity_id = assigned_vehicle_id
+                .clone()
+                .unwrap_or_else(|| raw_entity_id.clone());
+            let display_user_id = assigned_guard_id.or_else(|| {
+                row.try_get::<Option<String>, _>("user_id").unwrap_or(None)
+            });
+            let display_label = assigned_vehicle_number.or_else(|| {
+                row.try_get::<Option<String>, _>("label").unwrap_or(None)
+            });
             let recorded_at = row
                 .try_get::<chrono::DateTime<chrono::Utc>, _>("recorded_at")
                 .ok();
@@ -1288,7 +1458,7 @@ async fn fetch_map_snapshot(
 
             let heartbeat_status = recorded_at
                 .map(|recorded| {
-                    if entity_type == "guard" {
+                    if display_entity_type == "guard" {
                         classify_guard_presence_at(
                             snapshot_time,
                             recorded,
@@ -1306,10 +1476,10 @@ async fn fetch_map_snapshot(
 
             json!({
                 "id": row.try_get::<String, _>("id").unwrap_or_default(),
-                "entityType": entity_type,
-                "entityId": row.try_get::<String, _>("entity_id").unwrap_or_default(),
-                "userId": row.try_get::<Option<String>, _>("user_id").unwrap_or(None),
-                "label": row.try_get::<Option<String>, _>("label").unwrap_or(None),
+                "entityType": display_entity_type,
+                "entityId": display_entity_id,
+                "userId": display_user_id,
+                "label": display_label,
                 "status": status,
                 "latitude": row.try_get::<f64, _>("latitude").unwrap_or(0.0),
                 "longitude": row.try_get::<f64, _>("longitude").unwrap_or(0.0),
@@ -2243,6 +2413,90 @@ pub async fn create_client_site(
     ))
 }
 
+pub async fn create_client_site_with_geofence(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateClientSiteWithGeofenceRequest>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let claims = utils::require_min_role(&headers, "supervisor")?;
+
+    if payload.name.trim().is_empty() {
+        return Err(AppError::BadRequest("Site name is required".to_string()));
+    }
+
+    validate_coordinates(payload.latitude, payload.longitude)?;
+
+    let geofence_payload = UpsertGeofenceZoneRequest {
+        zone_type: "radius".to_string(),
+        radius_km: Some(payload.geofence_radius_km),
+        polygon_points: None,
+        is_active: Some(true),
+    };
+    let (zone_type, radius_km, polygon_points, is_active) =
+        validate_geofence_payload(&geofence_payload)?;
+
+    let site_id = utils::generate_id();
+    let zone_id = utils::generate_id();
+    let mut transaction = db
+        .begin()
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to start site setup: {}", e)))?;
+
+    sqlx::query(
+        r#"INSERT INTO client_sites (id, name, address, latitude, longitude, is_active, created_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+    )
+    .bind(&site_id)
+    .bind(payload.name.trim())
+    .bind(payload.address.as_deref())
+    .bind(payload.latitude)
+    .bind(payload.longitude)
+    .bind(payload.is_active.unwrap_or(true))
+    .bind(&claims.sub)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create client site: {}", e)))?;
+
+    sqlx::query(
+        r#"INSERT INTO site_geofences (
+               id,
+               client_site_id,
+               zone_type,
+               radius_km,
+               polygon_points,
+               is_active,
+               created_by
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+    )
+    .bind(&zone_id)
+    .bind(&site_id)
+    .bind(zone_type)
+    .bind(radius_km)
+    .bind(polygon_points)
+    .bind(is_active)
+    .bind(&claims.sub)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create site check-in area: {}", e)))?;
+
+    transaction
+        .commit()
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to complete site setup: {}", e)))?;
+
+    publish_tracking_event("client_site_created");
+    publish_tracking_event("geofence_zone_created");
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "message": "Client site and check-in area created",
+            "siteId": site_id,
+            "zoneId": zone_id,
+        })),
+    ))
+}
+
 pub async fn update_client_site(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
@@ -2636,11 +2890,11 @@ pub async fn guard_heartbeat(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to record location heartbeat: {}", e)))?;
 
-    let geofence_events =
+    let geofence_evaluation =
         evaluate_geofence_transitions(db.as_ref(), entity_type, &claims.sub, guard_label).await?;
 
     publish_tracking_event("guard_heartbeat");
-    if !geofence_events.is_empty() {
+    if !geofence_evaluation.transitions.is_empty() {
         publish_tracking_event("geofence_transition");
     }
 
@@ -2651,7 +2905,8 @@ pub async fn guard_heartbeat(
             "accepted": true,
             "approximate": is_ip_based_approximate,
             "trackingId": tracking_id,
-            "geofenceEvents": geofence_events,
+            "geofenceEvents": geofence_evaluation.transitions,
+            "automaticCheckIns": geofence_evaluation.automatic_check_ins,
         })),
     ))
 }
@@ -2745,7 +3000,7 @@ pub async fn create_tracking_point(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create tracking point: {}", e)))?;
 
-    let geofence_events = evaluate_geofence_transitions(
+    let geofence_evaluation = evaluate_geofence_transitions(
         db.as_ref(),
         &entity_type,
         entity_id,
@@ -2754,7 +3009,7 @@ pub async fn create_tracking_point(
     .await?;
 
     publish_tracking_event("tracking_point_created");
-    if !geofence_events.is_empty() {
+    if !geofence_evaluation.transitions.is_empty() {
         publish_tracking_event("geofence_transition");
     }
 
@@ -2763,7 +3018,8 @@ pub async fn create_tracking_point(
         Json(json!({
             "message": "Tracking point recorded",
             "trackingId": tracking_id,
-            "geofenceEvents": geofence_events,
+            "geofenceEvents": geofence_evaluation.transitions,
+            "automaticCheckIns": geofence_evaluation.automatic_check_ins,
         })),
     ))
 }

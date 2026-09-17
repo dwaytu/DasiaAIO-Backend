@@ -103,6 +103,13 @@ pub async fn require_manage_users(req: Request<Body>, next: Next) -> Result<Resp
     authorize_permission(req, next, "create_user").await
 }
 
+pub async fn require_manage_guard_passwords(
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, AppError> {
+    authorize_permission(req, next, "manage_guard_passwords").await
+}
+
 pub async fn require_guard_approval_management(
     req: Request<Body>,
     next: Next,

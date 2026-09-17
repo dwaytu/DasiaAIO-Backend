@@ -576,7 +576,7 @@ pub async fn login(
 
     // Find user by email, username, or phone
     let user = sqlx::query(
-        r#"SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, COALESCE(approval_status, 'approved') AS approval_status, consent_accepted_at, consent_version, created_at, updated_at FROM users 
+        r#"SELECT id, email, username, password, role, full_name, phone_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, must_change_password, COALESCE(approval_status, 'approved') AS approval_status, consent_accepted_at, consent_version, created_at, updated_at FROM users
            WHERE email = $1 OR username = $1 OR phone_number = $1"#
     )
     .bind(identifier)
@@ -703,6 +703,7 @@ pub async fn login(
         user.try_get("consent_accepted_at").ok();
     let consent_version: Option<String> = user.try_get("consent_version").ok();
     let legal_consent_accepted = consent_accepted_at.is_some();
+    let must_change_password: bool = user.try_get("must_change_password").unwrap_or(false);
 
     sqlx::query("UPDATE users SET last_seen_at = CURRENT_TIMESTAMP WHERE id = $1")
         .bind(&id)
@@ -767,6 +768,7 @@ pub async fn login(
             "consentAcceptedAt": consent_accepted_at,
             "consentVersion": consent_version,
             "legalConsentAccepted": legal_consent_accepted,
+            "mustChangePassword": must_change_password,
         }
     })))
 }
@@ -1242,7 +1244,7 @@ pub async fn reset_password(
         ));
     }
 
-    sqlx::query("UPDATE users SET password = $1 WHERE id = $2")
+    sqlx::query("UPDATE users SET password = $1, must_change_password = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
         .bind(&hashed_password)
         .bind(&user_id)
         .execute(&mut *tx)

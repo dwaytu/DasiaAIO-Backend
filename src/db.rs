@@ -51,7 +51,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         r#"
         CREATE TABLE IF NOT EXISTS users (
             id VARCHAR(36) PRIMARY KEY,
-            email VARCHAR(255) NOT NULL UNIQUE,
+            email VARCHAR(255) NOT NULL,
             username VARCHAR(255) NOT NULL UNIQUE,
             password VARCHAR(255) NOT NULL,
             role VARCHAR(50) NOT NULL DEFAULT 'guard',
@@ -101,6 +101,22 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             AppError::DatabaseError(format!("Failed to add profile_photo column: {}", e))
         })?;
 
+    // MDR-created guards intentionally have no email address. Keep real email
+    // addresses unique while allowing multiple imported guards to remain blank.
+    sqlx::query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_key")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to update users email constraint: {}", e))
+        })?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_non_blank_unique ON users (email) WHERE BTRIM(email) <> ''",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create users email index: {}", e))
+    })?;
     // Add license_issued_date column
     sqlx::query(
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS license_issued_date TIMESTAMP WITH TIME ZONE",
@@ -141,6 +157,18 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         .execute(pool)
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to add created_by column: {}", e)))?;
+
+    sqlx::query(
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT false",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to add must_change_password column: {}",
+            e
+        ))
+    })?;
 
     sqlx::query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP WITH TIME ZONE")
         .execute(pool)
@@ -475,6 +503,30 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             .await
             .map_err(|e| AppError::DatabaseError(format!("Failed MDR schema alter: {}", e)))?;
     }
+
+    // Existing MDR-created guards used the old shared bootstrap password. Force
+    // those imported accounts through the administrator handoff workflow too.
+    sqlx::query(
+        "UPDATE users SET must_change_password = TRUE WHERE LOWER(role) = 'guard' AND must_change_password = FALSE AND mdr_batch_id IS NOT NULL",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to mark imported guard accounts for activation: {}",
+            e
+        ))
+    })?;
+
+    // Clear legacy generated addresses after the MDR ownership column exists.
+    sqlx::query(
+        "UPDATE users SET email = '' WHERE LOWER(role) = 'guard' AND mdr_batch_id IS NOT NULL AND email LIKE '%@sentinel.local'",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to clear legacy imported guard emails: {}", e))
+    })?;
 
     sqlx::query(
         r#"
@@ -1065,6 +1117,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             check_in_time TIMESTAMP WITH TIME ZONE NOT NULL,
             check_out_time TIMESTAMP WITH TIME ZONE,
             status VARCHAR(50) NOT NULL DEFAULT 'checked_in',
+            check_in_source VARCHAR(20) NOT NULL DEFAULT 'manual',
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (guard_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -1075,6 +1128,13 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .execute(pool)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create attendance table: {}", e)))?;
+
+    sqlx::query(
+        "ALTER TABLE attendance ADD COLUMN IF NOT EXISTS check_in_source VARCHAR(20) NOT NULL DEFAULT 'manual'",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to add attendance check-in source: {}", e)))?;
 
     for analytics_index in &[
         "CREATE INDEX IF NOT EXISTS idx_shifts_analytics_window ON shifts(start_time, end_time, status, guard_id)",
@@ -1497,6 +1557,39 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .map_err(|e| {
         AppError::DatabaseError(format!("Failed to create guard_availability table: {}", e))
     })?;
+
+    // Store a guard's pre-shift equipment confirmation per assigned shift.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS guard_shift_readiness (
+            id VARCHAR(36) PRIMARY KEY,
+            shift_id VARCHAR(36) NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+            guard_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            checked_items JSONB NOT NULL DEFAULT '[]'::jsonb,
+            notes TEXT,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT guard_shift_readiness_shift_guard_unique UNIQUE (shift_id, guard_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to create guard_shift_readiness table: {}",
+            e
+        ))
+    })?;
+
+    for readiness_index in [
+        "CREATE INDEX IF NOT EXISTS idx_guard_shift_readiness_guard ON guard_shift_readiness(guard_id, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_guard_shift_readiness_shift ON guard_shift_readiness(shift_id)",
+    ] {
+        sqlx::query(readiness_index).execute(pool).await.map_err(|e| {
+            AppError::DatabaseError(format!("Failed to create readiness index: {}", e))
+        })?;
+    }
 
     // Older databases may have the base shifts table without replacement workflow fields.
     for migration in &[
