@@ -1154,6 +1154,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         CREATE TABLE IF NOT EXISTS armored_cars (
             id VARCHAR(36) PRIMARY KEY,
             license_plate VARCHAR(50) NOT NULL UNIQUE,
+            plate_number VARCHAR(50),
             vin VARCHAR(100) NOT NULL UNIQUE,
             model VARCHAR(255) NOT NULL,
             manufacturer VARCHAR(255) NOT NULL,
@@ -1368,11 +1369,21 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         "ALTER TABLE trips ADD COLUMN IF NOT EXISTS destination VARCHAR(500)",
         "ALTER TABLE trips ALTER COLUMN start_location DROP NOT NULL",
         "ALTER TABLE armored_cars ADD COLUMN IF NOT EXISTS passenger_capacity INTEGER DEFAULT 4",
+        "ALTER TABLE armored_cars ADD COLUMN IF NOT EXISTS plate_number VARCHAR(50)",
     ] {
         sqlx::query(migration).execute(pool).await.map_err(|e| {
             AppError::DatabaseError(format!("Migration failed '{}': {}", migration, e))
         })?;
     }
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_armored_cars_plate_number_unique ON armored_cars (LOWER(BTRIM(plate_number))) WHERE plate_number IS NOT NULL AND BTRIM(plate_number) <> ''",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create armored car plate index: {}", e))
+    })?;
 
     // Create notifications table
     sqlx::query(

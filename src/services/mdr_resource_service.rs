@@ -49,7 +49,7 @@ pub async fn export_current_resources(pool: &PgPool) -> AppResult<MdrResourceExp
     .map_err(|error| AppError::DatabaseError(format!("Failed to export firearm records: {error}")))?;
 
     let vehicles = sqlx::query(
-        "SELECT id, COALESCE(license_plate, '') AS license_plate, COALESCE(vin, '') AS vin, COALESCE(model, '') AS model, COALESCE(manufacturer, '') AS manufacturer, COALESCE(capacity_kg::TEXT, '') AS capacity_kg, COALESCE(passenger_capacity::TEXT, '') AS passenger_capacity, COALESCE(status, '') AS status, COALESCE(registration_expiry::TEXT, '') AS registration_expiry, COALESCE(insurance_expiry::TEXT, '') AS insurance_expiry FROM armored_cars ORDER BY LOWER(license_plate)",
+        "SELECT id, COALESCE(license_plate, '') AS license_plate, COALESCE(plate_number, '') AS plate_number, COALESCE(vin, '') AS vin, COALESCE(model, '') AS model, COALESCE(manufacturer, '') AS manufacturer, COALESCE(capacity_kg::TEXT, '') AS capacity_kg, COALESCE(passenger_capacity::TEXT, '') AS passenger_capacity, COALESCE(status, '') AS status, COALESCE(registration_expiry::TEXT, '') AS registration_expiry, COALESCE(insurance_expiry::TEXT, '') AS insurance_expiry FROM armored_cars ORDER BY LOWER(license_plate)",
     )
     .fetch_all(pool)
     .await
@@ -126,7 +126,8 @@ pub async fn export_current_resources(pool: &PgPool) -> AppResult<MdrResourceExp
         &mut csv,
         &[
             "ID".to_string(),
-            "License Plate".to_string(),
+            "A/C Number".to_string(),
+            "Plate Number".to_string(),
             "VIN".to_string(),
             "Model".to_string(),
             "Manufacturer".to_string(),
@@ -143,6 +144,7 @@ pub async fn export_current_resources(pool: &PgPool) -> AppResult<MdrResourceExp
             &[
                 row_text(row, "id")?,
                 row_text(row, "license_plate")?,
+                row_text(row, "plate_number")?,
                 row_text(row, "vin")?,
                 row_text(row, "model")?,
                 row_text(row, "manufacturer")?,

@@ -380,6 +380,7 @@ pub struct SetShiftReadinessRequest {
 pub struct ArmoredCar {
     pub id: String,
     pub license_plate: String,
+    pub plate_number: Option<String>,
     pub vin: String,
     pub model: String,
     pub manufacturer: String,
@@ -398,6 +399,8 @@ pub struct ArmoredCar {
 #[serde(rename_all = "camelCase")]
 pub struct CreateArmoredCarRequest {
     pub license_plate: String,
+    #[serde(default)]
+    pub plate_number: Option<String>,
     #[serde(default)]
     pub vin: Option<String>,
     #[serde(default)]

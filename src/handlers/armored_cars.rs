@@ -45,6 +45,13 @@ pub async fn add_armored_car(
         return Err(AppError::BadRequest("A/C number is required".to_string()));
     }
 
+    let plate_number = payload
+        .plate_number
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("Plate number is required".to_string()))?;
+
     let id = utils::generate_id();
     // The legacy table still requires these columns, but they are no longer
     // part of the vehicle workflow. Keep supplied values for old API clients
@@ -70,10 +77,11 @@ pub async fn add_armored_car(
         .unwrap_or("Not provided");
 
     sqlx::query(
-        "INSERT INTO armored_cars (id, license_plate, vin, model, manufacturer, capacity_kg, passenger_capacity, registration_expiry, insurance_expiry, status) VALUES ($1, $2, $3, $4, $5, 0, 4, $6, $7, $8)"
+        "INSERT INTO armored_cars (id, license_plate, plate_number, vin, model, manufacturer, capacity_kg, passenger_capacity, registration_expiry, insurance_expiry, status) VALUES ($1, $2, $3, $4, $5, $6, 0, 4, $7, $8, $9)"
     )
     .bind(&id)
     .bind(ac_number)
+    .bind(plate_number)
     .bind(vin)
     .bind(model)
     .bind(manufacturer)
@@ -97,7 +105,7 @@ pub async fn get_all_armored_cars(
     State(db): State<Arc<PgPool>>,
 ) -> AppResult<Json<Vec<ArmoredCar>>> {
     let cars = sqlx::query_as::<_, ArmoredCar>(
-        "SELECT id, license_plate, vin, model, manufacturer, capacity_kg, passenger_capacity, status, registration_expiry, insurance_expiry, last_maintenance_date, mileage, created_at, updated_at FROM armored_cars"
+        "SELECT id, license_plate, plate_number, vin, model, manufacturer, capacity_kg, passenger_capacity, status, registration_expiry, insurance_expiry, last_maintenance_date, mileage, created_at, updated_at FROM armored_cars"
     )
     .fetch_all(db.as_ref())
     .await
@@ -111,7 +119,7 @@ pub async fn get_armored_car_by_id(
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     let car = sqlx::query_as::<_, ArmoredCar>(
-        "SELECT id, license_plate, vin, model, manufacturer, capacity_kg, passenger_capacity, status, registration_expiry, insurance_expiry, last_maintenance_date, mileage, created_at, updated_at FROM armored_cars WHERE id = $1"
+        "SELECT id, license_plate, plate_number, vin, model, manufacturer, capacity_kg, passenger_capacity, status, registration_expiry, insurance_expiry, last_maintenance_date, mileage, created_at, updated_at FROM armored_cars WHERE id = $1"
     )
     .bind(&id)
     .fetch_optional(db.as_ref())
@@ -142,7 +150,7 @@ pub async fn update_armored_car(
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
     let car = sqlx::query_as::<_, ArmoredCar>(
-        "SELECT id, license_plate, vin, model, manufacturer, capacity_kg, passenger_capacity, status, registration_expiry, insurance_expiry, last_maintenance_date, mileage, created_at, updated_at FROM armored_cars WHERE id = $1"
+        "SELECT id, license_plate, plate_number, vin, model, manufacturer, capacity_kg, passenger_capacity, status, registration_expiry, insurance_expiry, last_maintenance_date, mileage, created_at, updated_at FROM armored_cars WHERE id = $1"
     )
     .bind(&id)
     .fetch_optional(db.as_ref())
