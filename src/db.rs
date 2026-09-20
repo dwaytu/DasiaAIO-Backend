@@ -493,6 +493,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
 
     for alter_sql in &[
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS guard_number INTEGER",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS guard_code VARCHAR(32)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active'",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS mdr_batch_id VARCHAR(36)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS lic_reg_name VARCHAR(100)",
@@ -503,6 +504,111 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             .await
             .map_err(|e| AppError::DatabaseError(format!("Failed MDR schema alter: {}", e)))?;
     }
+
+    // Guard codes are operational identifiers. PostgreSQL owns allocation so
+    // concurrent guard creation and MDR imports cannot reuse a code.
+    sqlx::query("CREATE SEQUENCE IF NOT EXISTS guard_code_sequence START WITH 1")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to create guard code sequence: {}", e))
+        })?;
+
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION sentinel_assign_guard_code()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF LOWER(BTRIM(NEW.role)) IN ('guard', 'user') AND NEW.guard_code IS NULL THEN
+                PERFORM pg_advisory_xact_lock(9042107);
+                NEW.guard_code := 'G-' || LPAD(nextval('guard_code_sequence')::TEXT, 4, '0');
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to create guard code trigger function: {}",
+            e
+        ))
+    })?;
+
+    sqlx::query("DROP TRIGGER IF EXISTS users_assign_guard_code ON users")
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!("Failed to replace guard code trigger: {}", e))
+        })?;
+
+    sqlx::query(
+        "CREATE TRIGGER users_assign_guard_code BEFORE INSERT OR UPDATE OF role ON users FOR EACH ROW EXECUTE FUNCTION sentinel_assign_guard_code()",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create guard code trigger: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        DO $$
+        DECLARE
+            max_code BIGINT;
+            sequence_value BIGINT;
+            sequence_called BOOLEAN;
+        BEGIN
+            PERFORM pg_advisory_xact_lock(9042107);
+            SELECT COALESCE(MAX((substring(guard_code FROM '^G-([0-9]+)$'))::BIGINT), 0)
+            INTO max_code
+            FROM users
+            WHERE guard_code ~ '^G-[0-9]+$';
+            SELECT last_value, is_called INTO sequence_value, sequence_called
+            FROM guard_code_sequence;
+            PERFORM setval(
+                'guard_code_sequence',
+                GREATEST(max_code, sequence_value, 1),
+                sequence_called OR max_code >= 1
+            );
+            UPDATE users
+            SET guard_code = 'G-' || LPAD(nextval('guard_code_sequence')::TEXT, 4, '0')
+            WHERE LOWER(BTRIM(role)) IN ('guard', 'user') AND guard_code IS NULL;
+        END $$
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to align and backfill guard codes: {}", e))
+    })?;
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_guard_code_unique ON users (guard_code) WHERE guard_code IS NOT NULL",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create guard code index: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.table_constraints
+                WHERE table_name = 'users' AND constraint_name = 'users_guard_code_format_check'
+            ) THEN
+                ALTER TABLE users
+                    ADD CONSTRAINT users_guard_code_format_check
+                    CHECK (guard_code IS NULL OR guard_code ~ '^G-[0-9]{4,}$');
+            END IF;
+        END $$
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to validate guard code format: {}", e)))?;
 
     // Existing MDR-created guards used the old shared bootstrap password. Force
     // those imported accounts through the administrator handoff workflow too.

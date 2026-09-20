@@ -237,7 +237,7 @@ pub async fn create_user_by_actor(
         "approved"
     };
 
-    sqlx::query(
+    let guard_code = sqlx::query_scalar::<_, Option<String>>(
         r#"INSERT INTO users (
             id, email, username, password, role, full_name, phone_number,
             guard_number, license_number, license_issued_date, license_expiry_date, address,
@@ -250,7 +250,8 @@ pub async fn create_user_by_actor(
             CASE WHEN $13 = 'approved' THEN $14 ELSE NULL END,
             CASE WHEN $13 = 'approved' THEN CURRENT_TIMESTAMP ELSE NULL END,
             $14
-        )"#,
+        )
+        RETURNING guard_code"#,
     )
     .bind(&user_id)
     .bind(&payload.email)
@@ -266,7 +267,7 @@ pub async fn create_user_by_actor(
     .bind(&payload.address)
     .bind(approval_status)
     .bind(&claims.sub)
-    .execute(db.as_ref())
+    .fetch_one(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create user: {}", e)))?;
 
@@ -318,6 +319,7 @@ pub async fn create_user_by_actor(
                 "User created successfully"
             },
             "userId": user_id,
+            "guardCode": guard_code,
             "role": target_role,
             "approvalStatus": approval_status,
             "requiresApproval": requires_approval
@@ -340,7 +342,7 @@ pub async fn get_all_users(
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
     let users = sqlx::query_as::<_, User>(
-        "SELECT id, email, username, password, role, full_name, phone_number, guard_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, last_seen_at, created_at, updated_at FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2"
+        "SELECT id, email, username, password, role, full_name, phone_number, guard_number, guard_code, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, last_seen_at, created_at, updated_at FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2"
     )
     .bind(page_size)
     .bind(offset)
@@ -366,7 +368,7 @@ pub async fn get_guards(
 
     let guards = sqlx::query_as::<_, User>(
         r#"SELECT id, email, username, password, role, full_name, phone_number,
-                  guard_number, license_number, license_issued_date, license_expiry_date, address,
+                  guard_number, guard_code, license_number, license_issued_date, license_expiry_date, address,
                   profile_photo, verified, last_seen_at, created_at, updated_at
            FROM users
            WHERE LOWER(role) = 'guard'
@@ -557,7 +559,7 @@ pub async fn get_user_by_id(
     let _claims = utils::require_self_or_min_role(&headers, &id, "supervisor")?;
 
     let user = sqlx::query_as::<_, User>(
-        "SELECT id, email, username, password, role, full_name, phone_number, guard_number, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, last_seen_at, created_at, updated_at FROM users WHERE id = $1"
+        "SELECT id, email, username, password, role, full_name, phone_number, guard_number, guard_code, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, last_seen_at, created_at, updated_at FROM users WHERE id = $1"
     )
     .bind(&id)
     .fetch_optional(db.as_ref())
