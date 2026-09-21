@@ -81,8 +81,12 @@ pub struct UserResponse {
     pub license_number: Option<String>,
     pub license_issued_date: Option<DateTime<Utc>>,
     pub license_expiry_date: Option<DateTime<Utc>>,
+    pub address: Option<String>,
     pub profile_photo: Option<String>,
+    pub verified: bool,
     pub last_seen_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl From<User> for UserResponse {
@@ -99,8 +103,12 @@ impl From<User> for UserResponse {
             license_number: user.license_number,
             license_issued_date: user.license_issued_date,
             license_expiry_date: user.license_expiry_date,
+            address: user.address,
             profile_photo: user.profile_photo,
+            verified: user.verified,
             last_seen_at: user.last_seen_at,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
         }
     }
 }

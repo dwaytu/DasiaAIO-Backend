@@ -527,7 +527,7 @@ pub async fn send_confirmation_email(api_key: &str, to_email: &str, code: &str) 
 #[cfg(test)]
 mod tests {
     use super::{
-        can_manage_role, extract_requester_with_proxy_trust, has_permission,
+        can_create_role, can_manage_role, extract_requester_with_proxy_trust, has_permission,
         normalize_authenticated_role, verify_refresh_token, verify_token, RefreshTokenClaims,
         TokenClaims,
     };
@@ -660,6 +660,15 @@ mod tests {
         assert!(!can_manage_role("supervisor", " SUPERVISOR "));
         assert!(!can_manage_role("unknown", "guard"));
         assert!(!can_manage_role("superadmin", "unknown"));
+    }
+
+    #[test]
+    fn supervisor_can_create_only_guard_accounts() {
+        assert!(can_create_role("supervisor", "guard"));
+        assert!(!can_create_role("supervisor", "supervisor"));
+        assert!(!can_create_role("supervisor", "admin"));
+        assert!(!can_create_role("supervisor", "superadmin"));
+        assert!(!can_create_role("supervisor", "unknown"));
     }
 
     #[test]

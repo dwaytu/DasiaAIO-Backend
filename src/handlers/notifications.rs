@@ -42,10 +42,22 @@ pub async fn get_user_notifications(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
-    let unread_count = notifications.iter().filter(|n| !n.read).count();
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notifications WHERE user_id = $1")
+        .bind(&user_id)
+        .fetch_one(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to count notifications: {}", e)))?;
+
+    let unread_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND read = false",
+    )
+    .bind(&user_id)
+    .fetch_one(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to count unread notifications: {}", e)))?;
 
     Ok(Json(json!({
-        "total": notifications.len(),
+        "total": total,
         "unreadCount": unread_count,
         "notifications": notifications
     })))

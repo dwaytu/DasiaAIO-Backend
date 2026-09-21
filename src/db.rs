@@ -1524,6 +1524,37 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         ))
     })?;
 
+    // A compliance condition stays actionable until it is read. Retain the newest
+    // unread alert per recipient and condition so older daily reminders do not flood
+    // the Inbox while keeping read notification history intact.
+    sqlx::query(
+        r#"
+        DELETE FROM notifications duplicate
+        USING (
+            SELECT id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY user_id, type, title
+                       ORDER BY created_at DESC, id DESC
+                   ) AS duplicate_rank
+            FROM notifications
+            WHERE read = false
+              AND type IN ('guard_compliance', 'firearm_compliance')
+        ) ranked
+        WHERE duplicate.id = ranked.id
+          AND ranked.duplicate_rank > 1
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to consolidate unread compliance notifications: {}", e)))?;
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_unread_compliance_dedupe ON notifications(user_id, type, title) WHERE read = false AND type IN ('guard_compliance', 'firearm_compliance')",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create unread compliance notification index: {}", e)))?;
+
     // External notification delivery is asynchronous so approval and operational
     // workflows remain available when an email or push provider is unavailable.
     for migration in [

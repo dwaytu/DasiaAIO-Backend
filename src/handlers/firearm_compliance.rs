@@ -284,7 +284,7 @@ pub async fn create_expiry_notifications(
 
         for recipient_id in &recipients {
             let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'firearm_compliance' AND title = $2 AND created_at >= NOW() - INTERVAL '24 hours')",
+                "SELECT EXISTS(SELECT 1 FROM notifications WHERE user_id = $1 AND type = 'firearm_compliance' AND title = $2 AND read = false)",
             )
             .bind(recipient_id)
             .bind(&title)
@@ -297,7 +297,7 @@ pub async fn create_expiry_notifications(
             }
 
             sqlx::query(
-                "INSERT INTO notifications (id, user_id, title, message, type, related_shift_id, read) VALUES ($1, $2, $3, $4, 'firearm_compliance', NULL, false)",
+                "INSERT INTO notifications (id, user_id, title, message, type, related_shift_id, read) VALUES ($1, $2, $3, $4, 'firearm_compliance', NULL, false) ON CONFLICT DO NOTHING",
             )
             .bind(utils::generate_id())
             .bind(recipient_id)
