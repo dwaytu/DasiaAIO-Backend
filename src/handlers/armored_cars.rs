@@ -158,6 +158,36 @@ pub async fn update_armored_car(
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
     .ok_or_else(|| AppError::NotFound("Armored car not found".to_string()))?;
 
+    if let Some(license_plate) = payload.license_plate {
+        let license_plate = license_plate.trim();
+        if license_plate.is_empty() {
+            return Err(AppError::BadRequest("A/C number is required".to_string()));
+        }
+        sqlx::query(
+            "UPDATE armored_cars SET license_plate = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+        )
+        .bind(license_plate)
+        .bind(&id)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to update armored car: {}", e)))?;
+    }
+
+    if let Some(plate_number) = payload.plate_number {
+        let plate_number = plate_number.trim();
+        if plate_number.is_empty() {
+            return Err(AppError::BadRequest("Plate number is required".to_string()));
+        }
+        sqlx::query(
+            "UPDATE armored_cars SET plate_number = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+        )
+        .bind(plate_number)
+        .bind(&id)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to update armored car: {}", e)))?;
+    }
+
     let status = validate_armored_car_status(payload.status.as_deref().unwrap_or(&car.status))?;
     let mileage = payload.mileage.unwrap_or(car.mileage);
     let registration_expiry = payload.registration_expiry.or(car.registration_expiry);

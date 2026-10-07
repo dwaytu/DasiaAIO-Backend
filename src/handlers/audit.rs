@@ -171,7 +171,7 @@ pub async fn get_user_activity(
                al.created_at
            FROM audit_logs al
            WHERE al.actor_user_id = $1
-             AND al.created_at >= (CURRENT_TIMESTAMP - ($2 || ' hours')::interval)
+             AND al.created_at >= (sentinel_now() - ($2 || ' hours')::interval)
            ORDER BY al.created_at ASC
            LIMIT $3"#,
     )
@@ -209,7 +209,7 @@ pub async fn get_user_activity(
                COUNT(*) AS event_count
            FROM audit_logs al
            WHERE al.actor_user_id = $1
-             AND al.created_at >= (CURRENT_TIMESTAMP - ($2 || ' hours')::interval)
+             AND al.created_at >= (sentinel_now() - ($2 || ' hours')::interval)
            GROUP BY hour_bucket
            ORDER BY hour_bucket"#,
     )
@@ -261,7 +261,7 @@ pub async fn get_audit_anomalies(
            FROM audit_logs al
            LEFT JOIN users u ON u.id = al.actor_user_id
            WHERE al.result = 'failed'
-             AND al.created_at >= (CURRENT_TIMESTAMP - ($1 || ' hours')::interval)
+             AND al.created_at >= (sentinel_now() - ($1 || ' hours')::interval)
            GROUP BY al.actor_user_id, actor_name
            HAVING COUNT(*) >= 4
            ORDER BY failed_count DESC
@@ -299,7 +299,7 @@ pub async fn get_audit_anomalies(
         r#"WITH hourly AS (
                SELECT date_trunc('hour', created_at) AS bucket, COUNT(*) AS event_total
                FROM audit_logs
-               WHERE created_at >= (CURRENT_TIMESTAMP - ($1 || ' hours')::interval)
+               WHERE created_at >= (sentinel_now() - ($1 || ' hours')::interval)
                GROUP BY bucket
            ), stats AS (
                SELECT COALESCE(AVG(event_total), 0) AS avg_total,
@@ -348,7 +348,7 @@ pub async fn get_audit_anomalies(
                COUNT(*) FILTER (WHERE result = 'failed') AS failed_total
            FROM audit_logs
            WHERE source_ip IS NOT NULL
-             AND created_at >= (CURRENT_TIMESTAMP - ($1 || ' hours')::interval)
+             AND created_at >= (sentinel_now() - ($1 || ' hours')::interval)
            GROUP BY source_ip
            HAVING COUNT(*) >= 12
               AND COUNT(*) FILTER (WHERE result = 'failed') >= 4

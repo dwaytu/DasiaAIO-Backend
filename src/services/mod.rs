@@ -3,6 +3,7 @@ pub mod geofence_alert_service;
 pub mod guard_prediction_service;
 pub mod incident_severity_classifier;
 pub mod incident_summary_service;
+pub mod mdr_data_cleansing;
 pub mod mdr_import_service;
 pub mod mdr_resource_service;
 pub mod notification_delivery;

@@ -5,17 +5,31 @@ pub async fn init_db_pool(
     database_url: &str,
     max_connections: u32,
     acquire_timeout_secs: u32,
+    presentation_reference_time: Option<&str>,
 ) -> AppResult<PgPool> {
     const MAX_RETRIES: u32 = 10;
     const RETRY_DELAY_SECS: u64 = 5;
 
     for attempt in 1..=MAX_RETRIES {
-        match PgPoolOptions::new()
+        let mut pool_options = PgPoolOptions::new()
             .max_connections(max_connections)
-            .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs as u64))
-            .connect(database_url)
-            .await
-        {
+            .acquire_timeout(std::time::Duration::from_secs(acquire_timeout_secs as u64));
+
+        if let Some(reference_time) = presentation_reference_time {
+            let reference_time = reference_time.to_string();
+            pool_options = pool_options.after_connect(move |connection, _| {
+                let reference_time = reference_time.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('sentinel.reference_time', $1, false)")
+                        .bind(reference_time)
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            });
+        }
+
+        match pool_options.connect(database_url).await {
             Ok(pool) => {
                 tracing::info!(
                     "✓ Database connected on attempt {}/{}",
@@ -46,6 +60,31 @@ pub async fn init_db_pool(
 }
 
 pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
+    // An explicitly enabled capstone reference clock affects only read queries that
+    // call sentinel_now(); all ordinary production writes retain PostgreSQL time.
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION sentinel_now()
+        RETURNS TIMESTAMPTZ
+        LANGUAGE SQL
+        STABLE
+        AS $$
+            SELECT COALESCE(
+                NULLIF(current_setting('sentinel.reference_time', true), '')::TIMESTAMPTZ,
+                CURRENT_TIMESTAMP
+            )
+        $$
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to create capstone reference clock function: {}",
+            e
+        ))
+    })?;
+
     // Create users table
     sqlx::query(
         r#"
@@ -387,6 +426,50 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .await
     .map_err(|e| {
         AppError::DatabaseError(format!("Failed to create mdr_staging_rows table: {}", e))
+    })?;
+
+    // Preserve source values and deterministic cleaning decisions separately from
+    // the staged values that are used for matching and commit.
+    for migration_sql in &[
+        "ALTER TABLE mdr_staging_rows ADD COLUMN IF NOT EXISTS raw_payload JSONB",
+        "ALTER TABLE mdr_staging_rows ADD COLUMN IF NOT EXISTS cleansing_changes JSONB NOT NULL DEFAULT '[]'::jsonb",
+        "ALTER TABLE mdr_staging_rows ADD COLUMN IF NOT EXISTS quality_flags JSONB NOT NULL DEFAULT '[]'::jsonb",
+        "ALTER TABLE mdr_staging_rows ADD COLUMN IF NOT EXISTS cleansed_at TIMESTAMP WITH TIME ZONE",
+    ] {
+        sqlx::query(migration_sql).execute(pool).await.map_err(|e| {
+            AppError::DatabaseError(format!("Failed to add MDR data-quality schema: {}", e))
+        })?;
+    }
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS data_quality_change_log (
+            id VARCHAR(36) PRIMARY KEY,
+            entity_type VARCHAR(50) NOT NULL,
+            entity_id VARCHAR(36) NOT NULL,
+            field_name VARCHAR(100) NOT NULL,
+            original_value TEXT,
+            cleaned_value TEXT,
+            change_source VARCHAR(100) NOT NULL,
+            applied_by VARCHAR(36) REFERENCES users(id),
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create data-quality change log: {}", e))
+    })?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_data_quality_change_log_entity ON data_quality_change_log(entity_type, entity_id, created_at DESC)",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create data-quality change-log index: {}", e))
     })?;
 
     for index_sql in &[
@@ -1546,7 +1629,12 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     )
     .execute(pool)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to consolidate unread compliance notifications: {}", e)))?;
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to consolidate unread compliance notifications: {}",
+            e
+        ))
+    })?;
 
     sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_unread_compliance_dedupe ON notifications(user_id, type, title) WHERE read = false AND type IN ('guard_compliance', 'firearm_compliance')",
@@ -2259,6 +2347,44 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             .await
             .map_err(|e| AppError::DatabaseError(format!("Failed to create audit index: {}", e)))?;
     }
+
+    // Provenance ledger for the explicitly authorized capstone dataset. It tracks
+    // generated IDs without adding presentation metadata to operational tables.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS capstone_seed_batches (
+            batch_id VARCHAR(80) PRIMARY KEY,
+            data_origin VARCHAR(80) NOT NULL,
+            reference_at TIMESTAMPTZ NOT NULL,
+            status VARCHAR(20) NOT NULL,
+            seeded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMPTZ,
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!(
+            "Failed to create capstone seed batch ledger: {}",
+            e
+        ))
+    })?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS capstone_seed_records (
+            batch_id VARCHAR(80) NOT NULL REFERENCES capstone_seed_batches(batch_id) ON DELETE CASCADE,
+            table_name VARCHAR(100) NOT NULL,
+            record_id VARCHAR(100) NOT NULL,
+            PRIMARY KEY (batch_id, table_name, record_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create capstone seed record ledger: {}", e)))?;
 
     // Create indexes for password_reset_tokens table
     for index in &[

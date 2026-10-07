@@ -8,6 +8,7 @@ pub struct Config {
     pub admin_code: String,
     pub db_pool_max_connections: u32,
     pub db_pool_acquire_timeout_secs: u32,
+    pub presentation_reference_time: Option<String>,
 }
 
 fn is_production_env(value: &str) -> bool {
@@ -115,6 +116,16 @@ impl Config {
             admin_code,
             db_pool_max_connections,
             db_pool_acquire_timeout_secs,
+            presentation_reference_time: match env::var("CAPSTONE_REFERENCE_CLOCK_MODE") {
+                Ok(mode) if mode.trim().eq_ignore_ascii_case("capstone-live") || mode.trim().eq_ignore_ascii_case("presentation") => {
+                    let value = require_non_empty_env("CAPSTONE_REFERENCE_DATE")?;
+                    chrono::DateTime::parse_from_rfc3339(&value).map_err(|_| {
+                        "CAPSTONE_REFERENCE_DATE must be an RFC 3339 timestamp.".to_string()
+                    })?;
+                    Some(value)
+                }
+                _ => None,
+            },
         };
 
         if is_production_env(&config.app_env) {

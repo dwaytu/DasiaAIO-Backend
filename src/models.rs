@@ -63,6 +63,7 @@ pub struct User {
     pub profile_photo: Option<String>,
     pub verified: bool,
     pub last_seen_at: Option<DateTime<Utc>>,
+    pub last_activity_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -85,6 +86,7 @@ pub struct UserResponse {
     pub profile_photo: Option<String>,
     pub verified: bool,
     pub last_seen_at: Option<DateTime<Utc>>,
+    pub last_activity_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -107,6 +109,7 @@ impl From<User> for UserResponse {
             profile_photo: user.profile_photo,
             verified: user.verified,
             last_seen_at: user.last_seen_at,
+            last_activity_at: user.last_activity_at,
             created_at: user.created_at,
             updated_at: user.updated_at,
         }
@@ -205,8 +208,11 @@ pub struct CreateFirearmRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateFirearmRequest {
+    pub serial_number: Option<String>,
+    pub model: Option<String>,
     pub status: Option<String>,
     pub caliber: Option<String>,
+    pub license_expiry_date: Option<String>,
 }
 
 // Firearm Allocation model
@@ -425,6 +431,8 @@ pub struct CreateArmoredCarRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateArmoredCarRequest {
+    pub license_plate: Option<String>,
+    pub plate_number: Option<String>,
     pub status: Option<String>,
     pub mileage: Option<i32>,
     pub registration_expiry: Option<DateTime<Utc>>,
@@ -1207,5 +1215,9 @@ pub struct MdrStagingRow {
     pub matched_firearm_id: Option<String>,
     pub matched_client_id: Option<String>,
     pub validation_errors: Option<serde_json::Value>,
+    pub raw_payload: Option<serde_json::Value>,
+    pub cleansing_changes: serde_json::Value,
+    pub quality_flags: serde_json::Value,
+    pub cleansed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }

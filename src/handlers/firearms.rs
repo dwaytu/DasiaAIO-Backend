@@ -165,6 +165,40 @@ pub async fn update_firearm(
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("Firearm not found".to_string()))?;
 
+    if let Some(serial_number) = payload.serial_number {
+        let serial_number = serial_number.trim();
+        if serial_number.is_empty() {
+            return Err(AppError::ValidationError(
+                "Serial number cannot be empty".to_string(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE firearms SET serial_number = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+        )
+        .bind(serial_number)
+        .bind(&id)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to update firearm: {}", e)))?;
+    }
+
+    if let Some(model) = payload.model {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(AppError::ValidationError(
+                "Model cannot be empty".to_string(),
+            ));
+        }
+        sqlx::query(
+            "UPDATE firearms SET name = $1, model = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+        )
+        .bind(model)
+        .bind(&id)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to update firearm: {}", e)))?;
+    }
+
     if let Some(status) = payload.status {
         let normalized_status = validate_firearm_status(&status)?;
         sqlx::query(
@@ -191,6 +225,18 @@ pub async fn update_firearm(
         .execute(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
+    }
+
+    if let Some(license_expiry_date) = payload.license_expiry_date {
+        let license_expiry_date = parse_license_expiry_date(Some(license_expiry_date))?;
+        sqlx::query(
+            "UPDATE firearms SET validity_date = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+        )
+        .bind(license_expiry_date)
+        .bind(&id)
+        .execute(db.as_ref())
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to update firearm: {}", e)))?;
     }
 
     Ok(Json(json!({

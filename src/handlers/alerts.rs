@@ -60,11 +60,11 @@ pub async fn get_operational_risk_alerts(
         r#"
         SELECT
             COUNT(*)::BIGINT AS total,
-            MIN(GREATEST(CEIL(EXTRACT(EPOCH FROM (expiry_date - NOW())) / 86400.0), 0)) AS soonest_days
+            MIN(GREATEST(CEIL(EXTRACT(EPOCH FROM (expiry_date - sentinel_now())) / 86400.0), 0)) AS soonest_days
         FROM guard_firearm_permits
         WHERE status = 'active'
           AND expiry_date IS NOT NULL
-          AND expiry_date <= NOW() + INTERVAL '7 days'
+          AND expiry_date <= sentinel_now() + INTERVAL '7 days'
         "#,
     )
     .fetch_one(db.as_ref())
@@ -109,7 +109,7 @@ pub async fn get_operational_risk_alerts(
         JOIN armored_cars ac ON ac.id = cm.car_id
         WHERE cm.status = 'pending'
           AND cm.scheduled_date IS NOT NULL
-          AND cm.scheduled_date < NOW()
+          AND cm.scheduled_date < sentinel_now()
         ORDER BY cm.scheduled_date ASC
         LIMIT 5
         "#,
@@ -168,7 +168,7 @@ pub async fn get_operational_risk_alerts(
         FROM punctuality_records pr
         JOIN users u ON u.id = pr.guard_id
         WHERE pr.status = 'no_show'
-          AND pr.scheduled_start_time >= NOW() - INTERVAL '14 days'
+          AND pr.scheduled_start_time >= sentinel_now() - INTERVAL '14 days'
                 GROUP BY pr.guard_id, guard_name
         HAVING COUNT(*) >= 2
         ORDER BY no_shows DESC, guard_name ASC
@@ -227,8 +227,8 @@ pub async fn get_operational_risk_alerts(
         r#"
         SELECT
             (SELECT COUNT(*) FROM users WHERE role IN ('guard'))::BIGINT AS total_guards,
-            (SELECT COUNT(DISTINCT guard_id) FROM shifts WHERE DATE(start_time) = CURRENT_DATE + INTERVAL '1 day' AND status IN ('scheduled', 'in_progress'))::BIGINT AS scheduled_tomorrow,
-            (SELECT COUNT(DISTINCT guard_id) FROM shifts WHERE DATE(start_time) = CURRENT_DATE AND status IN ('scheduled', 'in_progress'))::BIGINT AS committed_today
+            (SELECT COUNT(DISTINCT guard_id) FROM shifts WHERE DATE(start_time) = sentinel_now()::date + INTERVAL '1 day' AND status IN ('scheduled', 'in_progress'))::BIGINT AS scheduled_tomorrow,
+            (SELECT COUNT(DISTINCT guard_id) FROM shifts WHERE DATE(start_time) = sentinel_now()::date AND status IN ('scheduled', 'in_progress'))::BIGINT AS committed_today
         "#,
     )
     .fetch_one(db.as_ref())

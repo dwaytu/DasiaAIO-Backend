@@ -342,7 +342,36 @@ pub async fn get_all_users(
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
     let users = sqlx::query_as::<_, User>(
-        "SELECT id, email, username, password, role, full_name, phone_number, guard_number, guard_code, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, last_seen_at, created_at, updated_at FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2"
+        r#"
+        SELECT
+            users.id, users.email, users.username, users.password, users.role,
+            users.full_name, users.phone_number, users.guard_number, users.guard_code,
+            users.license_number, users.license_issued_date, users.license_expiry_date,
+            users.address, users.profile_photo, users.verified, users.last_seen_at,
+            COALESCE(
+                users.last_seen_at,
+                (
+                    SELECT MAX(activity_at)
+                    FROM (
+                        SELECT MAX(attendance.updated_at) AS activity_at FROM attendance WHERE attendance.guard_id = users.id
+                        UNION ALL
+                        SELECT MAX(shifts.updated_at) AS activity_at FROM shifts WHERE shifts.guard_id = users.id
+                        UNION ALL
+                        SELECT MAX(feedback.created_at) AS activity_at FROM feedback WHERE feedback.user_id = users.id
+                        UNION ALL
+                        SELECT MAX(client_evaluations.created_at) AS activity_at FROM client_evaluations WHERE client_evaluations.guard_id = users.id
+                        UNION ALL
+                        SELECT MAX(support_tickets.updated_at) AS activity_at FROM support_tickets WHERE support_tickets.guard_id = users.id
+                        UNION ALL
+                        SELECT MAX(audit_logs.created_at) AS activity_at FROM audit_logs WHERE audit_logs.actor_user_id = users.id AND audit_logs.result = 'success'
+                    ) AS recorded_activity
+                )
+            ) AS last_activity_at,
+            users.created_at, users.updated_at
+        FROM users
+        ORDER BY users.created_at DESC
+        LIMIT $1 OFFSET $2
+        "#,
     )
     .bind(page_size)
     .bind(offset)
@@ -369,7 +398,7 @@ pub async fn get_guards(
     let guards = sqlx::query_as::<_, User>(
         r#"SELECT id, email, username, password, role, full_name, phone_number,
                   guard_number, guard_code, license_number, license_issued_date, license_expiry_date, address,
-                  profile_photo, verified, last_seen_at, created_at, updated_at
+                  profile_photo, verified, last_seen_at, last_seen_at AS last_activity_at, created_at, updated_at
            FROM users
            WHERE LOWER(role) = 'guard'
              AND verified = true
@@ -559,7 +588,7 @@ pub async fn get_user_by_id(
     let _claims = utils::require_self_or_min_role(&headers, &id, "supervisor")?;
 
     let user = sqlx::query_as::<_, User>(
-        "SELECT id, email, username, password, role, full_name, phone_number, guard_number, guard_code, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, last_seen_at, created_at, updated_at FROM users WHERE id = $1"
+        "SELECT id, email, username, password, role, full_name, phone_number, guard_number, guard_code, license_number, license_issued_date, license_expiry_date, address, profile_photo, verified, last_seen_at, last_seen_at AS last_activity_at, created_at, updated_at FROM users WHERE id = $1"
     )
     .bind(&id)
     .fetch_optional(db.as_ref())

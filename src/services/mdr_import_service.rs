@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use crate::{
     error::{AppError, AppResult},
+    services::mdr_data_cleansing,
     utils,
 };
 
@@ -59,10 +60,7 @@ pub struct CommitSummary {
 }
 
 fn normalize_optional_text(value: &Option<String>) -> Option<String> {
-    value
-        .as_ref()
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
+    mdr_data_cleansing::normalize_optional_text(value.as_deref())
 }
 
 fn parse_mdr_date(value: &str) -> bool {
@@ -115,15 +113,11 @@ fn derive_firearm_name(
 }
 
 fn duplicateable_license(value: &str) -> Option<String> {
-    let normalized = normalize_optional_text(&Some(value.to_string()))?;
-    if !normalized
+    let canonical = mdr_data_cleansing::canonical_identifier_key(Some(value))?;
+    canonical
         .chars()
         .any(|character| character.is_ascii_digit())
-    {
-        return None;
-    }
-
-    Some(normalized.to_uppercase())
+        .then_some(canonical)
 }
 
 fn validate_staging_row(
@@ -329,8 +323,10 @@ pub async fn match_staging_rows(pool: &PgPool, batch_id: &str) -> AppResult<Matc
                 *license_counts.entry(license).or_insert(0) += 1;
             }
 
-            if let Some(serial) = normalize_optional_text(&row.serial_number) {
-                *serial_counts.entry(serial.to_uppercase()).or_insert(0) += 1;
+            if let Some(serial) =
+                mdr_data_cleansing::canonical_identifier_key(row.serial_number.as_deref())
+            {
+                *serial_counts.entry(serial).or_insert(0) += 1;
             }
         }
     }
@@ -368,14 +364,8 @@ pub async fn match_staging_rows(pool: &PgPool, batch_id: &str) -> AppResult<Matc
                 .map(|license| license_counts.get(&license).copied().unwrap_or(0) > 1)
                 .unwrap_or(false);
         let duplicate_serial = !is_historical
-            && normalize_optional_text(&row.serial_number)
-                .map(|serial| {
-                    serial_counts
-                        .get(&serial.to_uppercase())
-                        .copied()
-                        .unwrap_or(0)
-                        > 1
-                })
+            && mdr_data_cleansing::canonical_identifier_key(row.serial_number.as_deref())
+                .map(|serial| serial_counts.get(&serial).copied().unwrap_or(0) > 1)
                 .unwrap_or(false);
         let row_issues = validate_staging_row(row, duplicate_license, duplicate_serial);
         if !row_issues.is_empty() {
@@ -384,71 +374,75 @@ pub async fn match_staging_rows(pool: &PgPool, batch_id: &str) -> AppResult<Matc
         }
 
         if status != "error" {
-            if let Some(ref lic) = row.license_number {
-                if !lic.trim().is_empty() {
-                    let guard_matches: Vec<(String,)> = sqlx::query_as(
-                        "SELECT id FROM users WHERE license_number = $1 AND role = 'guard'",
-                    )
-                    .bind(lic.trim())
-                    .fetch_all(pool)
-                    .await
-                    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+            let guard_matches: Vec<(String,)> = match mdr_data_cleansing::canonical_identifier_key(
+                row.license_number.as_deref(),
+            ) {
+                Some(license_key) => sqlx::query_as(
+                    "SELECT id FROM users WHERE LOWER(BTRIM(COALESCE(role, ''))) = 'guard' AND regexp_replace(UPPER(BTRIM(COALESCE(license_number, ''))), '[^A-Z0-9]', '', 'g') = $1",
+                )
+                .bind(license_key)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| AppError::DatabaseError(e.to_string()))?,
+                None => Vec::new(),
+            };
 
-                    match guard_matches.len() {
-                        1 => {
-                            guard_id = Some(guard_matches[0].0.clone());
-                            status = "matched";
-                        }
-                        0 => {
-                            if let Some(ref name) = row.guard_name {
-                                if !name.trim().is_empty() {
-                                    let name_matches: Vec<(String,)> = sqlx::query_as(
-                                    "SELECT id FROM users WHERE UPPER(full_name) = UPPER($1) AND role = 'guard'",
-                                )
-                                .bind(name.trim())
-                                .fetch_all(pool)
-                                .await
-                                .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+            match guard_matches.len() {
+                1 => {
+                    guard_id = Some(guard_matches[0].0.clone());
+                    status = "matched";
+                }
+                count if count > 1 => {
+                    status = "ambiguous";
+                }
+                _ => {
+                    if let Some(name_key) =
+                        mdr_data_cleansing::canonical_name_key(row.guard_name.as_deref())
+                    {
+                        let name_matches: Vec<(String,)> = sqlx::query_as(
+                            "SELECT id FROM users WHERE LOWER(BTRIM(COALESCE(role, ''))) = 'guard' AND regexp_replace(UPPER(BTRIM(COALESCE(full_name, ''))), '[^[:alnum:]]', '', 'g') = $1",
+                        )
+                        .bind(name_key)
+                        .fetch_all(pool)
+                        .await
+                        .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-                                    match name_matches.len() {
-                                        1 => {
-                                            guard_id = Some(name_matches[0].0.clone());
-                                            status = "matched";
-                                        }
-                                        x if x > 1 => {
-                                            status = "ambiguous";
-                                        }
-                                        _ => {}
-                                    }
-                                }
+                        match name_matches.len() {
+                            1 => {
+                                guard_id = Some(name_matches[0].0.clone());
+                                status = "matched";
                             }
-                        }
-                        _ => {
-                            status = "ambiguous";
+                            count if count > 1 => {
+                                status = "ambiguous";
+                            }
+                            _ => {}
                         }
                     }
                 }
             }
 
-            if let Some(ref serial_number) = row.serial_number {
-                if !serial_number.trim().is_empty() {
-                    let firearm_matches: Vec<(String,)> =
-                        sqlx::query_as("SELECT id FROM firearms WHERE serial_number = $1")
-                            .bind(serial_number.trim())
-                            .fetch_all(pool)
-                            .await
-                            .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+            if let Some(serial_key) =
+                mdr_data_cleansing::canonical_identifier_key(row.serial_number.as_deref())
+            {
+                let firearm_matches: Vec<(String,)> = sqlx::query_as(
+                        "SELECT id FROM firearms WHERE regexp_replace(UPPER(BTRIM(COALESCE(serial_number, ''))), '[^A-Z0-9]', '', 'g') = $1",
+                    )
+                    .bind(serial_key)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
-                    if firearm_matches.len() == 1 {
-                        firearm_id = Some(firearm_matches[0].0.clone());
-                    }
+                match firearm_matches.len() {
+                    1 => firearm_id = Some(firearm_matches[0].0.clone()),
+                    count if count > 1 && status != "ambiguous" => status = "ambiguous",
+                    _ => {}
                 }
             }
 
             if let Some(ref client_name) = row.client_name {
                 if !client_name.trim().is_empty() {
                     let client_matches: Vec<(String,)> = sqlx::query_as(
-                        "SELECT id FROM clients WHERE UPPER(BTRIM(name)) = UPPER(BTRIM($1))",
+                        "SELECT id FROM clients WHERE UPPER(regexp_replace(BTRIM(name), '\\s+', ' ', 'g')) = UPPER(regexp_replace(BTRIM($1), '\\s+', ' ', 'g'))",
                     )
                     .bind(client_name.trim())
                     .fetch_all(pool)

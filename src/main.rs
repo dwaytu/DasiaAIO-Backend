@@ -50,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config.database_url,
         config.db_pool_max_connections,
         config.db_pool_acquire_timeout_secs,
+        config.presentation_reference_time.as_deref(),
     )
     .await?;
     tracing::info!("✓ Connected to PostgreSQL");

@@ -313,7 +313,7 @@ pub async fn get_ranked_guards(
                 COALESCE(gms.overall_score, 0)::FLOAT8, gms.rank,
                 COALESCE(gms.on_time_count, 0),
                 COALESCE(gms.on_time_count, 0) + COALESCE(gms.late_count, 0) + COALESCE(gms.no_show_count, 0),
-                COALESCE(gms.average_client_rating, 0)::FLOAT8
+                COALESCE(gms.client_rating, 0)::FLOAT8
          FROM users u
          LEFT JOIN guard_merit_scores gms ON gms.guard_id = u.id
          WHERE LOWER(BTRIM(COALESCE(u.role, ''))) = 'guard'

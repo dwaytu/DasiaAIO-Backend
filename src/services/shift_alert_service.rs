@@ -63,8 +63,8 @@ async fn evaluate_missing_check_ins(pool: &PgPool) -> Result<usize, sqlx::Error>
         JOIN users g ON g.id = s.guard_id
         CROSS JOIN users leadership
         WHERE s.status = 'scheduled'
-          AND s.start_time <= CURRENT_TIMESTAMP - ($1 || ' minutes')::interval
-          AND s.end_time >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+          AND s.start_time <= sentinel_now() - ($1 || ' minutes')::interval
+          AND s.end_time >= sentinel_now() - INTERVAL '24 hours'
           AND LOWER(BTRIM(leadership.role)) IN ('supervisor', 'admin', 'superadmin')
           AND COALESCE(leadership.verified, true) = true
           AND COALESCE(leadership.status, 'active') = 'active'

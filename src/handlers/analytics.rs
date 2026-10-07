@@ -329,8 +329,8 @@ pub async fn get_analytics(
     // Mission stats
     let total_missions_this_month = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM trips 
-         WHERE EXTRACT(MONTH FROM timezone('Asia/Manila', start_time)) = EXTRACT(MONTH FROM timezone('Asia/Manila', CURRENT_TIMESTAMP))
-         AND EXTRACT(YEAR FROM timezone('Asia/Manila', start_time)) = EXTRACT(YEAR FROM timezone('Asia/Manila', CURRENT_TIMESTAMP))",
+         WHERE EXTRACT(MONTH FROM timezone('Asia/Manila', start_time)) = EXTRACT(MONTH FROM timezone('Asia/Manila', sentinel_now()))
+         AND EXTRACT(YEAR FROM timezone('Asia/Manila', start_time)) = EXTRACT(YEAR FROM timezone('Asia/Manila', sentinel_now()))",
     )
     .fetch_one(db.as_ref())
     .await
@@ -339,8 +339,8 @@ pub async fn get_analytics(
     let completed_missions_this_month = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM trips 
          WHERE status = 'completed'
-         AND EXTRACT(MONTH FROM timezone('Asia/Manila', start_time)) = EXTRACT(MONTH FROM timezone('Asia/Manila', CURRENT_TIMESTAMP))
-         AND EXTRACT(YEAR FROM timezone('Asia/Manila', start_time)) = EXTRACT(YEAR FROM timezone('Asia/Manila', CURRENT_TIMESTAMP))",
+         AND EXTRACT(MONTH FROM timezone('Asia/Manila', start_time)) = EXTRACT(MONTH FROM timezone('Asia/Manila', sentinel_now()))
+         AND EXTRACT(YEAR FROM timezone('Asia/Manila', start_time)) = EXTRACT(YEAR FROM timezone('Asia/Manila', sentinel_now()))",
     )
     .fetch_one(db.as_ref())
     .await
@@ -373,8 +373,8 @@ pub async fn get_analytics(
     let attendance_row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
         "WITH bounds AS (
             SELECT
-                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
-                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
+                ((timezone('Asia/Manila', sentinel_now())::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
+                ((timezone('Asia/Manila', sentinel_now())::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
         ), scoped_shifts AS (
             SELECT id, start_time, end_time
             FROM shifts
@@ -396,7 +396,7 @@ pub async fn get_analytics(
                 SELECT 1 FROM punctuality_records p
                 WHERE p.shift_id = s.id AND p.status = 'late'
             ))::BIGINT,
-            COUNT(*) FILTER (WHERE s.end_time < CURRENT_TIMESTAMP AND NOT EXISTS (
+            COUNT(*) FILTER (WHERE s.end_time < sentinel_now() AND NOT EXISTS (
                 SELECT 1 FROM attendance a
                 WHERE a.shift_id = s.id AND a.check_in_time IS NOT NULL
             ))::BIGINT
@@ -416,8 +416,8 @@ pub async fn get_analytics(
     let attendance_trend = sqlx::query_as::<_, AttendanceTrendPoint>(
         "WITH bounds AS (
             SELECT
-                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
-                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
+                ((timezone('Asia/Manila', sentinel_now())::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
+                ((timezone('Asia/Manila', sentinel_now())::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
         )
         SELECT
             DATE(timezone('Asia/Manila', s.start_time)) AS date,
@@ -430,7 +430,7 @@ pub async fn get_analytics(
                 SELECT 1 FROM punctuality_records p
                 WHERE p.shift_id = s.id AND p.status = 'late'
             ))::BIGINT AS late_check_ins,
-            COUNT(*) FILTER (WHERE s.end_time < CURRENT_TIMESTAMP AND NOT EXISTS (
+            COUNT(*) FILTER (WHERE s.end_time < sentinel_now() AND NOT EXISTS (
                 SELECT 1 FROM attendance a
                 WHERE a.shift_id = s.id AND a.check_in_time IS NOT NULL
             ))::BIGINT AS no_shows
@@ -569,7 +569,7 @@ pub async fn get_guard_performance_report(
                           AND no_show.status = 'no_show'
                     ) OR (
                         NOT COALESCE(abs.checked_in, false)
-                        AND s.end_time < CURRENT_TIMESTAMP
+                        AND s.end_time < sentinel_now()
                     )
                 )::BIGINT AS no_shows
             FROM shifts s
@@ -704,7 +704,7 @@ pub async fn get_performance_trends(
                 COUNT(*) as missions_count,
                 COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_count
          FROM trips
-         WHERE start_time >= CURRENT_DATE - INTERVAL '30 days'
+         WHERE start_time >= sentinel_now()::date - INTERVAL '30 days'
          GROUP BY DATE(start_time)
          ORDER BY DATE(start_time) DESC
          LIMIT 30",
@@ -751,7 +751,7 @@ pub async fn get_guard_reliability(
             SELECT
                 guard_id,
                 COUNT(*) AS total_permits,
-                COUNT(*) FILTER (WHERE status = 'active' AND expiry_date > NOW()) AS active_permits
+                COUNT(*) FILTER (WHERE status = 'active' AND expiry_date > sentinel_now()) AS active_permits
             FROM guard_firearm_permits
             GROUP BY guard_id
         )

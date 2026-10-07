@@ -86,16 +86,16 @@ pub async fn fetch_resource_snapshot(pool: &PgPool) -> AppResult<ResourceSnapsho
             SELECT DISTINCT s.guard_id
             FROM shifts s
             WHERE s.status IN ('scheduled', 'in_progress')
-              AND s.start_time <= CURRENT_TIMESTAMP
-              AND s.end_time >= CURRENT_TIMESTAMP
+              AND s.start_time <= sentinel_now()
+              AND s.end_time >= sentinel_now()
         ), checked_in_guards AS (
             SELECT DISTINCT a.guard_id
             FROM attendance a
             JOIN shifts s ON s.id = a.shift_id AND s.guard_id = a.guard_id
             WHERE a.check_in_time IS NOT NULL
               AND a.check_out_time IS NULL
-              AND s.start_time <= CURRENT_TIMESTAMP
-              AND s.end_time >= CURRENT_TIMESTAMP
+              AND s.start_time <= sentinel_now()
+              AND s.end_time >= sentinel_now()
         )
         SELECT
             (SELECT COUNT(*) FROM eligible_guards)::BIGINT AS total_guards,
@@ -106,8 +106,8 @@ pub async fn fetch_resource_snapshot(pool: &PgPool) -> AppResult<ResourceSnapsho
                 LEFT JOIN guard_availability ga ON ga.guard_id = eg.id
                 LEFT JOIN current_assignments ca ON ca.guard_id = eg.id
                 WHERE COALESCE(ga.available, true) = true
-                  AND (ga.available_from IS NULL OR ga.available_from <= CURRENT_TIMESTAMP)
-                  AND (ga.available_to IS NULL OR ga.available_to >= CURRENT_TIMESTAMP)
+                  AND (ga.available_from IS NULL OR ga.available_from <= sentinel_now())
+                  AND (ga.available_to IS NULL OR ga.available_to >= sentinel_now())
                   AND ca.guard_id IS NULL
             )::BIGINT AS guards_available,
             (SELECT COUNT(*) FROM firearms)::BIGINT AS total_firearms,
@@ -132,8 +132,8 @@ pub async fn fetch_evaluation_analytics(
         r#"
         WITH bounds AS (
             SELECT
-                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
-                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
+                ((timezone('Asia/Manila', sentinel_now())::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
+                ((timezone('Asia/Manila', sentinel_now())::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
         )
         SELECT
             COUNT(*)::BIGINT AS total_evaluations,
@@ -155,8 +155,8 @@ pub async fn fetch_evaluation_analytics(
         r#"
         WITH bounds AS (
             SELECT
-                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
-                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
+                ((timezone('Asia/Manila', sentinel_now())::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
+                ((timezone('Asia/Manila', sentinel_now())::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
         )
         SELECT bucket::INTEGER AS rating, COUNT(ce.id)::BIGINT AS count
         FROM generate_series(1, 5) AS bucket
@@ -180,8 +180,8 @@ pub async fn fetch_evaluation_analytics(
         r#"
         WITH bounds AS (
             SELECT
-                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
-                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
+                ((timezone('Asia/Manila', sentinel_now())::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
+                ((timezone('Asia/Manila', sentinel_now())::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
         )
         SELECT
             DATE(timezone('Asia/Manila', created_at)) AS date,

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::{
     error::{AppError, AppResult},
     models::{MdrImportBatch, MdrStagingRow},
-    services::{mdr_import_service, mdr_resource_service},
+    services::{mdr_data_cleansing, mdr_import_service, mdr_resource_service},
     utils,
 };
 
@@ -95,6 +95,25 @@ pub struct ResolveRequest {
     pub resolution_note: Option<String>,
 }
 
+fn name_format_flags(
+    raw_value: Option<&str>,
+    cleaned_value: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let Some(raw_value) = raw_value else {
+        return Vec::new();
+    };
+
+    if raw_value.trim().is_empty() || cleaned_value.is_none() || raw_value.contains(',') {
+        return Vec::new();
+    }
+
+    vec![json!({
+        "field": "guardName",
+        "code": "name_order_not_inferred",
+        "message": "Name order was retained because no surname/given-name separator was supplied. Review before changing its order."
+    })]
+}
+
 /// POST /api/mdr/import
 pub async fn import_mdr(
     State(pool): State<Arc<PgPool>>,
@@ -130,10 +149,136 @@ pub async fn import_mdr(
 
     for row in &all_rows {
         let row_id = utils::generate_id();
+        let raw_payload = json!({
+            "section": &row.section,
+            "clientNumber": row.client_number,
+            "clientName": &row.client_name,
+            "clientAddress": &row.client_address,
+            "guardNumber": row.guard_number,
+            "guardName": &row.guard_name,
+            "contactNumber": &row.contact_number,
+            "licenseNumber": &row.license_number,
+            "licenseExpiry": &row.license_expiry,
+            "firearmKind": &row.firearm_kind,
+            "firearmMake": &row.firearm_make,
+            "caliber": &row.caliber,
+            "serialNumber": &row.serial_number,
+            "firearmValidity": &row.firearm_validity,
+            "actualAmmo": &row.actual_ammo,
+            "ammoCount": &row.ammo_count,
+            "licRegName": &row.lic_reg_name,
+            "pulloutStatus": &row.pullout_status,
+            "faRemarks": &row.fa_remarks,
+        });
+        let section = mdr_data_cleansing::normalize_optional_text(row.section.as_deref())
+            .map(|value| value.to_lowercase());
+        let client_name = mdr_data_cleansing::normalize_optional_text(row.client_name.as_deref());
+        let client_address =
+            mdr_data_cleansing::normalize_optional_text(row.client_address.as_deref());
+        let guard_name = mdr_data_cleansing::normalize_name(row.guard_name.as_deref());
+        let contact_number = mdr_data_cleansing::normalize_phone(row.contact_number.as_deref());
+        let license_number =
+            mdr_data_cleansing::normalize_identifier(row.license_number.as_deref());
+        let license_expiry = mdr_data_cleansing::normalize_date(row.license_expiry.as_deref());
+        let firearm_kind = mdr_data_cleansing::normalize_optional_text(row.firearm_kind.as_deref());
+        let firearm_make = mdr_data_cleansing::normalize_firearm_make(row.firearm_make.as_deref());
+        let caliber = mdr_data_cleansing::normalize_optional_text(row.caliber.as_deref());
+        let serial_number = mdr_data_cleansing::normalize_identifier(row.serial_number.as_deref());
+        let firearm_validity = mdr_data_cleansing::normalize_date(row.firearm_validity.as_deref());
+        let actual_ammo = mdr_data_cleansing::normalize_optional_text(row.actual_ammo.as_deref());
+        let ammo_count = mdr_data_cleansing::normalize_optional_text(row.ammo_count.as_deref());
+        let lic_reg_name = mdr_data_cleansing::normalize_name(row.lic_reg_name.as_deref());
+        let pullout_status =
+            mdr_data_cleansing::normalize_optional_text(row.pullout_status.as_deref());
+        let fa_remarks = mdr_data_cleansing::normalize_optional_text(row.fa_remarks.as_deref());
+        let mut cleansing_changes = Vec::new();
+
+        for (field, original, cleaned) in [
+            ("section", row.section.as_deref(), section.as_deref()),
+            (
+                "clientName",
+                row.client_name.as_deref(),
+                client_name.as_deref(),
+            ),
+            (
+                "clientAddress",
+                row.client_address.as_deref(),
+                client_address.as_deref(),
+            ),
+            (
+                "guardName",
+                row.guard_name.as_deref(),
+                guard_name.as_deref(),
+            ),
+            (
+                "contactNumber",
+                row.contact_number.as_deref(),
+                contact_number.as_deref(),
+            ),
+            (
+                "licenseNumber",
+                row.license_number.as_deref(),
+                license_number.as_deref(),
+            ),
+            (
+                "licenseExpiry",
+                row.license_expiry.as_deref(),
+                license_expiry.as_deref(),
+            ),
+            (
+                "firearmKind",
+                row.firearm_kind.as_deref(),
+                firearm_kind.as_deref(),
+            ),
+            (
+                "firearmMake",
+                row.firearm_make.as_deref(),
+                firearm_make.as_deref(),
+            ),
+            ("caliber", row.caliber.as_deref(), caliber.as_deref()),
+            (
+                "serialNumber",
+                row.serial_number.as_deref(),
+                serial_number.as_deref(),
+            ),
+            (
+                "firearmValidity",
+                row.firearm_validity.as_deref(),
+                firearm_validity.as_deref(),
+            ),
+            (
+                "actualAmmo",
+                row.actual_ammo.as_deref(),
+                actual_ammo.as_deref(),
+            ),
+            (
+                "ammoCount",
+                row.ammo_count.as_deref(),
+                ammo_count.as_deref(),
+            ),
+            (
+                "licRegName",
+                row.lic_reg_name.as_deref(),
+                lic_reg_name.as_deref(),
+            ),
+            (
+                "pulloutStatus",
+                row.pullout_status.as_deref(),
+                pullout_status.as_deref(),
+            ),
+            (
+                "faRemarks",
+                row.fa_remarks.as_deref(),
+                fa_remarks.as_deref(),
+            ),
+        ] {
+            mdr_data_cleansing::record_change(&mut cleansing_changes, field, original, cleaned);
+        }
+        let quality_flags = name_format_flags(row.guard_name.as_deref(), guard_name.as_deref());
         let initial_match_status = if row
             .section
             .as_deref()
-            .is_some_and(|section| section.trim().eq_ignore_ascii_case("armored"))
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("armored"))
         {
             "ignored"
         } else {
@@ -147,7 +292,8 @@ pub async fn import_mdr(
                 license_number, license_expiry,
                 firearm_kind, firearm_make, caliber, serial_number, firearm_validity,
                 actual_ammo, ammo_count, lic_reg_name,
-                pullout_status, fa_remarks, match_status
+                pullout_status, fa_remarks, match_status,
+                raw_payload, cleansing_changes, quality_flags, cleansed_at
             ) VALUES (
                 $1, $2, $3, $4, $5,
                 $6, $7, $8,
@@ -155,33 +301,42 @@ pub async fn import_mdr(
                 $12, $13,
                 $14, $15, $16, $17, $18,
                 $19, $20, $21,
-                $22, $23, $24
+                $22, $23, $24,
+                $25, $26, $27, NOW()
             )"#,
         )
         .bind(&row_id)
         .bind(&batch_id)
         .bind(&row.sheet_name)
         .bind(row.row_number)
-        .bind(&row.section)
+        .bind(&section)
         .bind(row.client_number)
-        .bind(&row.client_name)
-        .bind(&row.client_address)
+        .bind(&client_name)
+        .bind(&client_address)
         .bind(row.guard_number)
-        .bind(&row.guard_name)
-        .bind(&row.contact_number)
-        .bind(&row.license_number)
-        .bind(&row.license_expiry)
-        .bind(&row.firearm_kind)
-        .bind(&row.firearm_make)
-        .bind(&row.caliber)
-        .bind(&row.serial_number)
-        .bind(&row.firearm_validity)
-        .bind(&row.actual_ammo)
-        .bind(&row.ammo_count)
-        .bind(&row.lic_reg_name)
-        .bind(&row.pullout_status)
-        .bind(&row.fa_remarks)
+        .bind(&guard_name)
+        .bind(&contact_number)
+        .bind(&license_number)
+        .bind(&license_expiry)
+        .bind(&firearm_kind)
+        .bind(&firearm_make)
+        .bind(&caliber)
+        .bind(&serial_number)
+        .bind(&firearm_validity)
+        .bind(&actual_ammo)
+        .bind(&ammo_count)
+        .bind(&lic_reg_name)
+        .bind(&pullout_status)
+        .bind(&fa_remarks)
         .bind(initial_match_status)
+        .bind(raw_payload)
+        .bind(serde_json::to_value(cleansing_changes).map_err(|error| {
+            AppError::InternalServerError(format!(
+                "Failed to serialize MDR cleansing changes: {}",
+                error
+            ))
+        })?)
+        .bind(serde_json::Value::Array(quality_flags))
         .execute(pool.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to insert staging row: {}", e)))?;
