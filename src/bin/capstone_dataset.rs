@@ -1,7 +1,10 @@
-use std::{env, process};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    env, process,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Datelike, Duration, FixedOffset, TimeZone, Utc, Weekday};
+use chrono::{DateTime, Duration, FixedOffset, TimeZone, Utc};
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use uuid::Uuid;
@@ -9,11 +12,20 @@ use uuid::Uuid;
 const BATCH_ID: &str = "capstone-live-october-2026";
 const REQUIRED_CONFIRMATION: &str = "LIVE_CAPSTONE_DATASET_CONFIRMED";
 const MANILA_OFFSET_SECONDS: i32 = 8 * 60 * 60;
+const DATA_ORIGIN: &str = "capstone_presentation_seed";
+const PRIMARY_ROSTER_SIZE: usize = 5;
+const MAX_PARTICIPATING_GUARDS: usize = 55;
+const MIN_REST_HOURS: i64 = 8;
+const HISTORY_LAST_DAY: u32 = 16;
+const PLANNED_DAY: u32 = 17;
 
 #[derive(Clone)]
 struct SourceGuard {
     id: String,
     full_name: String,
+    guard_code: Option<String>,
+    address: Option<String>,
+    currently_available: bool,
 }
 
 #[derive(Clone)]
@@ -25,11 +37,65 @@ struct SourceSite {
     longitude: f64,
 }
 
-#[derive(Clone)]
-struct SeedActor {
-    id: String,
-    full_name: String,
-    role: String,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShiftRotation {
+    Day,
+    Evening,
+    Night,
+}
+
+impl ShiftRotation {
+    const ALL: [Self; 3] = [Self::Day, Self::Evening, Self::Night];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Evening => "evening",
+            Self::Night => "night",
+        }
+    }
+
+    fn start(self, day: u32) -> Result<DateTime<Utc>> {
+        match self {
+            Self::Day => manila_time(day, 7, 0),
+            Self::Evening => manila_time(day, 15, 0),
+            Self::Night => manila_time(day, 23, 0),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PlannedShift {
+    site_index: usize,
+    guard_index: usize,
+    day: u32,
+    rotation: ShiftRotation,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    is_cross_site: bool,
+}
+
+#[derive(Clone, Default)]
+struct GuardPerformance {
+    assigned: i32,
+    completed: i32,
+    on_time: i32,
+    late: i32,
+    absent: i32,
+    replacements: i32,
+}
+
+#[derive(Default)]
+struct SeedMetrics {
+    day_shifts: usize,
+    evening_shifts: usize,
+    night_shifts: usize,
+    planned_october_17: usize,
+    late_arrivals: usize,
+    absences: usize,
+    replacements: usize,
+    cross_site_assignments: usize,
+    guard_performance: HashMap<String, GuardPerformance>,
 }
 
 fn new_id() -> String {
@@ -61,10 +127,24 @@ fn verify_live_target(command: &str) -> Result<String> {
     }
     let _protected_superadmin = require_env("CAPSTONE_PROTECTED_SUPERADMIN_ID")?;
 
-    if !matches!(command, "seed" | "reset" | "status") {
-        bail!("Usage: cargo run --bin capstone-dataset -- <seed|reset|status>")
+    if !matches!(
+        command,
+        "seed" | "reset" | "status" | "preflight" | "validate"
+    ) {
+        bail!("Usage: cargo run --bin capstone-dataset -- <seed|reset|status|preflight|validate>")
     }
     Ok(target_url)
+}
+
+fn verify_backup_confirmation(command: &str) -> Result<()> {
+    if !matches!(command, "seed" | "reset") {
+        return Ok(());
+    }
+
+    let value = require_env("CAPSTONE_BACKUP_VERIFIED_AT")?;
+    DateTime::parse_from_rfc3339(&value)
+        .with_context(|| "CAPSTONE_BACKUP_VERIFIED_AT must be an RFC 3339 timestamp")?;
+    Ok(())
 }
 
 async fn connect(url: &str, label: &str) -> Result<PgPool> {
@@ -169,28 +249,43 @@ async fn reset_batch(pool: &PgPool) -> Result<()> {
 async fn read_live_guards(pool: &PgPool) -> Result<Vec<SourceGuard>> {
     let rows = sqlx::query(
         r#"
-        SELECT id, full_name
+        SELECT users.id,
+               users.full_name,
+               users.guard_code,
+               users.address,
+               COALESCE(guard_availability.available, true) AS currently_available
         FROM users
+        LEFT JOIN guard_availability ON guard_availability.guard_id = users.id
         WHERE LOWER(BTRIM(role)) = 'guard'
           AND COALESCE(LOWER(BTRIM(status)), 'active') = 'active'
-          AND NOT EXISTS (SELECT 1 FROM feedback WHERE feedback.user_id = users.id)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM guard_merit_scores
+              WHERE guard_merit_scores.guard_id = users.id
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM capstone_seed_records
+                    WHERE capstone_seed_records.batch_id = $1
+                      AND capstone_seed_records.table_name = 'guard_merit_scores'
+                      AND capstone_seed_records.record_id = guard_merit_scores.id
+                )
+          )
         ORDER BY guard_code NULLS LAST, full_name
-        LIMIT 50
+        LIMIT $2
         "#,
     )
+    .bind(BATCH_ID)
+    .bind(MAX_PARTICIPATING_GUARDS as i64)
     .fetch_all(pool)
     .await?;
-    if rows.len() < 50 {
-        bail!(
-            "Live database has only {} active guards without feedback; 50 are required",
-            rows.len()
-        )
-    }
     rows.into_iter()
         .map(|row| {
             Ok(SourceGuard {
                 id: row.try_get("id")?,
                 full_name: row.try_get("full_name")?,
+                guard_code: row.try_get("guard_code")?,
+                address: row.try_get("address")?,
+                currently_available: row.try_get("currently_available")?,
             })
         })
         .collect()
@@ -234,363 +329,682 @@ fn manila_time(day: u32, hour: u32, minute: u32) -> Result<DateTime<Utc>> {
         .ok_or_else(|| anyhow!("Invalid October 2026 timestamp"))
 }
 
+async fn read_assignment_history(pool: &PgPool) -> Result<HashMap<(String, String), i64>> {
+    let rows = sqlx::query(
+        "SELECT shifts.guard_id, shifts.client_site, COUNT(*)::BIGINT AS assignment_count FROM shifts WHERE NOT EXISTS (SELECT 1 FROM capstone_seed_records WHERE capstone_seed_records.table_name = 'shifts' AND capstone_seed_records.record_id = shifts.id) GROUP BY shifts.guard_id, shifts.client_site",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                (row.try_get("guard_id")?, row.try_get("client_site")?),
+                row.try_get("assignment_count")?,
+            ))
+        })
+        .collect()
+}
+
+fn guard_has_rest(
+    guard_index: usize,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    planned: &[PlannedShift],
+) -> bool {
+    planned
+        .iter()
+        .filter(|assignment| assignment.guard_index == guard_index)
+        .all(|assignment| {
+            if start < assignment.end && end > assignment.start {
+                return false;
+            }
+            if assignment.end <= start {
+                return start - assignment.end >= Duration::hours(MIN_REST_HOURS);
+            }
+            if end <= assignment.start {
+                return assignment.start - end >= Duration::hours(MIN_REST_HOURS);
+            }
+            true
+        })
+}
+
+fn assignment_count(guard_index: usize, planned: &[PlannedShift]) -> usize {
+    planned
+        .iter()
+        .filter(|assignment| assignment.guard_index == guard_index)
+        .count()
+}
+
+fn build_primary_rosters(
+    guards: &[SourceGuard],
+    sites: &[SourceSite],
+    history: &HashMap<(String, String), i64>,
+) -> Result<Vec<Vec<usize>>> {
+    let required_guards = sites.len() * PRIMARY_ROSTER_SIZE;
+    if required_guards > MAX_PARTICIPATING_GUARDS {
+        bail!(
+            "{} Tagum sites require {} primary guards, exceeding the approved {}-guard presentation pool",
+            sites.len(), required_guards, MAX_PARTICIPATING_GUARDS
+        )
+    }
+
+    let available_guards = guards
+        .iter()
+        .enumerate()
+        .filter_map(|(index, guard)| guard.currently_available.then_some(index))
+        .collect::<Vec<_>>();
+    if available_guards.len() < required_guards {
+        bail!(
+            "Live database has only {} currently available eligible guards; {} are required for stable five-guard site rosters",
+            available_guards.len(), required_guards
+        )
+    }
+
+    let mut unassigned = available_guards;
+    let mut rosters = Vec::with_capacity(sites.len());
+    for site in sites {
+        unassigned.sort_by(|left, right| {
+            let left_guard = &guards[*left];
+            let right_guard = &guards[*right];
+            let left_history = history
+                .get(&(left_guard.id.clone(), site.name.clone()))
+                .copied()
+                .unwrap_or_default();
+            let right_history = history
+                .get(&(right_guard.id.clone(), site.name.clone()))
+                .copied()
+                .unwrap_or_default();
+            right_history
+                .cmp(&left_history)
+                .then_with(|| left_guard.guard_code.cmp(&right_guard.guard_code))
+                .then_with(|| left_guard.full_name.cmp(&right_guard.full_name))
+        });
+        rosters.push(unassigned.drain(..PRIMARY_ROSTER_SIZE).collect());
+    }
+    Ok(rosters)
+}
+
+fn select_guard_for_slot(
+    candidates: &[usize],
+    site_index: usize,
+    day: u32,
+    rotation_index: usize,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    planned: &[PlannedShift],
+) -> Option<usize> {
+    let mut eligible = candidates
+        .iter()
+        .copied()
+        .filter(|guard_index| guard_has_rest(*guard_index, start, end, planned))
+        .collect::<Vec<_>>();
+    let preferred_offset = (day as usize + rotation_index + site_index) % candidates.len();
+    eligible.sort_by_key(|guard_index| {
+        let roster_position = candidates
+            .iter()
+            .position(|candidate| candidate == guard_index)
+            .unwrap_or_default();
+        (
+            assignment_count(*guard_index, planned),
+            (roster_position + candidates.len() - preferred_offset) % candidates.len(),
+            *guard_index,
+        )
+    });
+    eligible.into_iter().next()
+}
+
+fn plan_shift_coverage(
+    guards: &[SourceGuard],
+    sites: &[SourceSite],
+    rosters: &[Vec<usize>],
+) -> Result<Vec<PlannedShift>> {
+    let all_available = guards
+        .iter()
+        .enumerate()
+        .filter_map(|(index, guard)| guard.currently_available.then_some(index))
+        .collect::<Vec<_>>();
+    let mut planned = Vec::with_capacity(sites.len() * ShiftRotation::ALL.len() * 17);
+
+    for day in 1..=PLANNED_DAY {
+        for (site_index, roster) in rosters.iter().enumerate() {
+            for (rotation_index, rotation) in ShiftRotation::ALL.iter().enumerate() {
+                let start = rotation.start(day)?;
+                let end = start + Duration::hours(8);
+                let primary_guard = select_guard_for_slot(
+                    roster,
+                    site_index,
+                    day,
+                    rotation_index,
+                    start,
+                    end,
+                    &planned,
+                );
+                let (guard_index, is_cross_site) = match primary_guard {
+                    Some(guard_index) => (guard_index, false),
+                    None => (
+                        select_guard_for_slot(
+                            &all_available,
+                            site_index,
+                            day,
+                            rotation_index,
+                            start,
+                            end,
+                            &planned,
+                        )
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "No rested available guard can cover {} shift at {} on October {}",
+                                rotation.label(),
+                                sites[site_index].name,
+                                day
+                            )
+                        })?,
+                        true,
+                    ),
+                };
+                planned.push(PlannedShift {
+                    site_index,
+                    guard_index,
+                    day,
+                    rotation: *rotation,
+                    start,
+                    end,
+                    is_cross_site,
+                });
+            }
+        }
+    }
+    Ok(planned)
+}
+
+fn replacement_candidate(
+    absent_guard_index: usize,
+    site_index: usize,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    rosters: &[Vec<usize>],
+    guards: &[SourceGuard],
+    planned: &[PlannedShift],
+) -> Option<(usize, bool)> {
+    let mut same_site = rosters[site_index]
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            *candidate != absent_guard_index && guards[*candidate].currently_available
+        })
+        .collect::<Vec<_>>();
+    same_site.sort_by_key(|candidate| assignment_count(*candidate, planned));
+    if let Some(candidate) = same_site
+        .into_iter()
+        .find(|candidate| guard_has_rest(*candidate, start, end, planned))
+    {
+        return Some((candidate, false));
+    }
+
+    let mut fallback = guards
+        .iter()
+        .enumerate()
+        .filter_map(|(index, guard)| {
+            (index != absent_guard_index && guard.currently_available).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    fallback.sort_by_key(|candidate| assignment_count(*candidate, planned));
+    fallback
+        .into_iter()
+        .find(|candidate| guard_has_rest(*candidate, start, end, planned))
+        .map(|candidate| (candidate, true))
+}
+
+fn is_absence_scenario(assignment: &PlannedShift) -> bool {
+    matches!(
+        (assignment.day, assignment.site_index, assignment.rotation),
+        (7, 0, ShiftRotation::Day)
+            | (12, 3, ShiftRotation::Evening)
+            | (15, 6, ShiftRotation::Night)
+    )
+}
+
 async fn seed_shift_activity(
     pool: &PgPool,
     guards: &[SourceGuard],
     sites: &[SourceSite],
-    admin: &SeedActor,
-    supervisor: &SeedActor,
-) -> Result<()> {
-    let completed_until = 16;
-    for day in 1..=17_u32 {
-        let weekday = manila_time(day, 12, 0)?.weekday();
-        if weekday == Weekday::Sun {
+    rosters: &[Vec<usize>],
+    planned: &[PlannedShift],
+) -> Result<SeedMetrics> {
+    let mut metrics = SeedMetrics::default();
+
+    for (index, assignment) in planned.iter().enumerate() {
+        let guard = &guards[assignment.guard_index];
+        let site = &sites[assignment.site_index];
+        let historical = assignment.day <= HISTORY_LAST_DAY;
+        let absence = historical && is_absence_scenario(assignment);
+        let shift_id = new_id();
+        let created_at = assignment.start - Duration::days(6);
+        let status = if absence {
+            "absent"
+        } else if historical {
+            "completed"
+        } else {
+            "scheduled"
+        };
+        let replacement_status = if absence { "accepted" } else { "not_needed" };
+
+        sqlx::query(
+            r#"INSERT INTO shifts (id, guard_id, start_time, end_time, client_site, status, grace_period_minutes, replacement_status, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, 15, $7, $8, $8)"#,
+        )
+        .bind(&shift_id)
+        .bind(&guard.id)
+        .bind(assignment.start)
+        .bind(assignment.end)
+        .bind(&site.name)
+        .bind(status)
+        .bind(replacement_status)
+        .bind(created_at)
+        .execute(pool)
+        .await?;
+        track(pool, "shifts", &shift_id).await?;
+
+        match assignment.rotation {
+            ShiftRotation::Day => metrics.day_shifts += 1,
+            ShiftRotation::Evening => metrics.evening_shifts += 1,
+            ShiftRotation::Night => metrics.night_shifts += 1,
+        }
+        metrics.cross_site_assignments += if assignment.is_cross_site { 1 } else { 0 };
+        if !historical {
+            metrics.planned_october_17 += 1;
             continue;
         }
-        for (index, guard) in guards.iter().enumerate() {
-            let site = &sites[(index + day as usize) % sites.len()];
-            let night_shift = (index + day as usize) % 4 == 0;
-            let (start_hour, start_minute) = if night_shift { (15, 0) } else { (7, 0) };
-            let start = manila_time(day, start_hour, start_minute)?;
-            let end = start + Duration::hours(8);
-            let no_show = (day == 7 && index == 4) || (day == 13 && index == 18);
-            let replacement = day == 7 && index == 4;
-            let substitute = &guards[(index + 7) % guards.len()];
-            let active_today = day == 17 && night_shift && index % 3 == 0;
-            let shift_id = new_id();
-            let scheduled_guard_id = if replacement {
-                &substitute.id
-            } else {
-                &guard.id
-            };
-            let status = if active_today {
-                "in_progress"
-            } else if no_show && !replacement {
-                "absent"
-            } else {
-                "completed"
-            };
-            let replacement_status = if replacement {
-                "accepted"
-            } else if no_show {
-                "searching"
-            } else {
-                "not_needed"
-            };
-            let created_at = start
-                - Duration::days(5 + (index % 7) as i64)
-                - Duration::minutes((index * 3) as i64);
 
+        if absence {
+            metrics.absences += 1;
+            let performance = metrics
+                .guard_performance
+                .entry(guard.id.clone())
+                .or_default();
+            performance.assigned += 1;
+            performance.absent += 1;
+            let punctuality_id = new_id();
+            sqlx::query(
+                "INSERT INTO punctuality_records (id, guard_id, shift_id, scheduled_start_time, actual_check_in_time, minutes_late, is_on_time, status, created_at) VALUES ($1, $2, $3, $4, NULL, NULL, false, 'absent', $5)",
+            )
+            .bind(&punctuality_id)
+            .bind(&guard.id)
+            .bind(&shift_id)
+            .bind(assignment.start)
+            .bind(assignment.start + Duration::minutes(20))
+            .execute(pool)
+            .await?;
+            track(pool, "punctuality_records", &punctuality_id).await?;
+
+            let (replacement_index, cross_site) = replacement_candidate(
+                assignment.guard_index,
+                assignment.site_index,
+                assignment.start,
+                assignment.end,
+                rosters,
+                guards,
+                planned,
+            )
+            .ok_or_else(|| {
+                anyhow!(
+                    "No rested relief guard is available for {} on October {}",
+                    site.name,
+                    assignment.day
+                )
+            })?;
+            let replacement_guard = &guards[replacement_index];
+            let replacement_shift_id = new_id();
             sqlx::query(
                 r#"INSERT INTO shifts (id, guard_id, start_time, end_time, client_site, status, grace_period_minutes, replacement_status, created_at, updated_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, 15, $7, $8, $8)"#,
+                   VALUES ($1, $2, $3, $4, $5, 'completed', 15, 'accepted', $6, $6)"#,
             )
-            .bind(&shift_id).bind(scheduled_guard_id).bind(start).bind(end).bind(&site.name).bind(status).bind(replacement_status).bind(created_at)
-            .execute(pool).await?;
-            track(pool, "shifts", &shift_id).await?;
+            .bind(&replacement_shift_id)
+            .bind(&replacement_guard.id)
+            .bind(assignment.start)
+            .bind(assignment.end)
+            .bind(&site.name)
+            .bind(created_at)
+            .execute(pool)
+            .await?;
+            track(pool, "shifts", &replacement_shift_id).await?;
 
-            if no_show {
-                let punctuality_id = new_id();
-                sqlx::query(
-                    "INSERT INTO punctuality_records (id, guard_id, shift_id, scheduled_start_time, actual_check_in_time, minutes_late, is_on_time, status, created_at) VALUES ($1, $2, $3, $4, NULL, NULL, false, 'absent', $5)",
-                )
-                .bind(&punctuality_id).bind(&guard.id).bind(&shift_id).bind(start).bind(start + Duration::minutes(20)).execute(pool).await?;
-                track(pool, "punctuality_records", &punctuality_id).await?;
-
-                if replacement {
-                    let recommendation_id = new_id();
-                    sqlx::query(
-                        r#"INSERT INTO smart_guard_replacements (id, shift_id, absent_guard_id, recommended_guard_id, recommendation_rank, compatibility_score, confidence_score, rationale, scoring_breakdown, candidate_pool, recommendation_status, generated_at, expires_at, created_at, updated_at)
-                           VALUES ($1, $2, $3, $4, 1, 0.93, 0.89, 'Available nearby with recent on-time attendance and matching Tagum assignment history.', $5, $6, 'accepted', $7, $8, $7, $7)"#,
-                    )
-                    .bind(&recommendation_id).bind(&shift_id).bind(&guard.id).bind(&substitute.id)
-                    .bind(json!({"availability": 0.35, "punctuality": 0.32, "site_history": 0.26}))
-                    .bind(json!([{"guardId": substitute.id, "rank": 1, "score": 0.93}]))
-                    .bind(start + Duration::minutes(18)).bind(start + Duration::minutes(40)).execute(pool).await?;
-                    track(pool, "smart_guard_replacements", &recommendation_id).await?;
-                } else {
-                    continue;
-                }
-            }
-
-            if !active_today {
-                let check_in =
-                    start + Duration::minutes(((index * 7 + day as usize * 3) % 9) as i64);
-                let is_late = !replacement && !no_show && (index + day as usize) % 17 == 0;
-                let actual_check_in = if is_late {
-                    start + Duration::minutes(18 + (index % 13) as i64)
-                } else {
-                    check_in
-                };
-                let check_out = end + Duration::minutes(((index * 5 + day as usize) % 12) as i64);
-                let attendance_id = new_id();
-                sqlx::query("INSERT INTO attendance (id, guard_id, shift_id, check_in_time, check_out_time, status, check_in_source, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 'completed', $6, $4, $5)")
-                    .bind(&attendance_id).bind(scheduled_guard_id).bind(&shift_id).bind(actual_check_in).bind(check_out).bind(if index % 3 == 0 { "mobile" } else { "manual" }).execute(pool).await?;
-                track(pool, "attendance", &attendance_id).await?;
-                let punctuality_id = new_id();
-                sqlx::query("INSERT INTO punctuality_records (id, guard_id, shift_id, scheduled_start_time, actual_check_in_time, minutes_late, is_on_time, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $5)")
-                    .bind(&punctuality_id).bind(scheduled_guard_id).bind(&shift_id).bind(start).bind(actual_check_in).bind(if is_late { Some((actual_check_in - start).num_minutes() as i32) } else { Some(0) }).bind(!is_late).bind(if is_late { "late" } else { "present" }).execute(pool).await?;
-                track(pool, "punctuality_records", &punctuality_id).await?;
+            let recommendation_id = new_id();
+            let rationale = if cross_site {
+                "Available Tagum relief guard with no conflicting shift and sufficient rest."
             } else {
-                let check_in = start - Duration::minutes(4 + (index % 5) as i64);
-                let attendance_id = new_id();
-                sqlx::query("INSERT INTO attendance (id, guard_id, shift_id, check_in_time, check_out_time, status, check_in_source, created_at, updated_at) VALUES ($1, $2, $3, $4, NULL, 'checked_in', 'mobile', $4, $4)")
-                    .bind(&attendance_id).bind(&guard.id).bind(&shift_id).bind(check_in).execute(pool).await?;
-                track(pool, "attendance", &attendance_id).await?;
-            }
+                "Regular relief guard for this client site, currently off duty with no conflicting shift."
+            };
+            sqlx::query(
+                r#"INSERT INTO smart_guard_replacements (id, shift_id, absent_guard_id, recommended_guard_id, recommendation_rank, compatibility_score, confidence_score, rationale, scoring_breakdown, candidate_pool, recommendation_status, generated_at, expires_at, created_at, updated_at)
+                   VALUES ($1, $2, $3, $4, 1, 0.93, 0.89, $5, $6, $7, 'accepted', $8, $9, $8, $8)"#,
+            )
+            .bind(&recommendation_id)
+            .bind(&shift_id)
+            .bind(&guard.id)
+            .bind(&replacement_guard.id)
+            .bind(rationale)
+            .bind(json!({"availability": "confirmed", "rest_hours": MIN_REST_HOURS, "site_affinity": if cross_site {"Tagum relief"} else {"primary roster"}}))
+            .bind(json!([{"guardId": replacement_guard.id, "rank": 1, "selection": if cross_site {"Tagum relief"} else {"same-site relief"}}]))
+            .bind(assignment.start + Duration::minutes(18))
+            .bind(assignment.start + Duration::minutes(40))
+            .execute(pool)
+            .await?;
+            track(pool, "smart_guard_replacements", &recommendation_id).await?;
 
-            if index % 5 == 0 && day <= completed_until {
-                let readiness_id = new_id();
-                sqlx::query("INSERT INTO guard_shift_readiness (id, shift_id, guard_id, checked_items, notes, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $6)")
-                    .bind(&readiness_id).bind(&shift_id).bind(scheduled_guard_id).bind(json!(["radio", "identification", "site briefing"])).bind("Pre-shift readiness confirmed.").bind(start - Duration::minutes(20)).execute(pool).await?;
-                track(pool, "guard_shift_readiness", &readiness_id).await?;
-            }
-
-            if replacement || (index + day as usize) % 23 == 0 {
-                let audit_id = new_id();
-                sqlx::query("INSERT INTO audit_logs (id, actor_user_id, action_key, entity_type, entity_id, result, reason, source_ip, user_agent, metadata, created_at) VALUES ($1, $2, $3, 'shift', $4, 'success', $5, '10.10.0.15', 'SENTINEL Operations Console', $6, $7)")
-                    .bind(&audit_id).bind(if replacement { &supervisor.id } else { &admin.id }).bind(if replacement { "SHIFT_REPLACEMENT_ACCEPTED" } else { "SHIFT_SCHEDULE_CREATED" }).bind(&shift_id).bind(if replacement { "No-show replacement accepted after supervisor review." } else { "Schedule published for Tagum operations." }).bind(json!({"data_origin":"capstone_live_seed","batch_id":BATCH_ID})).bind(start - Duration::minutes(15)).execute(pool).await?;
-                track(pool, "audit_logs", &audit_id).await?;
-            }
+            record_completed_attendance(
+                pool,
+                replacement_guard,
+                &replacement_shift_id,
+                assignment.start,
+                assignment.end,
+                index + 11,
+                false,
+                &mut metrics,
+                true,
+            )
+            .await?;
+            metrics.replacements += 1;
+            metrics.cross_site_assignments += if cross_site { 1 } else { 0 };
+            continue;
         }
-    }
-    Ok(())
-}
 
-async fn seed_operational_records(
-    pool: &PgPool,
-    guards: &[SourceGuard],
-    sites: &[SourceSite],
-    admin: &SeedActor,
-    supervisor: &SeedActor,
-) -> Result<()> {
-    let site = &sites[0];
-    let incident_specs = [
-        ("Visitor access verification", "A visitor reached the reception point without a matching appointment record. Identity was verified and entry was delayed.", "investigating", "medium", 8_u32),
-        ("Perimeter lighting outage", "The north perimeter light was out during the evening patrol. Facilities were notified and temporary patrol frequency was increased.", "resolved", "low", 10_u32),
-        ("Unattended delivery package", "A delivery package was left at the side entrance. The area was isolated until the client representative confirmed the delivery.", "resolved", "high", 14_u32),
-        ("Gate access delay", "Vehicle gate access was delayed during the afternoon shift change. The guard recorded the queue and escalated to the site contact.", "open", "medium", 17_u32),
-    ];
-    for (index, (title, description, status, priority, day)) in incident_specs.iter().enumerate() {
-        let id = new_id();
-        let created_at = manila_time(*day, 10 + index as u32, 12 + index as u32 * 7)?;
-        sqlx::query("INSERT INTO incidents (id, title, description, location, site_name, reported_by, status, priority, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
-            .bind(&id).bind(title).bind(description).bind(&site.address).bind(&site.name).bind(&guards[index].id).bind(status).bind(priority).bind(created_at).bind(created_at + Duration::minutes(40)).execute(pool).await?;
-        track(pool, "incidents", &id).await?;
-        let classification_id = new_id();
-        sqlx::query("INSERT INTO incident_severity_classifications (id, incident_id, predicted_severity, confidence_score, requires_human_review, rationale, feature_scores, supporting_signals, classified_at, created_at, updated_at) VALUES ($1, $2, $3, 0.86, $4, $5, $6, $7, $8, $8, $8)")
-            .bind(&classification_id).bind(&id).bind(priority).bind(*priority == "high").bind("Classification reflects reported site impact and required supervisor follow-up.").bind(json!({"impact":0.7,"urgency":0.6})).bind(json!({"site":site.name,"workflow":"incident-review"})).bind(created_at + Duration::minutes(8)).execute(pool).await?;
-        track(
+        let late = (index + assignment.day as usize) % 29 == 0;
+        record_completed_attendance(
             pool,
-            "incident_severity_classifications",
-            &classification_id,
+            guard,
+            &shift_id,
+            assignment.start,
+            assignment.end,
+            index,
+            late,
+            &mut metrics,
+            false,
         )
         .await?;
     }
+    Ok(metrics)
+}
 
-    let request_specs = [
-        (
-            "service",
-            "pending",
-            "high",
-            "Request additional radios",
-            "Two handheld radios require replacement for the next Tagum night rotation.",
-            15_u32,
-        ),
-        (
-            "service",
-            "approved",
-            "normal",
-            "Site lighting follow-up",
-            "Request follow-up with the client on the reported north perimeter light.",
-            10_u32,
-        ),
-        (
-            "deposit",
-            "completed",
-            "normal",
-            "Document turnover",
-            "Turn over completed site incident documents to command records.",
-            12_u32,
-        ),
-        (
-            "return",
-            "rejected",
-            "normal",
-            "Early equipment return",
-            "Request to return assigned equipment before the scheduled shift end.",
-            9_u32,
-        ),
-        (
-            "service",
-            "in_progress",
-            "urgent",
-            "Gate access review",
-            "Request coordination with the client for recurring vehicle gate delays.",
-            17_u32,
-        ),
-    ];
-    for (index, (request_type, status, priority, subject, reason, day)) in
-        request_specs.iter().enumerate()
-    {
-        let request_id = new_id();
-        let created_at = manila_time(*day, 9 + index as u32, 18)?;
-        let reviewer = if index % 2 == 0 {
-            &supervisor.id
-        } else {
-            &admin.id
-        };
-        sqlx::query("INSERT INTO operational_requests (id, request_type, status, requester_id, subject, reason, details, priority, client_site_id, reviewer_id, reviewed_at, decision_reason, fulfilled_by, fulfilled_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)")
-            .bind(&request_id).bind(request_type).bind(status).bind(&guards[(index + 9) % guards.len()].id).bind(subject).bind(reason).bind("Created through the operational request workflow.").bind(priority).bind(&site.id).bind(if *status == "pending" { None } else { Some(reviewer) }).bind(if *status == "pending" { None } else { Some(created_at + Duration::hours(2)) }).bind(if *status == "rejected" { Some("The equipment remains required for the assigned shift. Return after supervisor clearance.") } else { None }).bind(if *status == "completed" { Some(&admin.id) } else { None }).bind(if *status == "completed" { Some(created_at + Duration::hours(5)) } else { None }).bind(created_at).bind(created_at + Duration::hours(2)).execute(pool).await?;
-        track(pool, "operational_requests", &request_id).await?;
-        let event_id = new_id();
-        sqlx::query("INSERT INTO operational_request_events (id, request_id, actor_user_id, from_status, to_status, comment, metadata, created_at) VALUES ($1, $2, $3, NULL, 'pending', 'Request submitted for operational review.', $4, $5)")
-            .bind(&event_id).bind(&request_id).bind(&guards[(index + 9) % guards.len()].id).bind(json!({"data_origin":"capstone_live_seed","batch_id":BATCH_ID})).bind(created_at).execute(pool).await?;
-        track(pool, "operational_request_events", &event_id).await?;
-        if *status != "pending" {
-            let decision_id = new_id();
-            sqlx::query("INSERT INTO operational_request_events (id, request_id, actor_user_id, from_status, to_status, comment, metadata, created_at) VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7)")
-                .bind(&decision_id).bind(&request_id).bind(reviewer).bind(status).bind(if *status == "rejected" { "Request rejected with operational explanation." } else { "Request reviewed and routed for action." }).bind(json!({"data_origin":"capstone_live_seed","batch_id":BATCH_ID})).bind(created_at + Duration::hours(2)).execute(pool).await?;
-            track(pool, "operational_request_events", &decision_id).await?;
-        }
-        let notification_id = new_id();
-        sqlx::query("INSERT INTO notifications (id, user_id, title, message, type, related_request_id, read, created_at, updated_at) VALUES ($1, $2, $3, $4, 'operational_request', $5, $6, $7, $7)")
-            .bind(&notification_id).bind(&guards[(index + 9) % guards.len()].id).bind(if *status == "pending" { "Request received" } else { "Request updated" }).bind(format!("{} is {}.", subject, status)).bind(&request_id).bind(*status != "pending").bind(created_at + Duration::hours(2)).execute(pool).await?;
-        track(pool, "notifications", &notification_id).await?;
+async fn record_completed_attendance(
+    pool: &PgPool,
+    guard: &SourceGuard,
+    shift_id: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    sequence: usize,
+    late: bool,
+    metrics: &mut SeedMetrics,
+    replacement: bool,
+) -> Result<()> {
+    let early_offsets = [-13_i64, -8, -4, -1, 2, 4];
+    let check_in = if late {
+        start + Duration::minutes(17 + (sequence % 9) as i64)
+    } else {
+        start + Duration::minutes(early_offsets[sequence % early_offsets.len()])
+    };
+    let check_out = end + Duration::minutes(2 + (sequence % 11) as i64);
+    let attendance_id = new_id();
+    sqlx::query("INSERT INTO attendance (id, guard_id, shift_id, check_in_time, check_out_time, status, check_in_source, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 'completed', $6, $4, $5)")
+        .bind(&attendance_id)
+        .bind(&guard.id)
+        .bind(shift_id)
+        .bind(check_in)
+        .bind(check_out)
+        .bind(if sequence % 3 == 0 { "mobile" } else { "manual" })
+        .execute(pool)
+        .await?;
+    track(pool, "attendance", &attendance_id).await?;
+
+    let punctuality_id = new_id();
+    sqlx::query("INSERT INTO punctuality_records (id, guard_id, shift_id, scheduled_start_time, actual_check_in_time, minutes_late, is_on_time, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $5)")
+        .bind(&punctuality_id)
+        .bind(&guard.id)
+        .bind(shift_id)
+        .bind(start)
+        .bind(check_in)
+        .bind(if late { Some((check_in - start).num_minutes() as i32) } else { Some(0) })
+        .bind(!late)
+        .bind(if late { "late" } else { "present" })
+        .execute(pool)
+        .await?;
+    track(pool, "punctuality_records", &punctuality_id).await?;
+
+    let performance = metrics
+        .guard_performance
+        .entry(guard.id.clone())
+        .or_default();
+    performance.assigned += 1;
+    performance.completed += 1;
+    if late {
+        metrics.late_arrivals += 1;
+        performance.late += 1;
+    } else {
+        performance.on_time += 1;
     }
-
-    for index in 0..6 {
-        let ticket_id = new_id();
-        let created_at = manila_time(11 + index as u32, 13, 10 + index as u32 * 5)?;
-        sqlx::query("INSERT INTO support_tickets (id, guard_id, subject, message, status, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $6)")
-            .bind(&ticket_id).bind(&guards[index].id).bind(["Mobile check-in clarification", "Schedule visibility", "Notification preference", "Site instructions", "Replacement availability", "DTR review"][index]).bind("Submitted through the normal guard support workflow for supervisor follow-up.").bind(if index % 2 == 0 { "open" } else { "resolved" }).bind(created_at).execute(pool).await?;
-        track(pool, "support_tickets", &ticket_id).await?;
+    if replacement {
+        performance.replacements += 1;
     }
     Ok(())
 }
 
-async fn seed_performance_feedback_and_tracking(
+async fn seed_derived_performance(
     pool: &PgPool,
     guards: &[SourceGuard],
-    sites: &[SourceSite],
-    admin: &SeedActor,
-    supervisor: &SeedActor,
+    metrics: &SeedMetrics,
 ) -> Result<()> {
-    for (index, guard) in guards.iter().enumerate() {
-        let merit_id = new_id();
-        let late_count: i32 = if index % 9 == 0 {
-            2
+    let calculated_at = Utc::now();
+    for guard in guards {
+        let performance = metrics
+            .guard_performance
+            .get(&guard.id)
+            .cloned()
+            .unwrap_or_default();
+        if performance.assigned == 0 {
+            continue;
+        }
+        let attendance_score = (performance.completed as f64 / performance.assigned as f64) * 100.0;
+        let reported_count = performance.on_time + performance.late;
+        let punctuality_score = if reported_count == 0 {
+            0.0
         } else {
-            (index % 3) as i32
+            (performance.on_time as f64 / reported_count as f64) * 100.0
         };
-        let no_show_count: i32 = if index == 4 || index == 18 { 1 } else { 0 };
-        let overall =
-            91.0 - (late_count as f64 * 2.1) - (no_show_count as f64 * 7.5) + (index % 5) as f64;
-        let average_rating = 4.1 + (index % 8) as f64 / 10.0;
-        sqlx::query("INSERT INTO guard_merit_scores (id, guard_id, attendance_score, punctuality_score, client_rating, overall_score, rank, total_shifts_completed, on_time_count, late_count, no_show_count, average_client_rating, evaluation_count, last_calculated_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 14, $8, $9, $10, $11, 1, $12, $12, $12)")
-            .bind(&merit_id).bind(&guard.id).bind(94.0 - no_show_count as f64 * 8.0).bind(95.0 - late_count as f64 * 3.0).bind(average_rating * 20.0).bind(overall).bind(if overall >= 94.0 { "Excellent" } else if overall >= 88.0 { "Good" } else { "For review" }).bind(12_i32 - late_count - no_show_count).bind(late_count).bind(no_show_count).bind(average_rating).bind(manila_time(17, 16, 30)?).execute(pool).await?;
+        let overall_score = attendance_score * 0.65 + punctuality_score * 0.35;
+        let rank = if overall_score >= 95.0 {
+            "Excellent"
+        } else if overall_score >= 85.0 {
+            "Good"
+        } else {
+            "For review"
+        };
+        let merit_id = new_id();
+        sqlx::query("INSERT INTO guard_merit_scores (id, guard_id, attendance_score, punctuality_score, client_rating, overall_score, rank, total_shifts_completed, on_time_count, late_count, no_show_count, average_client_rating, evaluation_count, last_calculated_at, created_at, updated_at) VALUES ($1, $2, $3, $4, 0, $5, $6, $7, $8, $9, $10, 0, 0, $11, $11, $11)")
+            .bind(&merit_id)
+            .bind(&guard.id)
+            .bind(attendance_score)
+            .bind(punctuality_score)
+            .bind(overall_score)
+            .bind(rank)
+            .bind(performance.completed)
+            .bind(performance.on_time)
+            .bind(performance.late)
+            .bind(performance.absent)
+            .bind(calculated_at)
+            .execute(pool)
+            .await?;
         track(pool, "guard_merit_scores", &merit_id).await?;
-        let evaluator = if index % 2 == 0 { supervisor } else { admin };
-        let evaluation_id = new_id();
-        sqlx::query("INSERT INTO client_evaluations (id, guard_id, shift_id, evaluator_name, evaluator_role, rating, comment, created_at) VALUES ($1, $2, NULL, $3, $4, $5, $6, $7)")
-            .bind(&evaluation_id).bind(&guard.id).bind(&evaluator.full_name).bind(&evaluator.role).bind(average_rating).bind("October performance review based on recorded attendance and site conduct.").bind(manila_time(15 + (index % 2) as u32, 14, 20)?).execute(pool).await?;
-        track(pool, "client_evaluations", &evaluation_id).await?;
-    }
-
-    let comments = [
-        "Klaro ang proseso sa mobile check-in atol sa akong gitudlong duty.",
-        "Mas sayon sundon ang mga update sa schedule kung una ipakita ang ngalan sa site.",
-        "Nakatabang ang mga pahibalo aron mabantayan nako ang kausaban sa duty sa wala pa ang oras sa pag-report.",
-        "Kinahanglan magpabilin nga makita ang pinakabag-ong kahimtang sa check-in sa attendance screen bisan hinay ang signal.",
-        "Nakatabang ang status sa replacement request kung adunay kauban nga dili makasulod sa duty.",
-        "Nakatabang ang mga rekord sa DTR sa pagsusi sa akong nahuman nga mga duty.",
-        "Mapuslanon ang mapa, apan kinahanglan og mubo nga pasabot bahin sa pagtugot sa lokasyon.",
-        "Nakaabot sayo ang pahinumdom sa duty aron makaandam ko sa akong kagamitan.",
-        "Klaro ang mga instruksyon sa site para sa assignment sa Tagum.",
-        "Gusto ko og mas klarong timailhan kung na-review na ang usa ka support request.",
-        "Maayo ang schedule view sa pagsusi sa adlaw ug gabii nga mga assignment.",
-        "Ang mga koreksyon sa attendance kinahanglan magpakita sa rason human sa pag-review sa supervisor.",
-        "Nakatabang ang notification inbox kung daghan ang kausaban sa schedule.",
-        "Mas klaro unta ang workflow kung adunay mubo nga kumpirmasyon human sa check-out.",
-        "Sakto ang konteksto nga gihatag sa replacement recommendation para sa desisyon sa supervisor.",
-        "Madumala ra ang mobile form bisan panahon sa pahulay sa patrol.",
-        "Nakatabang ang DTR page sa pagtandi sa akong mga oras sa pag-report.",
-        "Gusto ko nga makita ang kontak sa client site human makumpirma ang schedule.",
-        "Nakatabang ang sistema sa pagkumpirma kung na-record na ba ang akong duty.",
-        "Kinahanglan adunay paagi sa pag-filter sa nahuman nga mga request sumala sa petsa.",
-    ];
-    for (index, comment) in comments.iter().enumerate() {
-        let feedback_id = new_id();
-        sqlx::query("INSERT INTO feedback (id, user_id, rating, comments, created_at) VALUES ($1, $2, $3, $4, $5)")
-            .bind(&feedback_id).bind(&guards[index].id).bind([5_i32, 4, 4, 3, 5, 4, 3, 4, 5, 3][index % 10]).bind(comment).bind(manila_time(8 + (index % 9) as u32, 17, 5 + (index % 10) as u32 * 3)?).execute(pool).await?;
-        track(pool, "feedback", &feedback_id).await?;
-    }
-    for (actor, rating, comment, day) in [
-        (admin, 4_i32, "Mapuslanon ang operational summaries sa pag-turnover sa duty. Kinahanglan magpabiling mubo ug klaro ang mga pasabot sa status sa request.", 16_u32),
-        (supervisor, 4_i32, "Nakatabang ang impormasyon sa replacement ug mga rekord sa attendance sa pagdumala sa mga assignment sa Tagum.", 17_u32),
-    ] {
-        let feedback_id = new_id();
-        sqlx::query("INSERT INTO feedback (id, user_id, rating, comments, created_at) VALUES ($1, $2, $3, $4, $5)")
-            .bind(&feedback_id).bind(&actor.id).bind(rating).bind(comment).bind(manila_time(day, 16, 45)?).execute(pool).await?;
-        track(pool, "feedback", &feedback_id).await?;
-    }
-
-    for index in 0..10 {
-        let guard = &guards[index];
-        let site = &sites[index % sites.len()];
-        let tracking_id = new_id();
-        sqlx::query("INSERT INTO tracking_points (id, entity_type, entity_id, user_id, label, status, latitude, longitude, heading, speed_kph, accuracy_meters, recorded_at, created_by, created_at) VALUES ($1, 'guard', $2, $2, $3, 'active', $4, $5, $6, 0, 8, $7, $8, $7)")
-            .bind(&tracking_id).bind(&guard.id).bind(&guard.full_name).bind(site.latitude + index as f64 * 0.00007).bind(site.longitude + index as f64 * 0.00005).bind((index * 31) as f64).bind(manila_time(17, 16, 10 + index as u32 * 2)?).bind(&supervisor.id).execute(pool).await?;
-        track(pool, "tracking_points", &tracking_id).await?;
-    }
-    for index in [4_usize, 18, 27] {
-        let prediction_id = new_id();
-        sqlx::query("INSERT INTO guard_absence_predictions (id, guard_id, prediction_window_hours, risk_score, risk_level, confidence_score, explanation, contributing_factors, source_snapshot, generated_at, valid_until, created_at, updated_at) VALUES ($1, $2, 24, $3, $4, 0.78, $5, $6, $7, $8, $9, $8, $8)")
-            .bind(&prediction_id).bind(&guards[index].id).bind(if index == 4 { 0.76 } else { 0.48 }).bind(if index == 4 { "high" } else { "medium" }).bind(json!({"summary":"Recent attendance pattern requires supervisor review before the next assignment."})).bind(json!(["recent late arrival", "schedule change"])).bind(json!({"completed_shifts":14,"late_count":2})).bind(manila_time(17, 15, 30)?).bind(manila_time(18, 15, 30)?).execute(pool).await?;
-        track(pool, "guard_absence_predictions", &prediction_id).await?;
     }
     Ok(())
 }
 
-async fn seed_audit_activity(
+async fn seed_presentation_audit(
     pool: &PgPool,
-    admin: &SeedActor,
-    supervisor: &SeedActor,
+    metrics: &SeedMetrics,
+    site_count: usize,
 ) -> Result<()> {
-    for index in 0..20 {
-        let audit_id = new_id();
-        let is_supervisor = index % 2 == 0;
-        let created_at = manila_time(
-            3 + (index % 15) as u32,
-            9 + (index % 6) as u32,
-            5 + (index % 10) as u32 * 4,
-        )?;
-        sqlx::query("INSERT INTO audit_logs (id, actor_user_id, action_key, entity_type, entity_id, result, reason, source_ip, user_agent, metadata, created_at) VALUES ($1, $2, $3, $4, $5, 'success', $6, '10.10.0.15', 'SENTINEL Operations Console', $7, $8)")
-            .bind(&audit_id).bind(if is_supervisor { &supervisor.id } else { &admin.id }).bind(if is_supervisor { "SUPERVISOR_SHIFT_REVIEW" } else { "ADMIN_OPERATIONAL_REVIEW" }).bind(if is_supervisor { "attendance" } else { "operational_request" }).bind(format!("capstone-live-activity-{}", index + 1)).bind(if is_supervisor { "Supervisor reviewed an attendance or replacement workflow." } else { "Administrator reviewed an operational request workflow." }).bind(json!({"data_origin":"capstone_live_seed","batch_id":BATCH_ID})).bind(created_at).execute(pool).await?;
-        track(pool, "audit_logs", &audit_id).await?;
+    let audit_id = new_id();
+    sqlx::query("INSERT INTO audit_logs (id, actor_user_id, action_key, entity_type, entity_id, result, reason, source_ip, user_agent, metadata, created_at) VALUES ($1, NULL, 'CAPSTONE_PRESENTATION_SEED_CREATED', 'capstone_seed_batch', $2, 'success', $3, NULL, 'CAPSTONE DATASET SEEDER', $4, $5)")
+        .bind(&audit_id)
+        .bind(BATCH_ID)
+        .bind("Presentation schedule generated with stable client-site rosters. No real-user audit activity was created.")
+        .bind(json!({
+            "data_origin": DATA_ORIGIN,
+            "batch_id": BATCH_ID,
+            "presentation_context": true,
+            "actor_label": "CAPSTONE DATASET SEEDER",
+            "history_through": "2026-10-16",
+            "planned_from": "2026-10-17",
+            "site_count": site_count,
+            "scheduled_slots": metrics.day_shifts + metrics.evening_shifts + metrics.night_shifts,
+        }))
+        .bind(Utc::now())
+        .execute(pool)
+        .await?;
+    track(pool, "audit_logs", &audit_id).await?;
+    Ok(())
+}
+
+fn validate_plan(planned: &[PlannedShift], sites: &[SourceSite]) -> Result<()> {
+    let expected_slots = sites.len() * ShiftRotation::ALL.len() * PLANNED_DAY as usize;
+    if planned.len() != expected_slots {
+        bail!(
+            "Expected {} coverage slots, generated {}",
+            expected_slots,
+            planned.len()
+        )
+    }
+
+    let mut coverage = BTreeMap::new();
+    let mut per_guard: HashMap<usize, Vec<&PlannedShift>> = HashMap::new();
+    for assignment in planned {
+        *coverage
+            .entry((
+                assignment.site_index,
+                assignment.day,
+                assignment.rotation.label(),
+            ))
+            .or_insert(0_usize) += 1;
+        per_guard
+            .entry(assignment.guard_index)
+            .or_default()
+            .push(assignment);
+    }
+    if coverage.values().any(|count| *count != 1) {
+        bail!("At least one site/date/rotation has missing or duplicate planned coverage")
+    }
+    for day in [4_u32, 11] {
+        let sunday_slots = planned
+            .iter()
+            .filter(|assignment| assignment.day == day)
+            .count();
+        if sunday_slots != sites.len() * ShiftRotation::ALL.len() {
+            bail!("October {} does not have complete Sunday coverage", day)
+        }
+    }
+    for assignments in per_guard.values() {
+        for (index, current) in assignments.iter().enumerate() {
+            for other in assignments.iter().skip(index + 1) {
+                if current.start < other.end && current.end > other.start {
+                    bail!("A guard has overlapping planned shifts")
+                }
+                let rest = if current.end <= other.start {
+                    other.start - current.end
+                } else {
+                    current.start - other.end
+                };
+                if rest < Duration::hours(MIN_REST_HOURS) {
+                    bail!("A guard has an insufficient-rest planned assignment")
+                }
+            }
+        }
     }
     Ok(())
 }
 
-async fn find_existing_actor(
+async fn build_seed_plan(
     pool: &PgPool,
-    full_name: &str,
-    expected_role: &str,
-) -> Result<SeedActor> {
-    let row = sqlx::query(
-        "SELECT id, full_name, username, role FROM users WHERE UPPER(BTRIM(full_name)) = UPPER($1) AND LOWER(BTRIM(role)) = $2 AND COALESCE(LOWER(BTRIM(status)), 'active') = 'active' LIMIT 1",
-    )
-    .bind(full_name)
-    .bind(expected_role)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| anyhow!("Required active {} actor {} was not found", expected_role, full_name))?;
+) -> Result<(
+    Vec<SourceGuard>,
+    Vec<SourceSite>,
+    Vec<Vec<usize>>,
+    Vec<PlannedShift>,
+)> {
+    let guards = read_live_guards(pool).await?;
+    let sites = read_live_sites(pool).await?;
+    let history = read_assignment_history(pool).await?;
+    let rosters = build_primary_rosters(&guards, &sites, &history)?;
+    let planned = plan_shift_coverage(&guards, &sites, &rosters)?;
+    validate_plan(&planned, &sites)?;
+    Ok((guards, sites, rosters, planned))
+}
 
-    Ok(SeedActor {
-        id: row.try_get("id")?,
-        full_name: row.try_get("full_name")?,
-        role: row.try_get::<String, _>("role")?.to_ascii_lowercase(),
-    })
+fn print_seed_plan(
+    guards: &[SourceGuard],
+    sites: &[SourceSite],
+    rosters: &[Vec<usize>],
+    planned: &[PlannedShift],
+) {
+    let address_count = guards
+        .iter()
+        .filter(|guard| {
+            guard
+                .address
+                .as_deref()
+                .is_some_and(|address| !address.trim().is_empty())
+        })
+        .count();
+    println!(
+        "CAPSTONE PREFLIGHT: {} active Tagum sites; {} participating guards.",
+        sites.len(),
+        guards.len()
+    );
+    println!("Guard location fields: address present for {}/{} guards; no guard latitude/longitude fields are available, so geographic distance is not calculated.", address_count, guards.len());
+    println!("Selected Tagum sites:");
+    for site in sites {
+        println!(
+            "SITE|{}|{}|{}|{:.6}|{:.6}",
+            site.id,
+            site.name,
+            site.address.as_deref().unwrap_or("No address"),
+            site.latitude,
+            site.longitude
+        );
+    }
+    println!("SITE | PRIMARY GUARDS | RELIEF GUARDS | DAY | EVENING | NIGHT");
+    for (site_index, roster) in rosters.iter().enumerate() {
+        let primary = roster
+            .iter()
+            .map(|guard_index| {
+                guards[*guard_index]
+                    .guard_code
+                    .as_deref()
+                    .unwrap_or(&guards[*guard_index].full_name)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "{} | {} | Rotating off-duty members of this site roster | covered | covered | covered",
+            sites[site_index].name, primary
+        );
+    }
+    println!(
+        "Coverage slots: {} ({} day, {} evening, {} night).",
+        planned.len(),
+        planned
+            .iter()
+            .filter(|assignment| assignment.rotation == ShiftRotation::Day)
+            .count(),
+        planned
+            .iter()
+            .filter(|assignment| assignment.rotation == ShiftRotation::Evening)
+            .count(),
+        planned
+            .iter()
+            .filter(|assignment| assignment.rotation == ShiftRotation::Night)
+            .count()
+    );
 }
 
 async fn verify_protected_superadmin(pool: &PgPool) -> Result<()> {
@@ -609,22 +1023,113 @@ async fn verify_protected_superadmin(pool: &PgPool) -> Result<()> {
 
 async fn seed(pool: &PgPool) -> Result<()> {
     ensure_ledger(pool).await?;
+    let (guards, sites, rosters, planned) = build_seed_plan(pool).await?;
     reset_batch(pool).await?;
-    let guards = read_live_guards(pool).await?;
-    let sites = read_live_sites(pool).await?;
-    let admin = find_existing_actor(pool, "OSCAR GAGA-A", "admin").await?;
-    let supervisor = find_existing_actor(pool, "SENDRICK SOLIS", "supervisor").await?;
+    print_seed_plan(&guards, &sites, &rosters, &planned);
     let reference_at =
         DateTime::parse_from_rfc3339(&require_env("CAPSTONE_REFERENCE_DATE")?)?.with_timezone(&Utc);
-    sqlx::query("INSERT INTO capstone_seed_batches (batch_id, data_origin, reference_at, status, metadata) VALUES ($1, 'capstone_live_seed', $2, 'running', $3)")
-        .bind(BATCH_ID).bind(reference_at).bind(json!({"scope":"Tagum City, Davao del Norte","dateRange":"2026-10-01 through 2026-10-17","source":"existing live master data","actors":{"admin":admin.id,"supervisor":supervisor.id}})).execute(pool).await?;
+    sqlx::query("INSERT INTO capstone_seed_batches (batch_id, data_origin, reference_at, status, metadata) VALUES ($1, $2, $3, 'running', $4)")
+        .bind(BATCH_ID)
+        .bind(DATA_ORIGIN)
+        .bind(reference_at)
+        .bind(json!({
+            "scope":"Tagum City, Davao del Norte",
+            "dateRange":"2026-10-01 through 2026-10-17",
+            "historyThrough":"2026-10-16",
+            "plannedFrom":"2026-10-17",
+            "source":"existing live master data",
+            "presentationContext":true,
+            "auditActor":"CAPSTONE DATASET SEEDER",
+            "locationAssignment":"existing schedule history, then stable deterministic roster; no guard coordinates available"
+        }))
+        .execute(pool)
+        .await?;
 
-    seed_shift_activity(pool, &guards, &sites, &admin, &supervisor).await?;
-    seed_operational_records(pool, &guards, &sites, &admin, &supervisor).await?;
-    seed_performance_feedback_and_tracking(pool, &guards, &sites, &admin, &supervisor).await?;
-    seed_audit_activity(pool, &admin, &supervisor).await?;
+    let metrics = seed_shift_activity(pool, &guards, &sites, &rosters, &planned).await?;
+    seed_derived_performance(pool, &guards, &metrics).await?;
+    seed_presentation_audit(pool, &metrics, sites.len()).await?;
     sqlx::query("UPDATE capstone_seed_batches SET status = 'complete', completed_at = CURRENT_TIMESTAMP WHERE batch_id = $1")
         .bind(BATCH_ID).execute(pool).await?;
+    print_seed_metrics(&metrics, &planned, &guards, &sites, &rosters);
+    Ok(())
+}
+
+fn print_seed_metrics(
+    metrics: &SeedMetrics,
+    planned: &[PlannedShift],
+    guards: &[SourceGuard],
+    sites: &[SourceSite],
+    rosters: &[Vec<usize>],
+) {
+    let historical_slots = planned
+        .iter()
+        .filter(|assignment| assignment.day <= HISTORY_LAST_DAY)
+        .count();
+    let shift_counts = metrics
+        .guard_performance
+        .values()
+        .map(|performance| performance.assigned)
+        .collect::<Vec<_>>();
+    let average = if shift_counts.is_empty() {
+        0.0
+    } else {
+        shift_counts.iter().sum::<i32>() as f64 / shift_counts.len() as f64
+    };
+    println!(
+        "SEED REPORT: sites={}, guards={}, scheduled_slots={}, completed_history={}, october_17_planned={}, day={}, evening={}, night={}, sunday_slots={}, absences={}, replacements={}, late_arrivals={}, cross_site_assignments={}, average_historical_shifts={:.2}, minimum_historical_shifts={}, maximum_historical_shifts={}",
+        sites.len(),
+        guards.len(),
+        planned.len(),
+        historical_slots,
+        metrics.planned_october_17,
+        metrics.day_shifts,
+        metrics.evening_shifts,
+        metrics.night_shifts,
+        planned.iter().filter(|assignment| matches!(assignment.day, 4 | 11)).count(),
+        metrics.absences,
+        metrics.replacements,
+        metrics.late_arrivals,
+        metrics.cross_site_assignments,
+        average,
+        shift_counts.iter().min().copied().unwrap_or_default(),
+        shift_counts.iter().max().copied().unwrap_or_default(),
+    );
+    print_seed_plan(guards, sites, rosters, planned);
+}
+
+async fn preflight(pool: &PgPool) -> Result<()> {
+    ensure_ledger(pool).await?;
+    let (guards, sites, rosters, planned) = build_seed_plan(pool).await?;
+    print_seed_plan(&guards, &sites, &rosters, &planned);
+    Ok(())
+}
+
+async fn validate(pool: &PgPool) -> Result<()> {
+    let future_attendance: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM attendance WHERE shift_id IN (SELECT record_id FROM capstone_seed_records WHERE batch_id = $1 AND table_name = 'shifts') AND check_in_time >= $2",
+    )
+    .bind(BATCH_ID)
+    .bind(manila_time(PLANNED_DAY, 0, 0)?)
+    .fetch_one(pool)
+    .await?;
+    if future_attendance != 0 {
+        bail!(
+            "Found {} attendance records for future October 17 shifts",
+            future_attendance
+        )
+    }
+
+    let scheduled_october_17: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM shifts WHERE id IN (SELECT record_id FROM capstone_seed_records WHERE batch_id = $1 AND table_name = 'shifts') AND start_time >= $2 AND status = 'scheduled'",
+    )
+    .bind(BATCH_ID)
+    .bind(manila_time(PLANNED_DAY, 0, 0)?)
+    .fetch_one(pool)
+    .await?;
+    println!(
+        "VALIDATION: future_attendance=0, october_17_scheduled={}",
+        scheduled_october_17
+    );
     Ok(())
 }
 
@@ -656,19 +1161,25 @@ async fn main() {
     let command = env::args().nth(1).unwrap_or_else(|| "status".to_string());
     let result = async {
         let target_url = verify_live_target(&command)?;
+        verify_backup_confirmation(&command)?;
         let target_pool = connect(&target_url, "explicit live target").await?;
         verify_protected_superadmin(&target_pool).await?;
         match command.as_str() {
             "seed" => {
                 seed(&target_pool).await?;
+                verify_protected_superadmin(&target_pool).await?;
                 status(&target_pool).await?;
+                validate(&target_pool).await?;
             }
             "reset" => {
                 ensure_ledger(&target_pool).await?;
                 reset_batch(&target_pool).await?;
+                verify_protected_superadmin(&target_pool).await?;
                 println!("Reset only batch {}.", BATCH_ID);
             }
             "status" => status(&target_pool).await?,
+            "preflight" => preflight(&target_pool).await?,
+            "validate" => validate(&target_pool).await?,
             _ => unreachable!(),
         }
         Ok::<(), anyhow::Error>(())
@@ -677,5 +1188,71 @@ async fn main() {
     if let Err(error) = result {
         eprintln!("Capstone dataset command failed: {error:#}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Datelike, Timelike};
+
+    fn guard(index: usize) -> SourceGuard {
+        SourceGuard {
+            id: format!("guard-{index}"),
+            full_name: format!("Guard {index}"),
+            guard_code: Some(format!("G-{index:04}")),
+            address: None,
+            currently_available: true,
+        }
+    }
+
+    fn site(index: usize) -> SourceSite {
+        SourceSite {
+            id: format!("site-{index}"),
+            name: format!("Tagum Site {index}"),
+            address: Some("Tagum City, Davao del Norte".to_string()),
+            latitude: 7.45 + index as f64 * 0.01,
+            longitude: 125.80 + index as f64 * 0.01,
+        }
+    }
+
+    #[test]
+    fn stable_rosters_cover_all_rotations_without_overlap_or_short_rest() {
+        let guards = (0..15).map(guard).collect::<Vec<_>>();
+        let sites = (0..3).map(site).collect::<Vec<_>>();
+        let rosters = build_primary_rosters(&guards, &sites, &HashMap::new()).expect("rosters");
+        let planned = plan_shift_coverage(&guards, &sites, &rosters).expect("coverage plan");
+
+        validate_plan(&planned, &sites).expect("valid schedule");
+        assert_eq!(planned.len(), 3 * 3 * 17);
+        assert!(planned.iter().all(|assignment| !assignment.is_cross_site));
+        assert_eq!(
+            planned
+                .iter()
+                .filter(|assignment| assignment.day == 4)
+                .count(),
+            9
+        );
+        assert_eq!(
+            planned
+                .iter()
+                .filter(|assignment| assignment.day == 11)
+                .count(),
+            9
+        );
+    }
+
+    #[test]
+    fn night_rotation_ends_on_the_following_calendar_day() {
+        let start = ShiftRotation::Night.start(10).expect("night start");
+        let end = start + Duration::hours(8);
+        let offset = FixedOffset::east_opt(MANILA_OFFSET_SECONDS).expect("Manila offset");
+        let local_start = start.with_timezone(&offset);
+        let local_end = end.with_timezone(&offset);
+
+        assert_eq!(local_start.day(), 10);
+        assert_eq!(local_start.hour(), 23);
+        assert_eq!(local_end.day(), 11);
+        assert_eq!(local_end.hour(), 7);
     }
 }

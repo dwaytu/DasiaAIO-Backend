@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("seed", "reset", "status")]
+  [ValidateSet("seed", "reset", "status", "preflight", "validate")]
   [string]$Command = "status"
 )
 
@@ -19,6 +19,10 @@ if ([string]::IsNullOrWhiteSpace($env:CAPSTONE_TARGET_DATABASE_URL)) {
 
 if ([string]::IsNullOrWhiteSpace($env:CAPSTONE_PROTECTED_SUPERADMIN_ID)) {
   throw "Set CAPSTONE_PROTECTED_SUPERADMIN_ID to the active production Superadmin ID before running this command."
+}
+
+if ($Command -in @("seed", "reset") -and [string]::IsNullOrWhiteSpace($env:CAPSTONE_BACKUP_VERIFIED_AT)) {
+  throw "Set CAPSTONE_BACKUP_VERIFIED_AT to the RFC 3339 time of a verified production backup before $Command."
 }
 
 cargo run --manifest-path "$PSScriptRoot/../Cargo.toml" --bin capstone-dataset -- $Command
