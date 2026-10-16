@@ -4,15 +4,17 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Duration, FixedOffset, TimeZone, Utc};
+use chrono::{DateTime, Duration, FixedOffset, TimeZone, Timelike, Utc};
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use uuid::Uuid;
 
 const BATCH_ID: &str = "capstone-live-october-2026";
+const ENRICHMENT_BATCH_ID: &str = "capstone-live-october-2026-enrichment-v1";
 const REQUIRED_CONFIRMATION: &str = "LIVE_CAPSTONE_DATASET_CONFIRMED";
 const MANILA_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const DATA_ORIGIN: &str = "capstone_presentation_seed";
+const ENRICHMENT_DATA_ORIGIN: &str = "capstone_presentation_enrichment";
 const PRIMARY_ROSTER_SIZE: usize = 5;
 const MAX_PARTICIPATING_GUARDS: usize = 55;
 const MIN_REST_HOURS: i64 = 8;
@@ -62,6 +64,17 @@ impl ShiftRotation {
             Self::Night => manila_time(day, 23, 0),
         }
     }
+
+    fn from_start(start: DateTime<Utc>) -> Result<Self> {
+        let offset = FixedOffset::east_opt(MANILA_OFFSET_SECONDS)
+            .ok_or_else(|| anyhow!("Invalid Manila offset"))?;
+        match start.with_timezone(&offset).hour() {
+            7 => Ok(Self::Day),
+            15 => Ok(Self::Evening),
+            23 => Ok(Self::Night),
+            hour => bail!("Unsupported capstone shift start hour {hour}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +96,42 @@ struct GuardPerformance {
     late: i32,
     absent: i32,
     replacements: i32,
+}
+
+#[derive(Clone)]
+struct CapstoneShift {
+    id: String,
+    guard_id: String,
+    site_id: String,
+    site_name: String,
+    latitude: f64,
+    longitude: f64,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+}
+
+#[derive(Default)]
+struct EnrichmentMetrics {
+    incidents: usize,
+    incident_classifications: usize,
+    operational_requests: usize,
+    operational_request_events: usize,
+    notifications: usize,
+    readiness: BTreeMap<String, usize>,
+    absence_predictions: usize,
+    support_tickets: BTreeMap<String, usize>,
+    client_evaluations: usize,
+    tracking_points: usize,
+    feedback: BTreeMap<i32, usize>,
+    bisaya_guard_feedback: usize,
+}
+
+#[derive(Clone)]
+struct WorkflowContext {
+    id: String,
+    guard_id: String,
+    shift_id: String,
+    occurred_at: DateTime<Utc>,
 }
 
 #[derive(Default)]
@@ -129,15 +178,15 @@ fn verify_live_target(command: &str) -> Result<String> {
 
     if !matches!(
         command,
-        "seed" | "reset" | "status" | "preflight" | "validate"
+        "seed" | "reset" | "status" | "preflight" | "validate" | "enrich" | "enrich-preflight"
     ) {
-        bail!("Usage: cargo run --bin capstone-dataset -- <seed|reset|status|preflight|validate>")
+        bail!("Usage: cargo run --bin capstone-dataset -- <seed|reset|status|preflight|validate|enrich|enrich-preflight>")
     }
     Ok(target_url)
 }
 
 fn verify_backup_confirmation(command: &str) -> Result<()> {
-    if !matches!(command, "seed" | "reset") {
+    if !matches!(command, "seed" | "reset" | "enrich") {
         return Ok(());
     }
 
@@ -186,11 +235,16 @@ async fn ensure_ledger(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-async fn track(pool: &PgPool, table_name: &str, record_id: &str) -> Result<()> {
+async fn track_batch(
+    pool: &PgPool,
+    batch_id: &str,
+    table_name: &str,
+    record_id: &str,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO capstone_seed_records (batch_id, table_name, record_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
     )
-    .bind(BATCH_ID)
+    .bind(batch_id)
     .bind(table_name)
     .bind(record_id)
     .execute(pool)
@@ -198,17 +252,19 @@ async fn track(pool: &PgPool, table_name: &str, record_id: &str) -> Result<()> {
     Ok(())
 }
 
-async fn delete_marked(pool: &PgPool, table_name: &str, delete_sql: &str) -> Result<()> {
-    sqlx::query(delete_sql).bind(BATCH_ID).execute(pool).await?;
-    tracing::debug!(table_name, "Removed presentation seed records");
-    Ok(())
+async fn track(pool: &PgPool, table_name: &str, record_id: &str) -> Result<()> {
+    track_batch(pool, BATCH_ID, table_name, record_id).await
 }
 
-async fn reset_batch(pool: &PgPool) -> Result<()> {
+async fn track_enrichment(pool: &PgPool, table_name: &str, record_id: &str) -> Result<()> {
+    track_batch(pool, ENRICHMENT_BATCH_ID, table_name, record_id).await
+}
+
+async fn reset_tracked_batch(pool: &PgPool, batch_id: &str) -> Result<()> {
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM capstone_seed_batches WHERE batch_id = $1)",
     )
-    .bind(BATCH_ID)
+    .bind(batch_id)
     .fetch_one(pool)
     .await?;
     if !exists {
@@ -237,13 +293,19 @@ async fn reset_batch(pool: &PgPool) -> Result<()> {
         ("shifts", "DELETE FROM shifts WHERE id IN (SELECT record_id FROM capstone_seed_records WHERE batch_id = $1 AND table_name = 'shifts')"),
     ];
     for (table_name, query) in deletions {
-        delete_marked(pool, table_name, query).await?;
+        sqlx::query(query).bind(batch_id).execute(pool).await?;
+        tracing::debug!(table_name, batch_id, "Removed presentation seed records");
     }
     sqlx::query("DELETE FROM capstone_seed_batches WHERE batch_id = $1")
-        .bind(BATCH_ID)
+        .bind(batch_id)
         .execute(pool)
         .await?;
     Ok(())
+}
+
+async fn reset_batch(pool: &PgPool) -> Result<()> {
+    reset_tracked_batch(pool, ENRICHMENT_BATCH_ID).await?;
+    reset_tracked_batch(pool, BATCH_ID).await
 }
 
 async fn read_live_guards(pool: &PgPool) -> Result<Vec<SourceGuard>> {
@@ -839,6 +901,766 @@ async fn seed_derived_performance(
     Ok(())
 }
 
+async fn read_completed_capstone_shifts(pool: &PgPool) -> Result<Vec<CapstoneShift>> {
+    let cutoff = manila_time(PLANNED_DAY, 0, 0)?;
+    let rows = sqlx::query(
+        r#"
+        SELECT s.id, s.guard_id, cs.id AS site_id, s.client_site AS site_name,
+               cs.latitude, cs.longitude, s.start_time, s.end_time
+        FROM shifts s
+        JOIN capstone_seed_records csr
+          ON csr.batch_id = $1 AND csr.table_name = 'shifts' AND csr.record_id = s.id
+        JOIN attendance a ON a.shift_id = s.id AND a.status = 'completed'
+        JOIN client_sites cs ON cs.name = s.client_site
+        WHERE s.status = 'completed'
+          -- October 16 night duty ends on October 17 at 07:00, but was
+          -- performed before the reference-day cutoff and has valid attendance.
+          AND s.start_time < $2
+        ORDER BY s.start_time, s.client_site, s.guard_id
+        "#,
+    )
+    .bind(BATCH_ID)
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(CapstoneShift {
+                id: row.try_get("id")?,
+                guard_id: row.try_get("guard_id")?,
+                site_id: row.try_get("site_id")?,
+                site_name: row.try_get("site_name")?,
+                latitude: row.try_get("latitude")?,
+                longitude: row.try_get("longitude")?,
+                start: row.try_get("start_time")?,
+                end: row.try_get("end_time")?,
+            })
+        })
+        .collect()
+}
+
+async fn verify_enrichment_schema(pool: &PgPool) -> Result<()> {
+    let requirements = [
+        ("support_tickets", "guard_id"),
+        ("support_tickets", "subject"),
+        ("support_tickets", "message"),
+        ("notifications", "related_request_id"),
+        ("notifications", "related_shift_id"),
+    ];
+    for (table_name, column_name) in requirements {
+        let present: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2)",
+        )
+        .bind(table_name)
+        .bind(column_name)
+        .fetch_one(pool)
+        .await?;
+        if !present {
+            bail!("Enrichment requires public.{table_name}.{column_name}; production schema does not provide it")
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_enrichment_ready(pool: &PgPool) -> Result<Vec<CapstoneShift>> {
+    let base_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM capstone_seed_batches WHERE batch_id = $1")
+            .bind(BATCH_ID)
+            .fetch_optional(pool)
+            .await?;
+    if base_status.as_deref() != Some("complete") {
+        bail!("The validated base capstone schedule is not complete; enrichment will not run")
+    }
+    verify_enrichment_schema(pool).await?;
+    validate_schedule_integrity(pool).await?;
+    let shifts = read_completed_capstone_shifts(pool).await?;
+    if shifts.len() != 528 {
+        bail!(
+            "Expected 528 completed capstone shifts with attendance before enrichment, found {}",
+            shifts.len()
+        )
+    }
+    Ok(shifts)
+}
+
+fn scenario_shift<'a>(shifts: &'a [CapstoneShift], sequence: usize) -> &'a CapstoneShift {
+    &shifts[(sequence * 71 + 17) % shifts.len()]
+}
+
+async fn seed_incident_scenarios(
+    pool: &PgPool,
+    shifts: &[CapstoneShift],
+    metrics: &mut EnrichmentMetrics,
+) -> Result<Vec<WorkflowContext>> {
+    let scenarios = [
+        ("Visitor verification concern", "A visitor arrived without the required authorization reference. Access was held while the site contact verified the visit.", "resolved", "low", 68_i64),
+        ("Perimeter light outage", "One perimeter light was not operating during the scheduled inspection. The affected area was included in the guard's additional rounds.", "resolved", "medium", 96),
+        ("Gate access congestion", "Delivery and visitor traffic briefly congested the gate. The guard coordinated a controlled entry sequence with the site contact.", "investigating", "medium", 112),
+        ("Unattended package review", "An unattended package was observed near the entrance. The area was checked with the site contact before normal access resumed.", "resolved", "high", 144),
+        ("Access card verification", "A staff access card did not match the visitor log. Entry was deferred pending confirmation from the authorized contact.", "open", "low", 74),
+        ("Defective flashlight report", "The assigned flashlight intermittently failed during a routine patrol. The issue was reported for replacement before the next duty period.", "investigating", "medium", 88),
+        ("Attempted unauthorized entry", "An individual attempted to enter through a restricted gate without clearance. The guard maintained the access boundary and requested a supervisor review.", "open", "high", 132),
+    ];
+    let mut contexts = Vec::with_capacity(scenarios.len());
+    for (index, (title, description, status, priority, minute_offset)) in
+        scenarios.into_iter().enumerate()
+    {
+        let shift = scenario_shift(shifts, index + 3);
+        let created_at = shift.start + Duration::minutes(minute_offset);
+        if created_at >= shift.end {
+            bail!("Incident scenario timestamp falls outside its assigned shift")
+        }
+        let updated_at = match status {
+            "resolved" => created_at + Duration::minutes(95),
+            "investigating" => created_at + Duration::minutes(45),
+            _ => created_at,
+        };
+        let incident_id = new_id();
+        sqlx::query(
+            "INSERT INTO incidents (id, title, description, location, site_name, reported_by, status, priority, created_at, updated_at) VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(&incident_id)
+        .bind(title)
+        .bind(description)
+        .bind(&shift.site_name)
+        .bind(&shift.guard_id)
+        .bind(status)
+        .bind(priority)
+        .bind(created_at)
+        .bind(updated_at)
+        .execute(pool)
+        .await?;
+        track_enrichment(pool, "incidents", &incident_id).await?;
+
+        let classification_id = new_id();
+        let confidence = match priority {
+            "high" => 0.91,
+            "medium" => 0.82,
+            _ => 0.76,
+        };
+        sqlx::query(
+            "INSERT INTO incident_severity_classifications (id, incident_id, predicted_severity, confidence_score, requires_human_review, rationale, feature_scores, supporting_signals, classified_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $9)",
+        )
+        .bind(&classification_id)
+        .bind(&incident_id)
+        .bind(priority)
+        .bind(confidence)
+        .bind(matches!(priority, "high"))
+        .bind("Presentation scenario classification based on the reported operational condition and required follow-up.")
+        .bind(json!({"operationalImpact": priority, "siteContext": "scheduled shift"}))
+        .bind(json!({"dataOrigin": ENRICHMENT_DATA_ORIGIN, "workflow": "incident review"}))
+        .bind(created_at + Duration::minutes(18))
+        .execute(pool)
+        .await?;
+        track_enrichment(
+            pool,
+            "incident_severity_classifications",
+            &classification_id,
+        )
+        .await?;
+
+        metrics.incidents += 1;
+        metrics.incident_classifications += 1;
+        contexts.push(WorkflowContext {
+            id: incident_id,
+            guard_id: shift.guard_id.clone(),
+            shift_id: shift.id.clone(),
+            occurred_at: created_at,
+        });
+    }
+    Ok(contexts)
+}
+
+async fn seed_operational_request_scenarios(
+    pool: &PgPool,
+    shifts: &[CapstoneShift],
+    metrics: &mut EnrichmentMetrics,
+) -> Result<Vec<WorkflowContext>> {
+    let scenarios = [
+        ("Additional radio request", "Request an additional radio for clearer gate coordination.", "A spare radio would reduce handoff delays during the busier entry period.", "pending", "normal"),
+        ("Replacement rain gear", "Request replacement rain gear", "The current rain gear is worn and no longer reliable during extended perimeter rounds.", "approved", "normal"),
+        ("Client-site instruction clarification", "Clarify visitor verification instruction", "Please confirm the required reference for after-hours visitor verification.", "in_progress", "normal"),
+        ("Schedule correction review", "Review schedule end time", "The posted schedule needs a review because the handoff time differs from the site instruction.", "completed", "high"),
+        ("Temporary relief request", "Request temporary relief coverage", "A short relief arrangement is requested after an urgent personal concern was reported before duty.", "rejected", "normal"),
+        ("Defective flashlight follow-up", "Request flashlight replacement", "The assigned flashlight intermittently loses power during the patrol route.", "approved", "normal"),
+        ("Gate access coordination", "Coordinate delivery gate access", "Please confirm the arrival window and contact process for the scheduled delivery.", "in_progress", "normal"),
+        ("DTR correction review", "Request DTR check-in review", "Please review the recorded check-in after a delayed mobile signal at the site.", "completed", "high"),
+        ("Site briefing materials", "Request updated site briefing", "The guard team needs the latest visitor and delivery handling reminder for this post.", "pending", "normal"),
+    ];
+    let mut contexts = Vec::with_capacity(scenarios.len());
+    for (index, (subject, reason, details, status, priority)) in scenarios.into_iter().enumerate() {
+        let shift = scenario_shift(shifts, index + 18);
+        let created_at = shift.start + Duration::minutes(36 + (index as i64 * 7));
+        let request_id = new_id();
+        let reviewed_at =
+            (!matches!(status, "pending")).then_some(created_at + Duration::minutes(42));
+        let fulfilled_at = matches!(status, "completed").then_some(created_at + Duration::hours(3));
+        sqlx::query(
+            "INSERT INTO operational_requests (id, request_type, status, requester_id, resource_type, subject, reason, details, priority, client_site_id, shift_id, operational_event_key, reviewed_at, decision_reason, fulfilled_at, created_at, updated_at) VALUES ($1, 'service', $2, $3, 'guard_equipment', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, COALESCE($13, $11, $14))",
+        )
+        .bind(&request_id)
+        .bind(status)
+        .bind(&shift.guard_id)
+        .bind(subject)
+        .bind(reason)
+        .bind(details)
+        .bind(priority)
+        .bind(&shift.site_id)
+        .bind(&shift.id)
+        .bind(format!("capstone-enrichment-request-{}", index + 1))
+        .bind(reviewed_at)
+        .bind(if status == "rejected" { Some("Presentation scenario: the requested temporary relief was not available for the stated period.") } else { None })
+        .bind(fulfilled_at)
+        .bind(created_at)
+        .execute(pool)
+        .await?;
+        track_enrichment(pool, "operational_requests", &request_id).await?;
+
+        let mut timeline = vec![(
+            None,
+            "pending",
+            created_at,
+            "Request submitted for operational review.",
+        )];
+        match status {
+            "approved" => timeline.push((
+                Some("pending"),
+                "approved",
+                created_at + Duration::minutes(42),
+                "Request approved for the next available support cycle.",
+            )),
+            "in_progress" => {
+                timeline.push((
+                    Some("pending"),
+                    "approved",
+                    created_at + Duration::minutes(38),
+                    "Request approved for coordinated follow-up.",
+                ));
+                timeline.push((
+                    Some("approved"),
+                    "in_progress",
+                    created_at + Duration::minutes(70),
+                    "Support coordination is in progress.",
+                ));
+            }
+            "completed" => {
+                timeline.push((
+                    Some("pending"),
+                    "approved",
+                    created_at + Duration::minutes(38),
+                    "Request approved for coordinated follow-up.",
+                ));
+                timeline.push((
+                    Some("approved"),
+                    "in_progress",
+                    created_at + Duration::minutes(70),
+                    "Support coordination is in progress.",
+                ));
+                timeline.push((
+                    Some("in_progress"),
+                    "completed",
+                    created_at + Duration::hours(3),
+                    "Requested review or equipment follow-up completed.",
+                ));
+            }
+            "rejected" => timeline.push((
+                Some("pending"),
+                "rejected",
+                created_at + Duration::minutes(42),
+                "Requested temporary relief was unavailable for the stated period.",
+            )),
+            _ => {}
+        }
+        for (from_status, to_status, event_at, comment) in timeline {
+            let event_id = new_id();
+            sqlx::query(
+                "INSERT INTO operational_request_events (id, request_id, actor_user_id, from_status, to_status, comment, metadata, created_at) VALUES ($1, $2, NULL, $3, $4, $5, $6, $7)",
+            )
+            .bind(&event_id)
+            .bind(&request_id)
+            .bind(from_status)
+            .bind(to_status)
+            .bind(comment)
+            .bind(json!({"dataOrigin": ENRICHMENT_DATA_ORIGIN, "actorLabel": "CAPSTONE DATASET ENRICHER", "presentationContext": true}))
+            .bind(event_at)
+            .execute(pool)
+            .await?;
+            track_enrichment(pool, "operational_request_events", &event_id).await?;
+            metrics.operational_request_events += 1;
+        }
+        metrics.operational_requests += 1;
+        contexts.push(WorkflowContext {
+            id: request_id,
+            guard_id: shift.guard_id.clone(),
+            shift_id: shift.id.clone(),
+            occurred_at: created_at,
+        });
+    }
+    Ok(contexts)
+}
+
+async fn seed_readiness(
+    pool: &PgPool,
+    shifts: &[CapstoneShift],
+    metrics: &mut EnrichmentMetrics,
+) -> Result<()> {
+    for (index, shift) in shifts.iter().take(96).enumerate() {
+        let checked_items = if index % 7 == 0 {
+            json!(["uniform", "endorsement_form"])
+        } else {
+            json!(["uniform", "firearm", "endorsement_form"])
+        };
+        let recorded_at = shift.start - Duration::minutes(25 + (index % 18) as i64);
+        let readiness_id = new_id();
+        sqlx::query(
+            "INSERT INTO guard_shift_readiness (id, shift_id, guard_id, checked_items, notes, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $6)",
+        )
+        .bind(&readiness_id)
+        .bind(&shift.id)
+        .bind(&shift.guard_id)
+        .bind(checked_items)
+        .bind(if index % 7 == 0 { "Equipment follow-up noted before duty." } else { "Pre-shift equipment and endorsement confirmation recorded." })
+        .bind(recorded_at)
+        .execute(pool)
+        .await?;
+        track_enrichment(pool, "guard_shift_readiness", &readiness_id).await?;
+        *metrics
+            .readiness
+            .entry(ShiftRotation::from_start(shift.start)?.label().to_string())
+            .or_default() += 1;
+    }
+    Ok(())
+}
+
+async fn seed_support_tickets(
+    pool: &PgPool,
+    shifts: &[CapstoneShift],
+    metrics: &mut EnrichmentMetrics,
+) -> Result<Vec<WorkflowContext>> {
+    let scenarios = [
+        ("Mobile check-in concern", "Naa koy concern sa mobile check-in kay usahay hinay ang signal sa gate area. Palihog ko check kung naa pa bay dapat buhaton sa app.", "open"),
+        ("DTR clarification", "Palihog ko clarify sa akong DTR kay lahi ang oras sa akong handover ug sa na-record sa mobile.", "in_progress"),
+        ("Schedule not refreshing", "Dili dayon makita ang updated schedule sa akong mobile human sa change. Need lang ko ug confirmation sa latest duty.", "resolved"),
+        ("Notification clarification", "Naka-receive ko ug notification pero dili klaro kung kinahanglan ba ko mu-action dayon.", "resolved"),
+        ("Site instruction question", "Pwede ko mangayo ug klaro nga instruction para sa after-hours visitor verification sa site?", "in_progress"),
+        ("Attendance correction request", "Please review ang check-in record kay delayed ang signal sa akong shift.", "open"),
+        ("Profile contact concern", "Need ko ug tabang sa pag-check sa contact information nga makita sa akong account.", "resolved"),
+    ];
+    let mut contexts = Vec::with_capacity(scenarios.len());
+    for (index, (subject, message, status)) in scenarios.into_iter().enumerate() {
+        let shift = scenario_shift(shifts, index + 33);
+        let created_at = shift.end + Duration::minutes(25 + (index as i64 * 11));
+        let updated_at = match status {
+            "resolved" => created_at + Duration::hours(2),
+            "in_progress" => created_at + Duration::minutes(55),
+            _ => created_at,
+        };
+        let ticket_id = new_id();
+        sqlx::query(
+            "INSERT INTO support_tickets (id, guard_id, subject, message, status, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&ticket_id)
+        .bind(&shift.guard_id)
+        .bind(subject)
+        .bind(message)
+        .bind(status)
+        .bind(created_at)
+        .bind(updated_at)
+        .execute(pool)
+        .await?;
+        track_enrichment(pool, "support_tickets", &ticket_id).await?;
+        *metrics
+            .support_tickets
+            .entry(status.to_string())
+            .or_default() += 1;
+        contexts.push(WorkflowContext {
+            id: ticket_id,
+            guard_id: shift.guard_id.clone(),
+            shift_id: shift.id.clone(),
+            occurred_at: updated_at,
+        });
+    }
+    Ok(contexts)
+}
+
+async fn insert_notification(
+    pool: &PgPool,
+    metrics: &mut EnrichmentMetrics,
+    user_id: &str,
+    title: &str,
+    message: &str,
+    notification_type: &str,
+    related_shift_id: Option<&str>,
+    related_request_id: Option<&str>,
+    read: bool,
+    created_at: DateTime<Utc>,
+) -> Result<()> {
+    let notification_id = new_id();
+    sqlx::query(
+        "INSERT INTO notifications (id, user_id, title, message, type, related_shift_id, related_request_id, read, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)",
+    )
+    .bind(&notification_id)
+    .bind(user_id)
+    .bind(title)
+    .bind(message)
+    .bind(notification_type)
+    .bind(related_shift_id)
+    .bind(related_request_id)
+    .bind(read)
+    .bind(created_at)
+    .execute(pool)
+    .await?;
+    track_enrichment(pool, "notifications", &notification_id).await?;
+    metrics.notifications += 1;
+    Ok(())
+}
+
+async fn seed_workflow_notifications(
+    pool: &PgPool,
+    requests: &[WorkflowContext],
+    incidents: &[WorkflowContext],
+    tickets: &[WorkflowContext],
+    metrics: &mut EnrichmentMetrics,
+) -> Result<()> {
+    for (index, request) in requests.iter().enumerate() {
+        let read = index % 3 != 0;
+        insert_notification(
+            pool,
+            metrics,
+            &request.guard_id,
+            "Operational request updated",
+            "Your operational request has been recorded. Open Requests to review its current status and next step.",
+            "operational_request",
+            Some(&request.shift_id),
+            Some(&request.id),
+            read,
+            request.occurred_at + Duration::minutes(8),
+        )
+        .await?;
+    }
+    for (index, incident) in incidents.iter().enumerate() {
+        insert_notification(
+            pool,
+            metrics,
+            &incident.guard_id,
+            "Incident review recorded",
+            "An incident reported during your duty has been recorded for operational review. Follow the site instruction until the review is complete.",
+            "incident_review",
+            Some(&incident.shift_id),
+            None,
+            index % 2 == 0,
+            incident.occurred_at + Duration::minutes(24),
+        )
+        .await?;
+    }
+    for (index, ticket) in tickets.iter().enumerate() {
+        insert_notification(
+            pool,
+            metrics,
+            &ticket.guard_id,
+            "Support ticket update",
+            "Your support concern has an updated status. Open Support Tickets to review the latest response.",
+            "support_ticket",
+            Some(&ticket.shift_id),
+            None,
+            index % 2 != 0,
+            ticket.occurred_at + Duration::minutes(12),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn seed_client_evaluations(
+    pool: &PgPool,
+    shifts: &[CapstoneShift],
+    metrics: &mut EnrichmentMetrics,
+) -> Result<()> {
+    let ratings = [
+        4.6, 4.2, 3.8, 4.7, 4.4, 4.0, 4.9, 3.7, 4.3, 4.5, 3.9, 4.8, 4.1, 4.6, 3.6, 4.4, 4.7, 4.0,
+        4.5, 3.4, 4.8, 4.2, 4.6, 3.9,
+    ];
+    let comments = [
+        "Consistent attendance and professional site conduct during the observed duty period.",
+        "Handled visitor verification calmly and followed the site access process.",
+        "Needs a little more confidence when relaying handover details, but attendance remained consistent.",
+        "Demonstrated good familiarity with the site's patrol and gate procedures.",
+        "Professional communication during a busy entry period.",
+        "Reliable attendance; continue improving the clarity of written handover notes.",
+    ];
+    let mut selected_guards = HashSet::new();
+    for shift in shifts {
+        if selected_guards.len() == ratings.len() {
+            break;
+        }
+        if !selected_guards.insert(shift.guard_id.clone()) {
+            continue;
+        }
+        let index = selected_guards.len() - 1;
+        let evaluation_id = new_id();
+        let created_at = shift.end + Duration::minutes(80 + (index % 5) as i64 * 9);
+        sqlx::query(
+            "INSERT INTO client_evaluations (id, guard_id, shift_id, evaluator_name, evaluator_role, rating, comment, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&evaluation_id)
+        .bind(&shift.guard_id)
+        .bind(&shift.id)
+        .bind("Capstone presentation evaluation")
+        .bind("presentation scenario")
+        .bind(ratings[index])
+        .bind(comments[index % comments.len()])
+        .bind(created_at)
+        .execute(pool)
+        .await?;
+        track_enrichment(pool, "client_evaluations", &evaluation_id).await?;
+        metrics.client_evaluations += 1;
+    }
+    if metrics.client_evaluations != ratings.len() {
+        bail!("Expected 24 distinct guards with completed shifts for client evaluation scenarios")
+    }
+    Ok(())
+}
+
+async fn seed_tracking_points(
+    pool: &PgPool,
+    shifts: &[CapstoneShift],
+    metrics: &mut EnrichmentMetrics,
+) -> Result<()> {
+    for index in 0..18 {
+        let shift = scenario_shift(shifts, index + 49);
+        let point_id = new_id();
+        let latitude = shift.latitude + ((index as f64 % 3.0) - 1.0) * 0.00011;
+        let longitude = shift.longitude + (((index * 2) as f64 % 3.0) - 1.0) * 0.00010;
+        let recorded_at = shift.start + Duration::minutes(105 + (index as i64 * 13 % 210));
+        if recorded_at >= shift.end {
+            bail!("Tracking point timestamp falls outside its assigned completed shift")
+        }
+        sqlx::query(
+            "INSERT INTO tracking_points (id, entity_type, entity_id, user_id, label, status, latitude, longitude, heading, speed_kph, accuracy_meters, created_by, recorded_at, created_at) VALUES ($1, 'guard', $2, $2, $3, 'presentation_checkpoint', $4, $5, $6, $7, $8, NULL, $9, $9)",
+        )
+        .bind(&point_id)
+        .bind(&shift.guard_id)
+        .bind(format!("Presentation checkpoint near {}", shift.site_name))
+        .bind(latitude)
+        .bind(longitude)
+        .bind((index as f64 * 37.0) % 360.0)
+        .bind(2.2 + (index % 4) as f64 * 0.4)
+        .bind(9.0 + (index % 3) as f64)
+        .bind(recorded_at)
+        .execute(pool)
+        .await?;
+        track_enrichment(pool, "tracking_points", &point_id).await?;
+        metrics.tracking_points += 1;
+    }
+    Ok(())
+}
+
+async fn seed_absence_predictions(pool: &PgPool, metrics: &mut EnrichmentMetrics) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT s.guard_id,
+               COUNT(DISTINCT s.id) FILTER (WHERE s.status = 'completed')::BIGINT AS completed_shifts,
+               COUNT(DISTINCT s.id) FILTER (WHERE s.status = 'absent')::BIGINT AS prior_absences,
+               COUNT(DISTINCT p.id) FILTER (WHERE p.status = 'late')::BIGINT AS late_checkins,
+               COUNT(DISTINCT s.id) FILTER (WHERE EXTRACT(HOUR FROM s.start_time AT TIME ZONE 'Asia/Manila') = 23)::BIGINT AS night_shifts,
+               COUNT(DISTINCT r.id) FILTER (WHERE r.recommended_guard_id = s.guard_id)::BIGINT AS replacement_assignments
+        FROM shifts s
+        JOIN capstone_seed_records csr
+          ON csr.batch_id = $1 AND csr.table_name = 'shifts' AND csr.record_id = s.id
+        LEFT JOIN punctuality_records p ON p.shift_id = s.id
+        LEFT JOIN smart_guard_replacements r
+          ON r.recommended_guard_id = s.guard_id
+         AND EXISTS (
+             SELECT 1 FROM capstone_seed_records rcsr
+             WHERE rcsr.batch_id = $1 AND rcsr.table_name = 'smart_guard_replacements' AND rcsr.record_id = r.id
+         )
+        GROUP BY s.guard_id
+        ORDER BY prior_absences DESC, late_checkins DESC, night_shifts DESC, s.guard_id
+        LIMIT 4
+        "#,
+    )
+    .bind(BATCH_ID)
+    .fetch_all(pool)
+    .await?;
+    if rows.len() != 4 {
+        bail!(
+            "Expected four derived absence-prediction candidates, found {}",
+            rows.len()
+        )
+    }
+    for (index, row) in rows.into_iter().enumerate() {
+        let guard_id: String = row.try_get("guard_id")?;
+        let completed_shifts: i64 = row.try_get("completed_shifts")?;
+        let prior_absences: i64 = row.try_get("prior_absences")?;
+        let late_checkins: i64 = row.try_get("late_checkins")?;
+        let night_shifts: i64 = row.try_get("night_shifts")?;
+        let replacement_assignments: i64 = row.try_get("replacement_assignments")?;
+        let risk_score = (0.16
+            + (prior_absences as f64 * 0.42)
+            + (late_checkins.min(3) as f64 * 0.10)
+            + (replacement_assignments.min(2) as f64 * 0.06)
+            + (night_shifts.min(4) as f64 * 0.02))
+            .min(0.92);
+        let risk_level = if risk_score >= 0.72 {
+            "high"
+        } else if risk_score >= 0.42 {
+            "medium"
+        } else {
+            "low"
+        };
+        let generated_at = manila_time(16, 16 + index as u32, 20)?;
+        let prediction_id = new_id();
+        sqlx::query(
+            "INSERT INTO guard_absence_predictions (id, guard_id, prediction_window_hours, risk_score, risk_level, confidence_score, explanation, contributing_factors, source_snapshot, generated_at, valid_until, feature_version, created_at, updated_at) VALUES ($1, $2, 24, $3, $4, $5, $6, $7, $8, $9, $10, 'capstone-enrichment-v1', $9, $9)",
+        )
+        .bind(&prediction_id)
+        .bind(&guard_id)
+        .bind(risk_score)
+        .bind(risk_level)
+        .bind(0.78)
+        .bind(json!({
+            "summary": "Presentation scenario derived from the current capstone attendance, punctuality, replacement, and night-rotation records.",
+            "dataOrigin": ENRICHMENT_DATA_ORIGIN,
+        }))
+        .bind(json!({"priorAbsences": prior_absences, "lateCheckins": late_checkins, "replacementAssignments": replacement_assignments, "nightShifts": night_shifts}))
+        .bind(json!({"dataOrigin": ENRICHMENT_DATA_ORIGIN, "completedShifts": completed_shifts, "priorAbsences": prior_absences, "lateCheckins": late_checkins, "replacementAssignments": replacement_assignments, "nightShifts": night_shifts, "calculatedAt": generated_at}))
+        .bind(generated_at)
+        .bind(generated_at + Duration::hours(24))
+        .execute(pool)
+        .await?;
+        track_enrichment(pool, "guard_absence_predictions", &prediction_id).await?;
+        metrics.absence_predictions += 1;
+    }
+    Ok(())
+}
+
+async fn read_feedback_participants(pool: &PgPool) -> Result<(Vec<String>, String, String)> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT s.guard_id
+        FROM shifts s
+        JOIN capstone_seed_records csr
+          ON csr.batch_id = $1 AND csr.table_name = 'shifts' AND csr.record_id = s.id
+        LEFT JOIN feedback f ON f.user_id = s.guard_id
+        WHERE s.status = 'completed' AND f.id IS NULL
+        ORDER BY s.guard_id
+        "#,
+    )
+    .bind(BATCH_ID)
+    .fetch_all(pool)
+    .await?;
+    let mut guard_ids = rows
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("guard_id"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let replacement_guard: Option<String> = sqlx::query_scalar(
+        "SELECT r.recommended_guard_id FROM smart_guard_replacements r JOIN capstone_seed_records csr ON csr.batch_id = $1 AND csr.table_name = 'smart_guard_replacements' AND csr.record_id = r.id LEFT JOIN feedback f ON f.user_id = r.recommended_guard_id WHERE f.id IS NULL ORDER BY r.generated_at LIMIT 1",
+    )
+    .bind(BATCH_ID)
+    .fetch_optional(pool)
+    .await?;
+    if let Some(replacement_guard) = replacement_guard {
+        if let Some(position) = guard_ids
+            .iter()
+            .position(|guard_id| guard_id == &replacement_guard)
+        {
+            let guard_id = guard_ids.remove(position);
+            guard_ids.insert(0, guard_id);
+        }
+    }
+    if guard_ids.len() < 20 {
+        bail!(
+            "Expected at least 20 capstone guards without existing feedback, found {}",
+            guard_ids.len()
+        )
+    }
+
+    async fn role_participant(pool: &PgPool, role_filter: &str) -> Result<String> {
+        sqlx::query_scalar(
+            "SELECT u.id FROM users u LEFT JOIN feedback f ON f.user_id = u.id WHERE LOWER(BTRIM(u.role)) = $1 AND COALESCE(LOWER(BTRIM(u.status)), 'active') = 'active' AND f.id IS NULL ORDER BY u.created_at, u.id LIMIT 1",
+        )
+        .bind(role_filter)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| anyhow!("No active {} account is eligible for a presentation feedback scenario", role_filter))
+    }
+
+    Ok((
+        guard_ids.into_iter().take(20).collect(),
+        role_participant(pool, "supervisor").await?,
+        role_participant(pool, "admin").await?,
+    ))
+}
+
+async fn seed_feedback(
+    pool: &PgPool,
+    shifts: &[CapstoneShift],
+    metrics: &mut EnrichmentMetrics,
+) -> Result<()> {
+    let (guard_ids, supervisor_id, admin_id) = read_feedback_participants(pool).await?;
+    let comments = [
+        (4, "Mas sayon ang replacement kay makita dayon kung kinsa ang available kung naay kalit nga concern."),
+        (4, "Okay ra ang check-in sa app. Mas dali kaysa magsulat pa sa logbook."),
+        (3, "Usahay hinay mu-load kung weak ang signal sa gate, pero ma-record ra gihapon ang attendance."),
+        (4, "Nakatabang ang schedule kay makita daan asa ko nga site ug unsa akong duty."),
+        (4, "Okay ang DTR kay dali ra nako ma-check ang oras sa check-in ug check-out."),
+        (3, "Mas maayo unta kung mas klaro ang notification kung nausab ang schedule."),
+        (5, "Nindot kay dili na kinahanglan sige pangutana unsa akong duty ugma."),
+        (4, "Maayo ang site details, pero helpful unta kung makita dayon ang contact person sa schedule."),
+        (3, "Okay ra ang app pero medyo gamay ang text sa uban nga part sa mobile."),
+        (4, "Kung night shift, helpful kaayo nga naa ang schedule ug DTR sa usa ka place."),
+        (4, "Dali ra ko makakita sa akong duty history. Mas sayon na mag follow-up kung naay concern."),
+        (5, "Mas klaro ang handover kay makita ang latest schedule update sa app."),
+        (4, "Nakatabang ang notification kung naay request nga gi-review, pero kinahanglan ko usahay mag-open sa app para makita."),
+        (3, "Kung hinay ang data, dugay gamay ang refresh sa schedule pero okay ra kung naa na ang signal."),
+        (4, "Mas sayon nako ma-check kung complete ang DTR human sa duty."),
+        (5, "Practical ang app para sa duty kay usa ra ka lugar ang schedule, check-in, ug update."),
+        (4, "Okay ang replacement update kay kabalo dayon ko kung naay change sa assignment."),
+        (4, "Mas maayo ang pagtan-aw sa duty kaysa sa old nga message-message lang."),
+        (3, "Usahay wala ko kabantay sa alert. Basin pwede mas klaro kung important ang notification."),
+        (4, "Okay ra ang paggamit sa mobile. Ang pinaka importante kay makita dayon ang schedule ug site."),
+    ];
+    for (index, guard_id) in guard_ids.iter().enumerate() {
+        let feedback_at = manila_time(8 + (index % 9) as u32, 17, (index * 3 % 50) as u32)?;
+        let has_prior_usage = shifts
+            .iter()
+            .any(|shift| shift.guard_id == *guard_id && shift.end < feedback_at);
+        if !has_prior_usage {
+            bail!("Feedback scenario guard has no completed capstone attendance before its feedback timestamp")
+        }
+        let feedback_id = new_id();
+        sqlx::query("INSERT INTO feedback (id, user_id, rating, comments, created_at) VALUES ($1, $2, $3, $4, $5)")
+            .bind(&feedback_id)
+            .bind(guard_id)
+            .bind(comments[index].0)
+            .bind(comments[index].1)
+            .bind(feedback_at)
+            .execute(pool)
+            .await?;
+        track_enrichment(pool, "feedback", &feedback_id).await?;
+        *metrics.feedback.entry(comments[index].0).or_default() += 1;
+        metrics.bisaya_guard_feedback += 1;
+    }
+    for (user_id, rating, comment, created_at) in [
+        (&supervisor_id, 4, "Mas dali na ang pagtan-aw sa schedule concerns ug operational requests. Helpful nga naa ang status ug history sa usa ka lugar.", manila_time(15, 16, 15)?),
+        (&admin_id, 4, "Useful ang consolidated view sa DTR, requests, ug incident follow-up. Continue lang sa pagpa-klaro sa mobile notifications.", manila_time(16, 15, 40)?),
+    ] {
+        let feedback_id = new_id();
+        sqlx::query("INSERT INTO feedback (id, user_id, rating, comments, created_at) VALUES ($1, $2, $3, $4, $5)")
+            .bind(&feedback_id)
+            .bind(user_id)
+            .bind(rating)
+            .bind(comment)
+            .bind(created_at)
+            .execute(pool)
+            .await?;
+        track_enrichment(pool, "feedback", &feedback_id).await?;
+        *metrics.feedback.entry(rating).or_default() += 1;
+    }
+    Ok(())
+}
+
 async fn seed_presentation_audit(
     pool: &PgPool,
     metrics: &SeedMetrics,
@@ -863,6 +1685,219 @@ async fn seed_presentation_audit(
         .execute(pool)
         .await?;
     track(pool, "audit_logs", &audit_id).await?;
+    Ok(())
+}
+
+async fn seed_enrichment_audit(pool: &PgPool, metrics: &EnrichmentMetrics) -> Result<()> {
+    let audit_id = new_id();
+    sqlx::query(
+        "INSERT INTO audit_logs (id, actor_user_id, action_key, entity_type, entity_id, result, reason, source_ip, user_agent, metadata, created_at) VALUES ($1, NULL, 'CAPSTONE_PRESENTATION_ENRICHED', 'capstone_seed_batch', $2, 'success', $3, NULL, 'CAPSTONE DATASET ENRICHER', $4, $5)",
+    )
+    .bind(&audit_id)
+    .bind(ENRICHMENT_BATCH_ID)
+    .bind("Presentation workflow scenarios added from the existing validated capstone schedule. No real-user audit activity was created.")
+    .bind(json!({
+        "data_origin": ENRICHMENT_DATA_ORIGIN,
+        "batch_id": ENRICHMENT_BATCH_ID,
+        "parent_batch_id": BATCH_ID,
+        "presentation_context": true,
+        "actor_label": "CAPSTONE DATASET ENRICHER",
+        "incidents": metrics.incidents,
+        "operational_requests": metrics.operational_requests,
+        "notifications": metrics.notifications,
+        "feedback": metrics.feedback.values().sum::<usize>(),
+    }))
+    .bind(Utc::now())
+    .execute(pool)
+    .await?;
+    track_enrichment(pool, "audit_logs", &audit_id).await?;
+    Ok(())
+}
+
+async fn validate_schedule_integrity(pool: &PgPool) -> Result<()> {
+    let schedule_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM capstone_seed_records WHERE batch_id = $1 AND table_name = 'shifts'",
+    )
+    .bind(BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    if schedule_count != 564 {
+        bail!("Expected 564 tracked capstone shifts, found {schedule_count}")
+    }
+
+    let overlap_violations: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)::BIGINT
+        FROM shifts first_shift
+        JOIN capstone_seed_records first_record
+          ON first_record.batch_id = $1 AND first_record.table_name = 'shifts' AND first_record.record_id = first_shift.id
+        JOIN shifts second_shift
+          ON second_shift.guard_id = first_shift.guard_id
+         AND second_shift.id > first_shift.id
+         AND second_shift.start_time < first_shift.end_time
+         AND second_shift.end_time > first_shift.start_time
+        JOIN capstone_seed_records second_record
+          ON second_record.batch_id = $1 AND second_record.table_name = 'shifts' AND second_record.record_id = second_shift.id
+        "#,
+    )
+    .bind(BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    if overlap_violations != 0 {
+        bail!("Found {overlap_violations} capstone guard-overlap violations")
+    }
+
+    let rest_violations: i64 = sqlx::query_scalar(
+        r#"
+        WITH ordered AS (
+            SELECT s.guard_id, s.start_time,
+                   LAG(s.end_time) OVER (PARTITION BY s.guard_id ORDER BY s.start_time, s.id) AS previous_end
+            FROM shifts s
+            JOIN capstone_seed_records csr
+              ON csr.batch_id = $1 AND csr.table_name = 'shifts' AND csr.record_id = s.id
+        )
+        SELECT COUNT(*)::BIGINT
+        FROM ordered
+        WHERE previous_end IS NOT NULL
+          AND start_time - previous_end < INTERVAL '8 hours'
+        "#,
+    )
+    .bind(BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    if rest_violations != 0 {
+        bail!("Found {rest_violations} capstone insufficient-rest violations")
+    }
+    Ok(())
+}
+
+async fn validate_enrichment_timing(pool: &PgPool) -> Result<()> {
+    let readiness_after_start: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM guard_shift_readiness r JOIN shifts s ON s.id = r.shift_id JOIN capstone_seed_records csr ON csr.batch_id = $1 AND csr.table_name = 'guard_shift_readiness' AND csr.record_id = r.id WHERE r.created_at >= s.start_time",
+    )
+    .bind(ENRICHMENT_BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    let classifications_before_incident: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM incident_severity_classifications c JOIN incidents i ON i.id = c.incident_id JOIN capstone_seed_records csr ON csr.batch_id = $1 AND csr.table_name = 'incident_severity_classifications' AND csr.record_id = c.id WHERE c.classified_at <= i.created_at",
+    )
+    .bind(ENRICHMENT_BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    let invalid_tracking_points: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM tracking_points t JOIN capstone_seed_records csr ON csr.batch_id = $1 AND csr.table_name = 'tracking_points' AND csr.record_id = t.id WHERE NOT EXISTS (SELECT 1 FROM shifts s JOIN capstone_seed_records ssr ON ssr.batch_id = $2 AND ssr.table_name = 'shifts' AND ssr.record_id = s.id JOIN attendance a ON a.shift_id = s.id AND a.status = 'completed' WHERE s.guard_id = t.entity_id AND t.recorded_at > s.start_time AND t.recorded_at < s.end_time)",
+    )
+    .bind(ENRICHMENT_BATCH_ID)
+    .bind(BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    if readiness_after_start != 0
+        || classifications_before_incident != 0
+        || invalid_tracking_points != 0
+    {
+        bail!("Enrichment timing validation failed: readiness_after_start={readiness_after_start}, classifications_before_incident={classifications_before_incident}, invalid_tracking_points={invalid_tracking_points}")
+    }
+    Ok(())
+}
+
+fn print_enrichment_metrics(metrics: &EnrichmentMetrics) {
+    println!(
+        "ENRICHMENT REPORT: incidents={}, classifications={}, requests={}, request_events={}, notifications={}, readiness_day={}, readiness_evening={}, readiness_night={}, predictions={}, support_open={}, support_in_progress={}, support_resolved={}, evaluations={}, tracking_points={}, feedback_total={}, bisaya_guard_feedback={}, feedback_3={}, feedback_4={}, feedback_5={}",
+        metrics.incidents,
+        metrics.incident_classifications,
+        metrics.operational_requests,
+        metrics.operational_request_events,
+        metrics.notifications,
+        metrics.readiness.get("day").copied().unwrap_or_default(),
+        metrics.readiness.get("evening").copied().unwrap_or_default(),
+        metrics.readiness.get("night").copied().unwrap_or_default(),
+        metrics.absence_predictions,
+        metrics.support_tickets.get("open").copied().unwrap_or_default(),
+        metrics.support_tickets.get("in_progress").copied().unwrap_or_default(),
+        metrics.support_tickets.get("resolved").copied().unwrap_or_default(),
+        metrics.client_evaluations,
+        metrics.tracking_points,
+        metrics.feedback.values().sum::<usize>(),
+        metrics.bisaya_guard_feedback,
+        metrics.feedback.get(&3).copied().unwrap_or_default(),
+        metrics.feedback.get(&4).copied().unwrap_or_default(),
+        metrics.feedback.get(&5).copied().unwrap_or_default(),
+    );
+}
+
+async fn enrich_preflight(pool: &PgPool) -> Result<()> {
+    let batch_complete: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM capstone_seed_batches WHERE batch_id = $1 AND status = 'complete')",
+    )
+    .bind(ENRICHMENT_BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    if batch_complete {
+        println!(
+            "ENRICHMENT PREFLIGHT: batch already complete; existing ledger-tracked enrichment is idempotent."
+        );
+        return Ok(());
+    }
+    let shifts = ensure_enrichment_ready(pool).await?;
+    let (_, supervisor_id, admin_id) = read_feedback_participants(pool).await?;
+    println!("ENRICHMENT PREFLIGHT: source_completed_shifts={}, expected_incidents=7, expected_requests=9, expected_request_events=22, expected_notifications=23, expected_readiness=96, expected_predictions=4, expected_support_tickets=7, expected_evaluations=24, expected_tracking_points=18, expected_feedback=22, supervisor_feedback_user_present={}, admin_feedback_user_present={}", shifts.len(), !supervisor_id.is_empty(), !admin_id.is_empty());
+    Ok(())
+}
+
+async fn enrich(pool: &PgPool) -> Result<()> {
+    ensure_ledger(pool).await?;
+    let existing_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM capstone_seed_batches WHERE batch_id = $1")
+            .bind(ENRICHMENT_BATCH_ID)
+            .fetch_optional(pool)
+            .await?;
+    if existing_status.as_deref() == Some("complete") {
+        println!(
+            "Enrichment batch {} is already complete; no records were duplicated.",
+            ENRICHMENT_BATCH_ID
+        );
+        status(pool).await?;
+        return Ok(());
+    }
+    if existing_status.is_some() {
+        reset_tracked_batch(pool, ENRICHMENT_BATCH_ID).await?;
+    }
+
+    let shifts = ensure_enrichment_ready(pool).await?;
+    enrich_preflight(pool).await?;
+    let reference_at =
+        DateTime::parse_from_rfc3339(&require_env("CAPSTONE_REFERENCE_DATE")?)?.with_timezone(&Utc);
+    sqlx::query("INSERT INTO capstone_seed_batches (batch_id, data_origin, reference_at, status, metadata) VALUES ($1, $2, $3, 'running', $4)")
+        .bind(ENRICHMENT_BATCH_ID)
+        .bind(ENRICHMENT_DATA_ORIGIN)
+        .bind(reference_at)
+        .bind(json!({
+            "parentBatchId": BATCH_ID,
+            "presentationContext": true,
+            "source": "existing validated capstone shifts, attendance, replacements, and roster",
+            "historyThrough": "2026-10-16",
+            "auditActor": "CAPSTONE DATASET ENRICHER",
+        }))
+        .execute(pool)
+        .await?;
+
+    let mut metrics = EnrichmentMetrics::default();
+    let incidents = seed_incident_scenarios(pool, &shifts, &mut metrics).await?;
+    let requests = seed_operational_request_scenarios(pool, &shifts, &mut metrics).await?;
+    seed_readiness(pool, &shifts, &mut metrics).await?;
+    let tickets = seed_support_tickets(pool, &shifts, &mut metrics).await?;
+    seed_workflow_notifications(pool, &requests, &incidents, &tickets, &mut metrics).await?;
+    seed_absence_predictions(pool, &mut metrics).await?;
+    seed_client_evaluations(pool, &shifts, &mut metrics).await?;
+    seed_tracking_points(pool, &shifts, &mut metrics).await?;
+    seed_feedback(pool, &shifts, &mut metrics).await?;
+    seed_enrichment_audit(pool, &metrics).await?;
+    validate_enrichment_timing(pool).await?;
+    sqlx::query("UPDATE capstone_seed_batches SET status = 'complete', completed_at = CURRENT_TIMESTAMP WHERE batch_id = $1")
+        .bind(ENRICHMENT_BATCH_ID)
+        .execute(pool)
+        .await?;
+    print_enrichment_metrics(&metrics);
     Ok(())
 }
 
@@ -1105,6 +2140,7 @@ async fn preflight(pool: &PgPool) -> Result<()> {
 }
 
 async fn validate(pool: &PgPool) -> Result<()> {
+    validate_schedule_integrity(pool).await?;
     let future_attendance: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::BIGINT FROM attendance WHERE shift_id IN (SELECT record_id FROM capstone_seed_records WHERE batch_id = $1 AND table_name = 'shifts') AND check_in_time >= $2",
     )
@@ -1127,30 +2163,49 @@ async fn validate(pool: &PgPool) -> Result<()> {
     .fetch_one(pool)
     .await?;
     println!(
-        "VALIDATION: future_attendance=0, october_17_scheduled={}",
+        "VALIDATION: future_attendance=0, october_17_scheduled={}, overlap_violations=0, insufficient_rest_violations=0",
         scheduled_october_17
     );
+    let enrichment_complete: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM capstone_seed_batches WHERE batch_id = $1 AND status = 'complete')",
+    )
+    .bind(ENRICHMENT_BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    if enrichment_complete {
+        validate_enrichment_timing(pool).await?;
+        println!("ENRICHMENT VALIDATION: causal timestamps and completed-shift tracking points are valid.");
+    }
     Ok(())
 }
 
-async fn status(pool: &PgPool) -> Result<()> {
-    ensure_ledger(pool).await?;
+async fn print_batch_status(pool: &PgPool, batch_id: &str) -> Result<bool> {
     let rows = sqlx::query(
         "SELECT table_name, COUNT(*)::BIGINT AS count FROM capstone_seed_records WHERE batch_id = $1 GROUP BY table_name ORDER BY table_name",
     )
-    .bind(BATCH_ID)
+    .bind(batch_id)
     .fetch_all(pool)
     .await?;
     if rows.is_empty() {
-        println!("No {} dataset is present.", BATCH_ID);
-        return Ok(());
+        return Ok(false);
     }
+    println!("BATCH={batch_id}");
     for row in rows {
         println!(
             "{}={}",
             row.try_get::<String, _>("table_name")?,
             row.try_get::<i64, _>("count")?
         );
+    }
+    Ok(true)
+}
+
+async fn status(pool: &PgPool) -> Result<()> {
+    ensure_ledger(pool).await?;
+    let base_present = print_batch_status(pool, BATCH_ID).await?;
+    let enrichment_present = print_batch_status(pool, ENRICHMENT_BATCH_ID).await?;
+    if !base_present && !enrichment_present {
+        println!("No {} dataset is present.", BATCH_ID);
     }
     Ok(())
 }
@@ -1179,6 +2234,13 @@ async fn main() {
             }
             "status" => status(&target_pool).await?,
             "preflight" => preflight(&target_pool).await?,
+            "enrich-preflight" => enrich_preflight(&target_pool).await?,
+            "enrich" => {
+                enrich(&target_pool).await?;
+                verify_protected_superadmin(&target_pool).await?;
+                status(&target_pool).await?;
+                validate(&target_pool).await?;
+            }
             "validate" => validate(&target_pool).await?,
             _ => unreachable!(),
         }
