@@ -142,6 +142,11 @@ pub struct AuditLogEntry {
     pub source_ip: Option<String>,
     pub user_agent: Option<String>,
     pub metadata: Option<Value>,
+    pub source: String,
+    pub actor_attribution_mode: String,
+    pub capstone_batch_id: Option<String>,
+    pub seeded_at: Option<DateTime<Utc>>,
+    pub scenario_occurred_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 

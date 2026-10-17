@@ -2312,6 +2312,11 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             source_ip VARCHAR(64),
             user_agent TEXT,
             metadata JSONB,
+            source VARCHAR(32) NOT NULL DEFAULT 'runtime',
+            actor_attribution_mode VARCHAR(32) NOT NULL DEFAULT 'real',
+            capstone_batch_id VARCHAR(80),
+            seeded_at TIMESTAMP WITH TIME ZONE,
+            scenario_occurred_at TIMESTAMP WITH TIME ZONE,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (actor_user_id) REFERENCES users(id) ON DELETE SET NULL
         )
@@ -2335,12 +2340,26 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
             AppError::DatabaseError(format!("Failed to add audit user_agent column: {}", e))
         })?;
 
+    for statement in [
+        "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS source VARCHAR(32) NOT NULL DEFAULT 'runtime'",
+        "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS actor_attribution_mode VARCHAR(32) NOT NULL DEFAULT 'real'",
+        "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS capstone_batch_id VARCHAR(80)",
+        "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS seeded_at TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS scenario_occurred_at TIMESTAMP WITH TIME ZONE",
+    ] {
+        sqlx::query(statement)
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::DatabaseError(format!("Failed to extend audit provenance fields: {}", e)))?;
+    }
+
     for index in &[
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_created ON audit_logs(actor_user_id, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_source_ip_created ON audit_logs(source_ip, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_result_created ON audit_logs(result, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_logs_capstone_batch ON audit_logs(capstone_batch_id, created_at DESC) WHERE capstone_batch_id IS NOT NULL",
     ] {
         sqlx::query(index)
             .execute(pool)

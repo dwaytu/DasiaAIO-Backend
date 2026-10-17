@@ -6,15 +6,17 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, TimeZone, Timelike, Utc};
 use serde_json::json;
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 const BATCH_ID: &str = "capstone-live-october-2026";
 const ENRICHMENT_BATCH_ID: &str = "capstone-live-october-2026-enrichment-v1";
+const AUDIT_ACTIVITY_BATCH_ID: &str = "capstone-live-october-2026-audit-activity-v1";
 const REQUIRED_CONFIRMATION: &str = "LIVE_CAPSTONE_DATASET_CONFIRMED";
 const MANILA_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const DATA_ORIGIN: &str = "capstone_presentation_seed";
 const ENRICHMENT_DATA_ORIGIN: &str = "capstone_presentation_enrichment";
+const AUDIT_ACTIVITY_DATA_ORIGIN: &str = "capstone_presentation_synthetic_audit_activity";
 const PRIMARY_ROSTER_SIZE: usize = 5;
 const MAX_PARTICIPATING_GUARDS: usize = 55;
 const MIN_REST_HOURS: i64 = 8;
@@ -134,6 +136,49 @@ struct WorkflowContext {
     occurred_at: DateTime<Utc>,
 }
 
+#[derive(Clone)]
+struct SyntheticAuditActor {
+    id: String,
+    full_name: String,
+    role: String,
+    guard_code: Option<String>,
+}
+
+#[derive(Clone)]
+struct AuditShiftContext {
+    shift_id: String,
+    guard_id: String,
+    attendance_id: String,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct AuditReference {
+    id: String,
+    actor_id: String,
+    occurred_at: DateTime<Utc>,
+    label: String,
+}
+
+struct SyntheticAuditEvent {
+    actor_id: String,
+    action_key: &'static str,
+    entity_type: &'static str,
+    entity_id: String,
+    occurred_at: DateTime<Utc>,
+    detail: String,
+    related_label: String,
+}
+
+#[derive(Default)]
+struct AuditActivityMetrics {
+    guard_login_logout: usize,
+    guard_operational: usize,
+    supervisor_actions: usize,
+    admin_actions: usize,
+}
+
 #[derive(Default)]
 struct SeedMetrics {
     day_shifts: usize,
@@ -163,8 +208,12 @@ fn verify_live_target(command: &str) -> Result<String> {
     if env::var("CAPSTONE_DATASET_MODE").as_deref() != Ok("true") {
         bail!("CAPSTONE_DATASET_MODE=true is required")
     }
-    if require_env("CAPSTONE_TARGET_ENVIRONMENT")?.to_ascii_lowercase() != "production" {
-        bail!("CAPSTONE_TARGET_ENVIRONMENT must be production")
+    let target_environment = require_env("CAPSTONE_TARGET_ENVIRONMENT")?.to_ascii_lowercase();
+    if !matches!(
+        target_environment.as_str(),
+        "production" | "capstone_presentation"
+    ) {
+        bail!("CAPSTONE_TARGET_ENVIRONMENT must be production or capstone_presentation")
     }
     if require_env("CAPSTONE_SEED_CONFIRM")? != REQUIRED_CONFIRMATION {
         bail!("CAPSTONE_SEED_CONFIRM must equal {}", REQUIRED_CONFIRMATION)
@@ -178,15 +227,34 @@ fn verify_live_target(command: &str) -> Result<String> {
 
     if !matches!(
         command,
-        "seed" | "reset" | "status" | "preflight" | "validate" | "enrich" | "enrich-preflight"
+        "seed"
+            | "reset"
+            | "status"
+            | "preflight"
+            | "validate"
+            | "enrich"
+            | "enrich-preflight"
+            | "audit-preflight"
+            | "seed-audit-activity"
     ) {
-        bail!("Usage: cargo run --bin capstone-dataset -- <seed|reset|status|preflight|validate|enrich|enrich-preflight>")
+        bail!("Usage: cargo run --bin capstone-dataset -- <seed|reset|status|preflight|validate|enrich|enrich-preflight|audit-preflight|seed-audit-activity>")
+    }
+    if matches!(command, "audit-preflight" | "seed-audit-activity") {
+        if target_environment != "capstone_presentation" {
+            bail!("Synthetic audit activity requires CAPSTONE_TARGET_ENVIRONMENT=capstone_presentation")
+        }
+        if env::var("CAPSTONE_PRESENTATION_ENVIRONMENT").as_deref() != Ok("true") {
+            bail!("Synthetic audit activity requires CAPSTONE_PRESENTATION_ENVIRONMENT=true")
+        }
+        if env::var("CAPSTONE_ALLOW_SYNTHETIC_AUDIT_HISTORY").as_deref() != Ok("true") {
+            bail!("Synthetic audit activity requires CAPSTONE_ALLOW_SYNTHETIC_AUDIT_HISTORY=true")
+        }
     }
     Ok(target_url)
 }
 
 fn verify_backup_confirmation(command: &str) -> Result<()> {
-    if !matches!(command, "seed" | "reset" | "enrich") {
+    if !matches!(command, "seed" | "reset" | "enrich" | "seed-audit-activity") {
         return Ok(());
     }
 
@@ -227,6 +295,19 @@ async fn ensure_ledger(pool: &PgPool) -> Result<()> {
             table_name VARCHAR(100) NOT NULL,
             record_id VARCHAR(100) NOT NULL,
             PRIMARY KEY (batch_id, table_name, record_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS capstone_seed_actors (
+            batch_id VARCHAR(80) NOT NULL REFERENCES capstone_seed_batches(batch_id) ON DELETE CASCADE,
+            user_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+            role VARCHAR(32) NOT NULL,
+            registered_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (batch_id, user_id)
         )
         "#,
     )
@@ -304,6 +385,7 @@ async fn reset_tracked_batch(pool: &PgPool, batch_id: &str) -> Result<()> {
 }
 
 async fn reset_batch(pool: &PgPool) -> Result<()> {
+    reset_tracked_batch(pool, AUDIT_ACTIVITY_BATCH_ID).await?;
     reset_tracked_batch(pool, ENRICHMENT_BATCH_ID).await?;
     reset_tracked_batch(pool, BATCH_ID).await
 }
@@ -982,6 +1064,968 @@ async fn ensure_enrichment_ready(pool: &PgPool) -> Result<Vec<CapstoneShift>> {
         )
     }
     Ok(shifts)
+}
+
+async fn read_synthetic_audit_actors(
+    pool: &PgPool,
+) -> Result<(
+    Vec<SyntheticAuditActor>,
+    SyntheticAuditActor,
+    SyntheticAuditActor,
+)> {
+    let guard_rows = sqlx::query(
+        r#"
+        SELECT DISTINCT u.id, u.full_name, u.role, u.guard_code
+        FROM users u
+        JOIN shifts s ON s.guard_id = u.id
+        JOIN capstone_seed_records csr
+          ON csr.batch_id = $1 AND csr.table_name = 'shifts' AND csr.record_id = s.id
+        WHERE LOWER(BTRIM(u.role)) = 'guard'
+          AND s.status = 'completed'
+        ORDER BY u.id
+        "#,
+    )
+    .bind(BATCH_ID)
+    .fetch_all(pool)
+    .await?;
+    let guards = guard_rows
+        .into_iter()
+        .map(|row| {
+            Ok(SyntheticAuditActor {
+                id: row.try_get("id")?,
+                full_name: row.try_get("full_name")?,
+                role: row.try_get::<String, _>("role")?.to_ascii_lowercase(),
+                guard_code: row.try_get("guard_code")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    if guards.len() != MAX_PARTICIPATING_GUARDS {
+        bail!(
+            "Synthetic audit activity requires exactly {} capstone guards, found {}",
+            MAX_PARTICIPATING_GUARDS,
+            guards.len()
+        )
+    }
+
+    async fn role_actor(pool: &PgPool, role: &str) -> Result<SyntheticAuditActor> {
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT u.id, u.full_name, u.role, u.guard_code
+            FROM users u
+            JOIN feedback f ON f.user_id = u.id
+            JOIN capstone_seed_records csr
+              ON csr.batch_id = $1 AND csr.table_name = 'feedback' AND csr.record_id = f.id
+            WHERE LOWER(BTRIM(u.role)) = $2
+            ORDER BY u.id
+            "#,
+        )
+        .bind(ENRICHMENT_BATCH_ID)
+        .bind(role)
+        .fetch_all(pool)
+        .await?;
+        if rows.len() != 1 {
+            bail!(
+                "Synthetic audit activity requires exactly one ledger-tracked {} account, found {}",
+                role,
+                rows.len()
+            )
+        }
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Synthetic audit actor query returned no {role} account"))?;
+        Ok(SyntheticAuditActor {
+            id: row.try_get("id")?,
+            full_name: row.try_get("full_name")?,
+            role: row.try_get::<String, _>("role")?.to_ascii_lowercase(),
+            guard_code: row.try_get("guard_code")?,
+        })
+    }
+
+    Ok((
+        guards,
+        role_actor(pool, "supervisor").await?,
+        role_actor(pool, "admin").await?,
+    ))
+}
+
+async fn read_audit_shift_contexts(pool: &PgPool) -> Result<Vec<AuditShiftContext>> {
+    let cutoff = manila_time(PLANNED_DAY, 0, 0)?;
+    let rows = sqlx::query(
+        r#"
+        SELECT s.id AS shift_id, s.guard_id, a.id AS attendance_id, s.start_time, s.end_time
+        FROM shifts s
+        JOIN attendance a ON a.shift_id = s.id AND a.status = 'completed'
+        JOIN capstone_seed_records csr
+          ON csr.batch_id = $1 AND csr.table_name = 'shifts' AND csr.record_id = s.id
+        WHERE s.status = 'completed' AND s.start_time < $2
+        ORDER BY s.guard_id, s.start_time, s.id
+        "#,
+    )
+    .bind(BATCH_ID)
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+    let contexts = rows
+        .into_iter()
+        .map(|row| {
+            Ok(AuditShiftContext {
+                shift_id: row.try_get("shift_id")?,
+                guard_id: row.try_get("guard_id")?,
+                attendance_id: row.try_get("attendance_id")?,
+                start: row.try_get("start_time")?,
+                end: row.try_get("end_time")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    if contexts.len() != 528 {
+        bail!(
+            "Synthetic audit activity requires 528 completed capstone shifts, found {}",
+            contexts.len()
+        )
+    }
+    Ok(contexts)
+}
+
+async fn read_audit_references(
+    pool: &PgPool,
+    batch_id: &str,
+    table_name: &str,
+    sql: &str,
+) -> Result<Vec<AuditReference>> {
+    let rows = sqlx::query(sql).bind(batch_id).fetch_all(pool).await?;
+    let references = rows
+        .into_iter()
+        .map(|row| {
+            Ok(AuditReference {
+                id: row.try_get("id")?,
+                actor_id: row.try_get("actor_id")?,
+                occurred_at: row.try_get("occurred_at")?,
+                label: row.try_get("label")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    if references.is_empty() {
+        bail!("Synthetic audit activity requires ledger-tracked {table_name}")
+    }
+    Ok(references)
+}
+
+fn synthetic_audit_actions() -> &'static [&'static str] {
+    &[
+        "AUTH_LOGIN_ATTEMPT",
+        "AUTH_LOGOUT",
+        "GUARD_DASHBOARD_VIEWED",
+        "SHIFT_SCHEDULE_VIEWED",
+        "DTR_RECORD_VIEWED",
+        "ATTENDANCE_HISTORY_VIEWED",
+        "NOTIFICATION_VIEWED",
+        "SHIFT_REPLACEMENT_STATUS_VIEWED",
+        "SHIFT_REPLACEMENT_ACKNOWLEDGED",
+        "OPERATIONAL_REQUEST_SUBMITTED",
+        "OPERATIONAL_REQUEST_VIEWED",
+        "INCIDENT_REPORT_OPENED",
+        "INCIDENT_REPORT_ACKNOWLEDGED",
+        "FEEDBACK_PAGE_VIEWED",
+        "FEEDBACK_SUBMITTED",
+        "SUPERVISOR_ATTENDANCE_EXCEPTION_REVIEWED",
+        "SUPERVISOR_OPERATIONAL_REQUEST_REVIEWED",
+        "SUPERVISOR_INCIDENT_REVIEWED",
+        "SUPERVISOR_RELIEF_COVERAGE_APPROVED",
+        "ADMIN_ANALYTICS_VIEWED",
+        "ADMIN_DTR_SUMMARY_REVIEWED",
+        "ADMIN_FEEDBACK_SUMMARY_REVIEWED",
+        "ADMIN_SUPPORT_TICKET_REVIEWED",
+        "ADMIN_REPORT_VIEWED",
+    ]
+}
+
+async fn register_synthetic_audit_actor(
+    transaction: &mut Transaction<'_, Postgres>,
+    actor: &SyntheticAuditActor,
+    protected_superadmin_id: &str,
+) -> Result<()> {
+    if actor.id == protected_superadmin_id || actor.role == "superadmin" {
+        bail!("Protected Superadmin accounts cannot be registered for synthetic audit activity")
+    }
+    let active_matching_actor: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND LOWER(BTRIM(role)) = $2 AND COALESCE(LOWER(BTRIM(status)), 'active') = 'active')",
+    )
+    .bind(&actor.id)
+    .bind(&actor.role)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if !active_matching_actor {
+        bail!("Synthetic audit actor is no longer active with its expected role")
+    }
+    sqlx::query(
+        "INSERT INTO capstone_seed_actors (batch_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(AUDIT_ACTIVITY_BATCH_ID)
+    .bind(&actor.id)
+    .bind(&actor.role)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn insert_synthetic_audit_event(
+    transaction: &mut Transaction<'_, Postgres>,
+    actor: &SyntheticAuditActor,
+    event: &SyntheticAuditEvent,
+    protected_superadmin_id: &str,
+    seeded_at: DateTime<Utc>,
+) -> Result<()> {
+    if actor.id != event.actor_id || !synthetic_audit_actions().contains(&event.action_key) {
+        bail!("Synthetic audit event failed actor or action allow-list validation")
+    }
+    if event.occurred_at >= manila_time(PLANNED_DAY, 0, 0)? {
+        bail!("Synthetic audit activity cannot occur on or after October 17")
+    }
+    let actor_allowed: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM capstone_seed_actors csa
+            JOIN users u ON u.id = csa.user_id
+            WHERE csa.batch_id = $1
+              AND csa.user_id = $2
+              AND LOWER(BTRIM(csa.role)) = $3
+              AND LOWER(BTRIM(u.role)) = $3
+              AND csa.user_id <> $4
+              AND LOWER(BTRIM(u.role)) <> 'superadmin'
+        )
+        "#,
+    )
+    .bind(AUDIT_ACTIVITY_BATCH_ID)
+    .bind(&actor.id)
+    .bind(&actor.role)
+    .bind(protected_superadmin_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if !actor_allowed {
+        bail!("Synthetic audit event actor is not a registered capstone presentation account")
+    }
+
+    let audit_id = new_id();
+    sqlx::query(
+        "INSERT INTO audit_logs (id, actor_user_id, action_key, entity_type, entity_id, result, reason, source_ip, user_agent, metadata, source, actor_attribution_mode, capstone_batch_id, seeded_at, scenario_occurred_at, created_at) VALUES ($1, $2, $3, $4, $5, 'success', $6, NULL, 'SENTINEL CAPSTONE PRESENTATION RUNNER', $7, 'capstone_seed', 'synthetic_seeded', $8, $9, $10, $10)",
+    )
+    .bind(&audit_id)
+    .bind(&actor.id)
+    .bind(event.action_key)
+    .bind(event.entity_type)
+    .bind(&event.entity_id)
+    .bind(&event.detail)
+    .bind(json!({
+        "data_origin": AUDIT_ACTIVITY_DATA_ORIGIN,
+        "batch_id": AUDIT_ACTIVITY_BATCH_ID,
+        "parent_batch_id": BATCH_ID,
+        "presentation_context": true,
+        "source": "capstone_seed",
+        "actor_attribution_mode": "synthetic_seeded",
+        "actor_role": actor.role,
+        "actor_name": actor.full_name,
+        "guard_code": actor.guard_code,
+        "related_record_label": event.related_label,
+        "scenario_occurred_at": event.occurred_at,
+    }))
+    .bind(AUDIT_ACTIVITY_BATCH_ID)
+    .bind(seeded_at)
+    .bind(event.occurred_at)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO capstone_seed_records (batch_id, table_name, record_id) VALUES ($1, 'audit_logs', $2)",
+    )
+    .bind(AUDIT_ACTIVITY_BATCH_ID)
+    .bind(&audit_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn build_synthetic_audit_events(
+    pool: &PgPool,
+    guards: &[SyntheticAuditActor],
+    supervisor: &SyntheticAuditActor,
+    admin: &SyntheticAuditActor,
+    shifts: &[AuditShiftContext],
+) -> Result<(Vec<SyntheticAuditEvent>, AuditActivityMetrics)> {
+    let cutoff = manila_time(PLANNED_DAY, 0, 0)?;
+    let closed_shifts = shifts
+        .iter()
+        .filter(|shift| shift.end < cutoff)
+        .collect::<Vec<_>>();
+    if closed_shifts.len() < 500 {
+        bail!("Synthetic audit activity requires at least 500 completed shifts ending before October 17")
+    }
+    let guard_by_id = guards
+        .iter()
+        .map(|guard| (guard.id.as_str(), guard))
+        .collect::<HashMap<_, _>>();
+    let mut shifts_by_guard = HashMap::<&str, Vec<&AuditShiftContext>>::new();
+    for shift in &closed_shifts {
+        shifts_by_guard
+            .entry(shift.guard_id.as_str())
+            .or_default()
+            .push(*shift);
+    }
+
+    let mut events = Vec::new();
+    let mut metrics = AuditActivityMetrics::default();
+    for (index, guard) in guards.iter().enumerate() {
+        let guard_shifts = shifts_by_guard
+            .get(guard.id.as_str())
+            .ok_or_else(|| anyhow!("Capstone guard has no completed shift for audit activity"))?;
+        let session_count = if index < 10 { 2 } else { 1 };
+        for session_index in 0..session_count {
+            let shift = guard_shifts[(index * 3 + session_index * 5) % guard_shifts.len()];
+            let login_at =
+                shift.start - Duration::minutes(6 + ((index + session_index) % 9) as i64);
+            let logout_at =
+                shift.end + Duration::minutes(3 + ((index * 2 + session_index) % 12) as i64);
+            events.push(SyntheticAuditEvent {
+                actor_id: guard.id.clone(),
+                action_key: "AUTH_LOGIN_ATTEMPT",
+                entity_type: "auth",
+                entity_id: shift.shift_id.clone(),
+                occurred_at: login_at,
+                detail: format!(
+                    "Signed in before the assigned shift at the scheduled client site."
+                ),
+                related_label: "Assigned capstone shift".to_string(),
+            });
+            events.push(SyntheticAuditEvent {
+                actor_id: guard.id.clone(),
+                action_key: "AUTH_LOGOUT",
+                entity_type: "auth",
+                entity_id: shift.shift_id.clone(),
+                occurred_at: logout_at,
+                detail: "Signed out after completing the related scheduled duty activity."
+                    .to_string(),
+                related_label: "Assigned capstone shift".to_string(),
+            });
+            metrics.guard_login_logout += 2;
+        }
+    }
+
+    let shift_event_specs = [
+        (
+            "GUARD_DASHBOARD_VIEWED",
+            "Opened the guard dashboard before the assigned duty.",
+        ),
+        (
+            "SHIFT_SCHEDULE_VIEWED",
+            "Viewed the assigned shift schedule and site details.",
+        ),
+        (
+            "DTR_RECORD_VIEWED",
+            "Opened the DTR record for the completed duty.",
+        ),
+        (
+            "ATTENDANCE_HISTORY_VIEWED",
+            "Checked the completed attendance history for the duty.",
+        ),
+    ];
+    for (offset, (action_key, detail)) in shift_event_specs.into_iter().enumerate() {
+        for sequence in 0..3 {
+            let shift = closed_shifts[(offset * 67 + sequence * 83 + 11) % closed_shifts.len()];
+            let actor = guard_by_id
+                .get(shift.guard_id.as_str())
+                .ok_or_else(|| anyhow!("Audit shift actor is not a registered capstone guard"))?;
+            events.push(SyntheticAuditEvent {
+                actor_id: actor.id.clone(),
+                action_key,
+                entity_type: if matches!(
+                    action_key,
+                    "DTR_RECORD_VIEWED" | "ATTENDANCE_HISTORY_VIEWED"
+                ) {
+                    "attendance"
+                } else {
+                    "shift"
+                },
+                entity_id: if matches!(
+                    action_key,
+                    "DTR_RECORD_VIEWED" | "ATTENDANCE_HISTORY_VIEWED"
+                ) {
+                    shift.attendance_id.clone()
+                } else {
+                    shift.shift_id.clone()
+                },
+                occurred_at: shift.start
+                    + Duration::minutes(14 + (offset * 9 + sequence * 5) as i64),
+                detail: detail.to_string(),
+                related_label: if matches!(
+                    action_key,
+                    "DTR_RECORD_VIEWED" | "ATTENDANCE_HISTORY_VIEWED"
+                ) {
+                    "Completed capstone attendance record".to_string()
+                } else {
+                    "Assigned capstone shift".to_string()
+                },
+            });
+            metrics.guard_operational += 1;
+        }
+    }
+
+    let notifications = read_audit_references(
+        pool,
+        ENRICHMENT_BATCH_ID,
+        "notifications",
+        "SELECT n.id, n.user_id AS actor_id, n.created_at AS occurred_at, n.title AS label FROM notifications n JOIN capstone_seed_records csr ON csr.batch_id = $1 AND csr.table_name = 'notifications' AND csr.record_id = n.id ORDER BY n.created_at, n.id",
+    )
+    .await?
+    .into_iter()
+    .filter(|reference| reference.occurred_at < cutoff - Duration::minutes(12))
+    .collect::<Vec<_>>();
+    let requests = read_audit_references(
+        pool,
+        ENRICHMENT_BATCH_ID,
+        "operational requests",
+        "SELECT r.id, r.requester_id AS actor_id, r.created_at AS occurred_at, r.subject AS label FROM operational_requests r JOIN capstone_seed_records csr ON csr.batch_id = $1 AND csr.table_name = 'operational_requests' AND csr.record_id = r.id ORDER BY r.created_at, r.id",
+    )
+    .await?
+    .into_iter()
+    .filter(|reference| reference.occurred_at < cutoff - Duration::minutes(43))
+    .collect::<Vec<_>>();
+    let replacements = read_audit_references(
+        pool,
+        BATCH_ID,
+        "replacement scenarios",
+        "SELECT r.id, r.recommended_guard_id AS actor_id, r.generated_at AS occurred_at, 'Relief coverage recommendation' AS label FROM smart_guard_replacements r JOIN capstone_seed_records csr ON csr.batch_id = $1 AND csr.table_name = 'smart_guard_replacements' AND csr.record_id = r.id WHERE r.recommended_guard_id IS NOT NULL ORDER BY r.generated_at, r.id",
+    )
+    .await?
+    .into_iter()
+    .filter(|reference| reference.occurred_at < cutoff - Duration::minutes(19))
+    .collect::<Vec<_>>();
+    let incidents = read_audit_references(
+        pool,
+        ENRICHMENT_BATCH_ID,
+        "incidents",
+        "SELECT i.id, i.reported_by AS actor_id, i.created_at AS occurred_at, i.title AS label FROM incidents i JOIN capstone_seed_records csr ON csr.batch_id = $1 AND csr.table_name = 'incidents' AND csr.record_id = i.id ORDER BY i.created_at, i.id",
+    )
+    .await?
+    .into_iter()
+    .filter(|reference| reference.occurred_at < cutoff - Duration::minutes(25))
+    .collect::<Vec<_>>();
+    let feedback = read_audit_references(
+        pool,
+        ENRICHMENT_BATCH_ID,
+        "feedback records",
+        "SELECT f.id, f.user_id AS actor_id, f.created_at AS occurred_at, 'Submitted feedback' AS label FROM feedback f JOIN users u ON u.id = f.user_id JOIN capstone_seed_records csr ON csr.batch_id = $1 AND csr.table_name = 'feedback' AND csr.record_id = f.id WHERE LOWER(BTRIM(u.role)) = 'guard' ORDER BY f.created_at, f.id",
+    )
+    .await?
+    .into_iter()
+    .filter(|reference| reference.occurred_at < cutoff - Duration::minutes(29))
+    .collect::<Vec<_>>();
+    let tickets = read_audit_references(
+        pool,
+        ENRICHMENT_BATCH_ID,
+        "support tickets",
+        "SELECT t.id, t.guard_id AS actor_id, t.updated_at AS occurred_at, t.subject AS label FROM support_tickets t JOIN capstone_seed_records csr ON csr.batch_id = $1 AND csr.table_name = 'support_tickets' AND csr.record_id = t.id ORDER BY t.updated_at, t.id",
+    )
+    .await?
+    .into_iter()
+    .filter(|reference| reference.occurred_at < cutoff - Duration::minutes(19))
+    .collect::<Vec<_>>();
+    let merit_scores = read_audit_references(
+        pool,
+        BATCH_ID,
+        "merit scores",
+        "SELECT m.id, m.guard_id AS actor_id, COALESCE(m.last_calculated_at, m.updated_at, m.created_at) AS occurred_at, 'Guard performance scorecard' AS label FROM guard_merit_scores m JOIN capstone_seed_records csr ON csr.batch_id = $1 AND csr.table_name = 'guard_merit_scores' AND csr.record_id = m.id ORDER BY COALESCE(m.last_calculated_at, m.updated_at, m.created_at), m.id",
+    )
+    .await?
+    .into_iter()
+    .filter(|reference| reference.occurred_at < cutoff - Duration::minutes(21))
+    .collect::<Vec<_>>();
+
+    if notifications.len() < 3
+        || requests.len() < 3
+        || replacements.len() < 3
+        || incidents.len() < 3
+        || feedback.len() < 4
+        || tickets.len() < 2
+        || merit_scores.len() < 2
+    {
+        bail!(
+            "Synthetic audit activity does not have enough historical capstone workflow references"
+        )
+    }
+
+    for (index, reference) in notifications.iter().take(3).enumerate() {
+        events.push(SyntheticAuditEvent {
+            actor_id: reference.actor_id.clone(),
+            action_key: "NOTIFICATION_VIEWED",
+            entity_type: "notification",
+            entity_id: reference.id.clone(),
+            occurred_at: reference.occurred_at + Duration::minutes(3 + index as i64 * 4),
+            detail: "Viewed an operational notification related to current duty activity."
+                .to_string(),
+            related_label: reference.label.clone(),
+        });
+        metrics.guard_operational += 1;
+    }
+    for (index, reference) in requests.iter().take(3).enumerate() {
+        events.push(SyntheticAuditEvent {
+            actor_id: reference.actor_id.clone(),
+            action_key: if index == 0 {
+                "OPERATIONAL_REQUEST_SUBMITTED"
+            } else {
+                "OPERATIONAL_REQUEST_VIEWED"
+            },
+            entity_type: "operational_request",
+            entity_id: reference.id.clone(),
+            occurred_at: reference.occurred_at + Duration::minutes(4 + index as i64 * 3),
+            detail: if index == 0 {
+                "Submitted the linked operational request for supervisor review.".to_string()
+            } else {
+                "Viewed the current status and history of the linked operational request."
+                    .to_string()
+            },
+            related_label: reference.label.clone(),
+        });
+        metrics.guard_operational += 1;
+    }
+    for (index, reference) in replacements.iter().take(3).enumerate() {
+        events.push(SyntheticAuditEvent {
+            actor_id: reference.actor_id.clone(),
+            action_key: if index == 2 {
+                "SHIFT_REPLACEMENT_ACKNOWLEDGED"
+            } else {
+                "SHIFT_REPLACEMENT_STATUS_VIEWED"
+            },
+            entity_type: "smart_guard_replacement",
+            entity_id: reference.id.clone(),
+            occurred_at: reference.occurred_at + Duration::minutes(6 + index as i64 * 5),
+            detail: if index == 2 {
+                "Acknowledged the linked relief coverage assignment.".to_string()
+            } else {
+                "Viewed the linked replacement and relief coverage status.".to_string()
+            },
+            related_label: reference.label.clone(),
+        });
+        metrics.guard_operational += 1;
+    }
+    for (index, reference) in incidents.iter().take(3).enumerate() {
+        events.push(SyntheticAuditEvent {
+            actor_id: reference.actor_id.clone(),
+            action_key: if index == 0 {
+                "INCIDENT_REPORT_OPENED"
+            } else {
+                "INCIDENT_REPORT_ACKNOWLEDGED"
+            },
+            entity_type: "incident",
+            entity_id: reference.id.clone(),
+            occurred_at: reference.occurred_at + Duration::minutes(8 + index as i64 * 4),
+            detail: if index == 0 {
+                "Opened the linked incident report during the assigned duty.".to_string()
+            } else {
+                "Acknowledged the linked incident report and its operational follow-up.".to_string()
+            },
+            related_label: reference.label.clone(),
+        });
+        metrics.guard_operational += 1;
+    }
+    for (index, reference) in feedback.iter().take(4).enumerate() {
+        events.push(SyntheticAuditEvent {
+            actor_id: reference.actor_id.clone(),
+            action_key: if index < 2 {
+                "FEEDBACK_PAGE_VIEWED"
+            } else {
+                "FEEDBACK_SUBMITTED"
+            },
+            entity_type: "feedback",
+            entity_id: reference.id.clone(),
+            occurred_at: reference.occurred_at - Duration::minutes(if index < 2 { 3 } else { 0 }),
+            detail: if index < 2 {
+                "Opened the feedback page after reviewing the completed duty experience."
+                    .to_string()
+            } else {
+                "Submitted the linked presentation feedback entry.".to_string()
+            },
+            related_label: reference.label.clone(),
+        });
+        metrics.guard_operational += 1;
+    }
+
+    for (index, shift) in closed_shifts.iter().take(2).enumerate() {
+        events.push(SyntheticAuditEvent {
+            actor_id: supervisor.id.clone(),
+            action_key: "SUPERVISOR_ATTENDANCE_EXCEPTION_REVIEWED",
+            entity_type: "attendance",
+            entity_id: shift.attendance_id.clone(),
+            occurred_at: shift.end + Duration::minutes(35 + index as i64 * 12),
+            detail: "Reviewed a completed attendance record requiring supervisor follow-up."
+                .to_string(),
+            related_label: "Completed capstone attendance record".to_string(),
+        });
+        metrics.supervisor_actions += 1;
+    }
+    for reference in requests.iter().take(2) {
+        events.push(SyntheticAuditEvent {
+            actor_id: supervisor.id.clone(),
+            action_key: "SUPERVISOR_OPERATIONAL_REQUEST_REVIEWED",
+            entity_type: "operational_request",
+            entity_id: reference.id.clone(),
+            occurred_at: reference.occurred_at + Duration::minutes(42),
+            detail: "Reviewed the linked operational request and its next operational step."
+                .to_string(),
+            related_label: reference.label.clone(),
+        });
+        metrics.supervisor_actions += 1;
+    }
+    for reference in incidents.iter().take(2) {
+        events.push(SyntheticAuditEvent {
+            actor_id: supervisor.id.clone(),
+            action_key: "SUPERVISOR_INCIDENT_REVIEWED",
+            entity_type: "incident",
+            entity_id: reference.id.clone(),
+            occurred_at: reference.occurred_at + Duration::minutes(24),
+            detail: "Reviewed and classified the linked incident for operational follow-up."
+                .to_string(),
+            related_label: reference.label.clone(),
+        });
+        metrics.supervisor_actions += 1;
+    }
+    for reference in replacements.iter().take(2) {
+        events.push(SyntheticAuditEvent {
+            actor_id: supervisor.id.clone(),
+            action_key: "SUPERVISOR_RELIEF_COVERAGE_APPROVED",
+            entity_type: "smart_guard_replacement",
+            entity_id: reference.id.clone(),
+            occurred_at: reference.occurred_at + Duration::minutes(18),
+            detail: "Reviewed and approved the linked same-site relief coverage recommendation."
+                .to_string(),
+            related_label: reference.label.clone(),
+        });
+        metrics.supervisor_actions += 1;
+    }
+
+    for reference in merit_scores.iter().take(2) {
+        events.push(SyntheticAuditEvent {
+            actor_id: admin.id.clone(),
+            action_key: "ADMIN_ANALYTICS_VIEWED",
+            entity_type: "guard_merit_score",
+            entity_id: reference.id.clone(),
+            occurred_at: reference.occurred_at + Duration::minutes(20),
+            detail: "Viewed the linked guard performance analytics scorecard.".to_string(),
+            related_label: reference.label.clone(),
+        });
+        metrics.admin_actions += 1;
+    }
+    let dtr_reference = closed_shifts
+        .get(12)
+        .ok_or_else(|| anyhow!("Missing capstone attendance context for admin DTR review"))?;
+    events.push(SyntheticAuditEvent {
+        actor_id: admin.id.clone(),
+        action_key: "ADMIN_DTR_SUMMARY_REVIEWED",
+        entity_type: "attendance",
+        entity_id: dtr_reference.attendance_id.clone(),
+        occurred_at: dtr_reference.end + Duration::minutes(52),
+        detail: "Reviewed the linked attendance record in the DTR summary.".to_string(),
+        related_label: "Completed capstone attendance record".to_string(),
+    });
+    metrics.admin_actions += 1;
+    for reference in feedback.iter().take(2) {
+        events.push(SyntheticAuditEvent {
+            actor_id: admin.id.clone(),
+            action_key: "ADMIN_FEEDBACK_SUMMARY_REVIEWED",
+            entity_type: "feedback",
+            entity_id: reference.id.clone(),
+            occurred_at: reference.occurred_at + Duration::minutes(28),
+            detail: "Reviewed the linked feedback entry in the feedback summary.".to_string(),
+            related_label: reference.label.clone(),
+        });
+        metrics.admin_actions += 1;
+    }
+    for reference in tickets.iter().take(2) {
+        events.push(SyntheticAuditEvent {
+            actor_id: admin.id.clone(),
+            action_key: "ADMIN_SUPPORT_TICKET_REVIEWED",
+            entity_type: "support_ticket",
+            entity_id: reference.id.clone(),
+            occurred_at: reference.occurred_at + Duration::minutes(18),
+            detail: "Reviewed the linked support ticket and current resolution status.".to_string(),
+            related_label: reference.label.clone(),
+        });
+        metrics.admin_actions += 1;
+    }
+    events.push(SyntheticAuditEvent {
+        actor_id: admin.id.clone(),
+        action_key: "ADMIN_REPORT_VIEWED",
+        entity_type: "capstone_seed_batch",
+        entity_id: BATCH_ID.to_string(),
+        occurred_at: manila_time(16, 16, 30)?,
+        detail: "Viewed the presentation operations report for the validated capstone batch."
+            .to_string(),
+        related_label: "Capstone presentation schedule batch".to_string(),
+    });
+    metrics.admin_actions += 1;
+
+    let total = metrics.guard_login_logout
+        + metrics.guard_operational
+        + metrics.supervisor_actions
+        + metrics.admin_actions;
+    if !(120..=180).contains(&total) || events.len() != total {
+        bail!("Synthetic audit activity plan must contain 120-180 events; planned {total}")
+    }
+    Ok((events, metrics))
+}
+
+async fn print_capstone_audit_counts(pool: &PgPool, label: &str) -> Result<()> {
+    println!("{label} CAPSTONE AUDIT COUNTS BY ROLE AND ACTION:");
+    let rows = sqlx::query(
+        r#"
+        SELECT COALESCE(LOWER(BTRIM(u.role)), 'system') AS actor_role,
+               al.action_key,
+               COUNT(*)::BIGINT AS count
+        FROM audit_logs al
+        LEFT JOIN users u ON u.id = al.actor_user_id
+        JOIN capstone_seed_records csr
+          ON csr.table_name = 'audit_logs'
+         AND csr.record_id = al.id
+         AND csr.batch_id IN ($1, $2, $3)
+        GROUP BY actor_role, al.action_key
+        ORDER BY actor_role, al.action_key
+        "#,
+    )
+    .bind(BATCH_ID)
+    .bind(ENRICHMENT_BATCH_ID)
+    .bind(AUDIT_ACTIVITY_BATCH_ID)
+    .fetch_all(pool)
+    .await?;
+    if rows.is_empty() {
+        println!("none");
+    }
+    for row in rows {
+        println!(
+            "{}|{}|{}",
+            row.try_get::<String, _>("actor_role")?,
+            row.try_get::<String, _>("action_key")?,
+            row.try_get::<i64, _>("count")?
+        );
+    }
+    Ok(())
+}
+
+async fn read_audit_activity_metrics(pool: &PgPool) -> Result<AuditActivityMetrics> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE LOWER(BTRIM(u.role)) = 'guard' AND al.action_key IN ('AUTH_LOGIN_ATTEMPT', 'AUTH_LOGOUT'))::BIGINT AS guard_login_logout,
+            COUNT(*) FILTER (WHERE LOWER(BTRIM(u.role)) = 'guard' AND al.action_key NOT IN ('AUTH_LOGIN_ATTEMPT', 'AUTH_LOGOUT'))::BIGINT AS guard_operational,
+            COUNT(*) FILTER (WHERE LOWER(BTRIM(u.role)) = 'supervisor')::BIGINT AS supervisor_actions,
+            COUNT(*) FILTER (WHERE LOWER(BTRIM(u.role)) = 'admin')::BIGINT AS admin_actions
+        FROM audit_logs al
+        JOIN capstone_seed_records csr
+          ON csr.batch_id = $1 AND csr.table_name = 'audit_logs' AND csr.record_id = al.id
+        LEFT JOIN users u ON u.id = al.actor_user_id
+        "#,
+    )
+    .bind(AUDIT_ACTIVITY_BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    Ok(AuditActivityMetrics {
+        guard_login_logout: row.try_get::<i64, _>("guard_login_logout")? as usize,
+        guard_operational: row.try_get::<i64, _>("guard_operational")? as usize,
+        supervisor_actions: row.try_get::<i64, _>("supervisor_actions")? as usize,
+        admin_actions: row.try_get::<i64, _>("admin_actions")? as usize,
+    })
+}
+
+fn print_audit_activity_metrics(label: &str, metrics: &AuditActivityMetrics) {
+    println!(
+        "{label} AUDIT ACTIVITY: guard_login_logout={}, guard_operational={}, supervisor_actions={}, admin_actions={}, total={}",
+        metrics.guard_login_logout,
+        metrics.guard_operational,
+        metrics.supervisor_actions,
+        metrics.admin_actions,
+        metrics.guard_login_logout
+            + metrics.guard_operational
+            + metrics.supervisor_actions
+            + metrics.admin_actions,
+    );
+}
+
+async fn audit_activity_preflight(pool: &PgPool) -> Result<()> {
+    ensure_ledger(pool).await?;
+    let shifts = ensure_enrichment_ready(pool).await?;
+    let (guards, supervisor, admin) = read_synthetic_audit_actors(pool).await?;
+    let audit_shifts = read_audit_shift_contexts(pool).await?;
+    let (events, metrics) =
+        build_synthetic_audit_events(pool, &guards, &supervisor, &admin, &audit_shifts).await?;
+    if shifts.len() != audit_shifts.len() {
+        bail!("Synthetic audit activity source shift count is inconsistent")
+    }
+    println!(
+        "AUDIT PREFLIGHT: guards={}, supervisor={}, admin={}, planned_events={}, source_completed_shifts={}",
+        guards.len(),
+        supervisor.id,
+        admin.id,
+        events.len(),
+        shifts.len()
+    );
+    print_audit_activity_metrics("PLANNED", &metrics);
+    print_capstone_audit_counts(pool, "BEFORE").await?;
+    Ok(())
+}
+
+async fn validate_audit_activity(pool: &PgPool) -> Result<()> {
+    let batch_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM capstone_seed_batches WHERE batch_id = $1")
+            .bind(AUDIT_ACTIVITY_BATCH_ID)
+            .fetch_optional(pool)
+            .await?;
+    if batch_status.is_none() {
+        println!("AUDIT ACTIVITY VALIDATION: no audit activity batch is present.");
+        return Ok(());
+    }
+    if batch_status.as_deref() != Some("complete") {
+        bail!("Synthetic audit activity batch is not complete")
+    }
+
+    let cutoff = manila_time(PLANNED_DAY, 0, 0)?;
+    let protected_id = require_env("CAPSTONE_PROTECTED_SUPERADMIN_ID")?;
+    let invalid_rows: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)::BIGINT
+        FROM audit_logs al
+        JOIN capstone_seed_records csr
+          ON csr.batch_id = $1 AND csr.table_name = 'audit_logs' AND csr.record_id = al.id
+        LEFT JOIN capstone_seed_actors csa
+          ON csa.batch_id = $1 AND csa.user_id = al.actor_user_id
+        LEFT JOIN users u ON u.id = al.actor_user_id
+        WHERE al.source <> 'capstone_seed'
+           OR al.actor_attribution_mode <> 'synthetic_seeded'
+           OR al.capstone_batch_id <> $1
+           OR al.seeded_at IS NULL
+           OR al.scenario_occurred_at IS NULL
+           OR al.created_at <> al.scenario_occurred_at
+           OR al.created_at >= $2
+           OR al.actor_user_id IS NULL
+           OR csa.user_id IS NULL
+           OR LOWER(BTRIM(COALESCE(csa.role, ''))) <> LOWER(BTRIM(COALESCE(u.role, '')))
+           OR al.actor_user_id = $3
+           OR LOWER(BTRIM(COALESCE(u.role, ''))) = 'superadmin'
+           OR NOT (al.action_key = ANY($4))
+           OR (
+                NOT (al.entity_type = 'capstone_seed_batch' AND al.entity_id IN ($1, $5, $6))
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM capstone_seed_records related
+                    WHERE related.record_id = al.entity_id
+                      AND related.batch_id IN ($1, $5, $6)
+                )
+           )
+        "#,
+    )
+    .bind(AUDIT_ACTIVITY_BATCH_ID)
+    .bind(cutoff)
+    .bind(protected_id)
+    .bind(synthetic_audit_actions())
+    .bind(BATCH_ID)
+    .bind(ENRICHMENT_BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    if invalid_rows != 0 {
+        bail!("Synthetic audit activity validation found {invalid_rows} invalid attributed rows")
+    }
+
+    let metrics = read_audit_activity_metrics(pool).await?;
+    let total = metrics.guard_login_logout
+        + metrics.guard_operational
+        + metrics.supervisor_actions
+        + metrics.admin_actions;
+    if !(120..=180).contains(&total) {
+        bail!("Synthetic audit activity validation expected 120-180 records, found {total}")
+    }
+    print_audit_activity_metrics("VALIDATED", &metrics);
+    Ok(())
+}
+
+async fn seed_audit_activity(pool: &PgPool) -> Result<()> {
+    ensure_ledger(pool).await?;
+    let existing_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM capstone_seed_batches WHERE batch_id = $1")
+            .bind(AUDIT_ACTIVITY_BATCH_ID)
+            .fetch_optional(pool)
+            .await?;
+    if existing_status.as_deref() == Some("complete") {
+        if validate_audit_activity(pool).await.is_ok() {
+            println!(
+                "Synthetic audit activity batch is already complete; no records were duplicated."
+            );
+            status(pool).await?;
+            validate(pool).await?;
+            return Ok(());
+        }
+        println!("Synthetic audit activity batch failed validation; resetting only that child batch before retrying.");
+        reset_tracked_batch(pool, AUDIT_ACTIVITY_BATCH_ID).await?;
+    } else if existing_status.is_some() {
+        reset_tracked_batch(pool, AUDIT_ACTIVITY_BATCH_ID).await?;
+    }
+
+    let shifts = ensure_enrichment_ready(pool).await?;
+    let (guards, supervisor, admin) = read_synthetic_audit_actors(pool).await?;
+    let audit_shifts = read_audit_shift_contexts(pool).await?;
+    let (events, expected_metrics) =
+        build_synthetic_audit_events(pool, &guards, &supervisor, &admin, &audit_shifts).await?;
+    if shifts.len() != audit_shifts.len() {
+        bail!("Synthetic audit activity source shift count is inconsistent")
+    }
+    let reference_at =
+        DateTime::parse_from_rfc3339(&require_env("CAPSTONE_REFERENCE_DATE")?)?.with_timezone(&Utc);
+    let protected_id = require_env("CAPSTONE_PROTECTED_SUPERADMIN_ID")?;
+    let seeded_at = Utc::now();
+    let actor_by_id = guards
+        .iter()
+        .chain(std::iter::once(&supervisor))
+        .chain(std::iter::once(&admin))
+        .map(|actor| (actor.id.as_str(), actor))
+        .collect::<HashMap<_, _>>();
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO capstone_seed_batches (batch_id, data_origin, reference_at, status, metadata) VALUES ($1, $2, $3, 'running', $4)",
+    )
+    .bind(AUDIT_ACTIVITY_BATCH_ID)
+    .bind(AUDIT_ACTIVITY_DATA_ORIGIN)
+    .bind(reference_at)
+    .bind(json!({
+        "parentBatchId": BATCH_ID,
+        "enrichmentBatchId": ENRICHMENT_BATCH_ID,
+        "presentationContext": true,
+        "source": "capstone_seed",
+        "actorAttributionMode": "synthetic_seeded",
+        "historyThrough": "2026-10-16",
+        "generatedBy": "capstone-dataset seed-audit-activity",
+    }))
+    .execute(&mut *transaction)
+    .await?;
+    for actor in guards
+        .iter()
+        .chain(std::iter::once(&supervisor))
+        .chain(std::iter::once(&admin))
+    {
+        register_synthetic_audit_actor(&mut transaction, actor, &protected_id).await?;
+    }
+    for event in &events {
+        let actor = actor_by_id
+            .get(event.actor_id.as_str())
+            .ok_or_else(|| anyhow!("Synthetic audit event refers to an unregistered actor"))?;
+        insert_synthetic_audit_event(&mut transaction, actor, event, &protected_id, seeded_at)
+            .await?;
+    }
+    sqlx::query("UPDATE capstone_seed_batches SET status = 'complete', completed_at = CURRENT_TIMESTAMP WHERE batch_id = $1")
+        .bind(AUDIT_ACTIVITY_BATCH_ID)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+
+    print_audit_activity_metrics("SEEDED", &expected_metrics);
+    validate_audit_activity(pool).await?;
+    Ok(())
 }
 
 fn scenario_shift<'a>(shifts: &'a [CapstoneShift], sequence: usize) -> &'a CapstoneShift {
@@ -2176,6 +3220,7 @@ async fn validate(pool: &PgPool) -> Result<()> {
         validate_enrichment_timing(pool).await?;
         println!("ENRICHMENT VALIDATION: causal timestamps and completed-shift tracking points are valid.");
     }
+    validate_audit_activity(pool).await?;
     Ok(())
 }
 
@@ -2204,7 +3249,8 @@ async fn status(pool: &PgPool) -> Result<()> {
     ensure_ledger(pool).await?;
     let base_present = print_batch_status(pool, BATCH_ID).await?;
     let enrichment_present = print_batch_status(pool, ENRICHMENT_BATCH_ID).await?;
-    if !base_present && !enrichment_present {
+    let audit_activity_present = print_batch_status(pool, AUDIT_ACTIVITY_BATCH_ID).await?;
+    if !base_present && !enrichment_present && !audit_activity_present {
         println!("No {} dataset is present.", BATCH_ID);
     }
     Ok(())
@@ -2240,6 +3286,15 @@ async fn main() {
                 verify_protected_superadmin(&target_pool).await?;
                 status(&target_pool).await?;
                 validate(&target_pool).await?;
+            }
+            "audit-preflight" => audit_activity_preflight(&target_pool).await?,
+            "seed-audit-activity" => {
+                audit_activity_preflight(&target_pool).await?;
+                seed_audit_activity(&target_pool).await?;
+                verify_protected_superadmin(&target_pool).await?;
+                status(&target_pool).await?;
+                validate(&target_pool).await?;
+                print_capstone_audit_counts(&target_pool, "AFTER").await?;
             }
             "validate" => validate(&target_pool).await?,
             _ => unreachable!(),
@@ -2316,5 +3371,18 @@ mod tests {
         assert_eq!(local_start.hour(), 23);
         assert_eq!(local_end.day(), 11);
         assert_eq!(local_end.hour(), 7);
+    }
+
+    #[test]
+    fn synthetic_audit_allow_list_excludes_sensitive_account_operations() {
+        let actions = synthetic_audit_actions();
+
+        assert!(actions.contains(&"AUTH_LOGIN_ATTEMPT"));
+        assert!(actions.contains(&"SUPERVISOR_INCIDENT_REVIEWED"));
+        assert!(actions.contains(&"ADMIN_REPORT_VIEWED"));
+        assert!(!actions.iter().any(|action| action.contains("PASSWORD")));
+        assert!(!actions.iter().any(|action| action.contains("MFA")));
+        assert!(!actions.iter().any(|action| action.contains("DELETE")));
+        assert!(!actions.iter().any(|action| action.contains("ROLE")));
     }
 }

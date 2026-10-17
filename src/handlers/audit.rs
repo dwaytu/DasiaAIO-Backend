@@ -24,7 +24,10 @@ pub struct AuditLogQuery {
     pub entity_type: Option<String>,
     pub resource_type: Option<String>,
     pub actor_id: Option<String>,
+    pub actor_role: Option<String>,
+    pub entity_id: Option<String>,
     pub action_type: Option<String>,
+    pub source: Option<String>,
     pub source_ip: Option<String>,
     pub user_agent: Option<String>,
     pub from: Option<String>,
@@ -98,6 +101,11 @@ pub async fn get_audit_logs(
             al.source_ip,
             al.user_agent,
             al.metadata,
+            al.source,
+            al.actor_attribution_mode,
+            al.capstone_batch_id,
+            al.seeded_at,
+            al.scenario_occurred_at,
             al.created_at,
             u.full_name AS actor_name,
             u.email AS actor_email,
@@ -472,6 +480,39 @@ fn apply_filters(
         append_condition_prefix(builder, &mut has_where);
         builder.push("al.actor_user_id = ");
         builder.push_bind(actor_id.to_string());
+    }
+
+    if let Some(actor_role) = params
+        .actor_role
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        append_condition_prefix(builder, &mut has_where);
+        builder.push("LOWER(BTRIM(COALESCE(u.role, ''))) = ");
+        builder.push_bind(actor_role.to_ascii_lowercase());
+    }
+
+    if let Some(entity_id) = params
+        .entity_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        append_condition_prefix(builder, &mut has_where);
+        builder.push("COALESCE(al.entity_id, '') ILIKE ");
+        builder.push_bind(format!("%{}%", entity_id));
+    }
+
+    if let Some(source) = params
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        append_condition_prefix(builder, &mut has_where);
+        builder.push("al.source = ");
+        builder.push_bind(source.to_ascii_lowercase());
     }
 
     if let Some(source_ip) = params
