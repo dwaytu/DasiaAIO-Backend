@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("seed", "reset", "status", "preflight", "validate", "enrich", "enrich-preflight", "audit-preflight", "seed-audit-activity")]
+  [ValidateSet("seed", "reset", "status", "preflight", "validate", "enrich", "enrich-preflight", "audit-preflight", "seed-audit-activity", "fleet-preflight", "enrich-fleet", "fleet-validate", "consistency-audit", "review-inventory", "firearm-custody-preflight", "seed-firearm-custody", "firearm-custody-validate", "firearm-custody-status", "reset-firearm-custody")]
   [string]$Command = "status"
 )
 
@@ -21,8 +21,12 @@ if ([string]::IsNullOrWhiteSpace($env:CAPSTONE_PROTECTED_SUPERADMIN_ID)) {
   throw "Set CAPSTONE_PROTECTED_SUPERADMIN_ID to the active production Superadmin ID before running this command."
 }
 
-if ($Command -in @("seed", "reset", "enrich", "seed-audit-activity") -and [string]::IsNullOrWhiteSpace($env:CAPSTONE_BACKUP_VERIFIED_AT)) {
+if ($Command -in @("seed", "reset", "enrich", "seed-audit-activity", "enrich-fleet", "seed-firearm-custody", "reset-firearm-custody") -and [string]::IsNullOrWhiteSpace($env:CAPSTONE_BACKUP_VERIFIED_AT)) {
   throw "Set CAPSTONE_BACKUP_VERIFIED_AT to the RFC 3339 time of a verified target-database backup before $Command."
+}
+
+if ($Command -in @("fleet-preflight", "enrich-fleet", "fleet-validate") -and ($env:CAPSTONE_TARGET_ENVIRONMENT -ne "capstone_presentation" -or $env:CAPSTONE_PRESENTATION_ENVIRONMENT -ne "true")) {
+  throw "Fleet enrichment requires CAPSTONE_TARGET_ENVIRONMENT=capstone_presentation and CAPSTONE_PRESENTATION_ENVIRONMENT=true."
 }
 
 if ($Command -in @("audit-preflight", "seed-audit-activity")) {

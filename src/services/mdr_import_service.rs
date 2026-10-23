@@ -1127,7 +1127,7 @@ pub async fn commit_batch(
                             derive_firearm_name(&row, serial_number);
                         let firearm_id = utils::generate_id();
                         let persisted_firearm_id = sqlx::query_scalar::<_, String>(
-                            "INSERT INTO firearms (id, name, serial_number, model, caliber, status, kind, make, validity_date, ammo_issued, lic_reg_name, mdr_batch_id) VALUES ($1, $2, $3, $4, $5, 'allocated', $6, $7, $8, $9, $10, $11) ON CONFLICT (serial_number) DO UPDATE SET name = EXCLUDED.name, model = EXCLUDED.model, caliber = EXCLUDED.caliber, status = 'allocated', kind = COALESCE(EXCLUDED.kind, firearms.kind), make = COALESCE(EXCLUDED.make, firearms.make), validity_date = COALESCE(EXCLUDED.validity_date, firearms.validity_date), ammo_issued = COALESCE(EXCLUDED.ammo_issued, firearms.ammo_issued), lic_reg_name = COALESCE(EXCLUDED.lic_reg_name, firearms.lic_reg_name), mdr_batch_id = EXCLUDED.mdr_batch_id, updated_at = NOW() RETURNING id",
+                            "INSERT INTO firearms (id, name, serial_number, model, caliber, status, kind, make, validity_date, ammo_issued, lic_reg_name, mdr_batch_id) VALUES ($1, $2, $3, $4, $5, 'available', $6, $7, $8, $9, $10, $11) ON CONFLICT (serial_number) DO UPDATE SET name = EXCLUDED.name, model = EXCLUDED.model, caliber = EXCLUDED.caliber, status = CASE WHEN LOWER(BTRIM(firearms.status)) = 'maintenance' THEN 'maintenance' WHEN EXISTS (SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = firearms.id AND LOWER(BTRIM(fa.status)) = 'active') THEN 'allocated' ELSE 'available' END, kind = COALESCE(EXCLUDED.kind, firearms.kind), make = COALESCE(EXCLUDED.make, firearms.make), validity_date = COALESCE(EXCLUDED.validity_date, firearms.validity_date), ammo_issued = COALESCE(EXCLUDED.ammo_issued, firearms.ammo_issued), lic_reg_name = COALESCE(EXCLUDED.lic_reg_name, firearms.lic_reg_name), mdr_batch_id = EXCLUDED.mdr_batch_id, updated_at = NOW() RETURNING id",
                         )
                         .bind(&firearm_id)
                         .bind(&firearm_name)
@@ -1157,10 +1157,17 @@ pub async fn commit_batch(
                     None
                 };
 
+                let has_validated_custody_relationship = row.match_status == "matched"
+                    && row.matched_guard_id.is_some()
+                    && row.matched_firearm_id.is_some();
+
                 if let (Some(ref guard_id), Some(ref firearm_id)) =
                     (&effective_guard_id, &effective_firearm_id)
                 {
-                    if guard_license_expired {
+                    if !has_validated_custody_relationship {
+                        // Source rows still enrich the master register, but they cannot establish
+                        // current custody without an explicitly validated staged relationship.
+                    } else if guard_license_expired {
                         summary.guard_records_blocked += 1;
                     } else if firearm_validity_expired {
                         summary.firearm_records_blocked += 1;
@@ -1186,6 +1193,11 @@ pub async fn commit_batch(
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+                        sqlx::query("UPDATE firearms SET status = 'allocated', updated_at = NOW() WHERE id = $1")
+                            .bind(firearm_id)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| AppError::DatabaseError(e.to_string()))?;
                         summary.allocations_created += 1;
                     }
                 }

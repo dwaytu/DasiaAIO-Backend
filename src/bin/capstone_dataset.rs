@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Duration, FixedOffset, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, TimeZone, Timelike, Utc, Weekday};
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -12,11 +12,15 @@ use uuid::Uuid;
 const BATCH_ID: &str = "capstone-live-october-2026";
 const ENRICHMENT_BATCH_ID: &str = "capstone-live-october-2026-enrichment-v1";
 const AUDIT_ACTIVITY_BATCH_ID: &str = "capstone-live-october-2026-audit-activity-v1";
+const FLEET_ENRICHMENT_BATCH_ID: &str = "capstone-live-october-2026-fleet-enrichment-v1";
+const FIREARM_CUSTODY_BATCH_ID: &str = "sentinel-october-2026-firearm-custody-v1";
 const REQUIRED_CONFIRMATION: &str = "LIVE_CAPSTONE_DATASET_CONFIRMED";
 const MANILA_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const DATA_ORIGIN: &str = "capstone_presentation_seed";
 const ENRICHMENT_DATA_ORIGIN: &str = "capstone_presentation_enrichment";
 const AUDIT_ACTIVITY_DATA_ORIGIN: &str = "capstone_presentation_synthetic_audit_activity";
+const FLEET_ENRICHMENT_DATA_ORIGIN: &str = "capstone_presentation_fleet_enrichment";
+const FIREARM_CUSTODY_DATA_ORIGIN: &str = "capstone_presentation_firearm_custody";
 const PRIMARY_ROSTER_SIZE: usize = 5;
 const MAX_PARTICIPATING_GUARDS: usize = 55;
 const MIN_REST_HOURS: i64 = 8;
@@ -179,6 +183,85 @@ struct AuditActivityMetrics {
     admin_actions: usize,
 }
 
+#[derive(Clone)]
+struct FleetVehicleContext {
+    car_id: String,
+    vehicle: String,
+    plate: String,
+    current_status: String,
+    driver_id: String,
+    driver_name: String,
+    client_id: String,
+    client_name: String,
+    allocation_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct FleetTripPlan {
+    car_id: String,
+    bank_arrival: DateTime<Utc>,
+    return_departure: DateTime<Utc>,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct CustodyGuard {
+    id: String,
+    guard_code: Option<String>,
+    full_name: String,
+    site_id: Option<String>,
+    site_name: Option<String>,
+}
+
+#[derive(Clone)]
+struct CustodyFirearm {
+    id: String,
+    serial_number: String,
+    make: Option<String>,
+    source_allocation_id: Option<String>,
+    source_kind: String,
+}
+
+#[derive(Clone)]
+struct CustodyMapping {
+    guard: CustodyGuard,
+    firearm: CustodyFirearm,
+}
+
+#[derive(Clone)]
+struct CustodyShift {
+    shift_id: String,
+    guard_id: String,
+    firearm_id: String,
+    start: DateTime<Utc>,
+    check_out: DateTime<Utc>,
+}
+
+#[derive(Default)]
+struct FirearmCustodyMetrics {
+    mapped_guards: usize,
+    unique_firearms: usize,
+    created_cycles: usize,
+    day_cycles: usize,
+    evening_cycles: usize,
+    night_cycles: usize,
+    sunday_cycles: usize,
+}
+
+#[derive(Clone, Default)]
+struct FleetCounts {
+    total_vehicles: i64,
+    available: i64,
+    allocated: i64,
+    maintenance: i64,
+    active_trips: i64,
+    trip_history_records: i64,
+    capstone_shifts: i64,
+    capstone_guards: i64,
+    firearms: i64,
+}
+
 #[derive(Default)]
 struct SeedMetrics {
     day_shifts: usize,
@@ -236,8 +319,18 @@ fn verify_live_target(command: &str) -> Result<String> {
             | "enrich-preflight"
             | "audit-preflight"
             | "seed-audit-activity"
+            | "fleet-preflight"
+            | "enrich-fleet"
+            | "fleet-validate"
+            | "consistency-audit"
+            | "review-inventory"
+            | "firearm-custody-preflight"
+            | "seed-firearm-custody"
+            | "firearm-custody-validate"
+            | "firearm-custody-status"
+            | "reset-firearm-custody"
     ) {
-        bail!("Usage: cargo run --bin capstone-dataset -- <seed|reset|status|preflight|validate|enrich|enrich-preflight|audit-preflight|seed-audit-activity>")
+        bail!("Usage: cargo run --bin capstone-dataset -- <seed|reset|status|preflight|validate|enrich|enrich-preflight|audit-preflight|seed-audit-activity|fleet-preflight|enrich-fleet|fleet-validate|consistency-audit|review-inventory|firearm-custody-preflight|seed-firearm-custody|firearm-custody-validate|firearm-custody-status|reset-firearm-custody>")
     }
     if matches!(command, "audit-preflight" | "seed-audit-activity") {
         if target_environment != "capstone_presentation" {
@@ -250,11 +343,31 @@ fn verify_live_target(command: &str) -> Result<String> {
             bail!("Synthetic audit activity requires CAPSTONE_ALLOW_SYNTHETIC_AUDIT_HISTORY=true")
         }
     }
+    if matches!(
+        command,
+        "fleet-preflight" | "enrich-fleet" | "fleet-validate"
+    ) {
+        if target_environment != "capstone_presentation" {
+            bail!("Fleet enrichment requires CAPSTONE_TARGET_ENVIRONMENT=capstone_presentation")
+        }
+        if env::var("CAPSTONE_PRESENTATION_ENVIRONMENT").as_deref() != Ok("true") {
+            bail!("Fleet enrichment requires CAPSTONE_PRESENTATION_ENVIRONMENT=true")
+        }
+    }
     Ok(target_url)
 }
 
 fn verify_backup_confirmation(command: &str) -> Result<()> {
-    if !matches!(command, "seed" | "reset" | "enrich" | "seed-audit-activity") {
+    if !matches!(
+        command,
+        "seed"
+            | "reset"
+            | "enrich"
+            | "seed-audit-activity"
+            | "enrich-fleet"
+            | "seed-firearm-custody"
+            | "reset-firearm-custody"
+    ) {
         return Ok(());
     }
 
@@ -312,6 +425,73 @@ async fn ensure_ledger(pool: &PgPool) -> Result<()> {
         "#,
     )
     .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn ensure_firearm_custody_schema(pool: &PgPool) -> Result<()> {
+    ensure_ledger(pool).await?;
+    for statement in [
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS shift_id VARCHAR(36)",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS source VARCHAR(32) NOT NULL DEFAULT 'runtime'",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS capstone_batch_id VARCHAR(80)",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS issued_by_role VARCHAR(32)",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS received_by_role VARCHAR(32)",
+        "CREATE INDEX IF NOT EXISTS idx_firearm_allocations_shift_id ON firearm_allocations(shift_id) WHERE shift_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_firearm_allocations_capstone_batch ON firearm_allocations(capstone_batch_id, allocation_date DESC) WHERE capstone_batch_id IS NOT NULL",
+    ] {
+        sqlx::query(statement).execute(pool).await?;
+    }
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS capstone_firearm_custody_mappings (
+            batch_id VARCHAR(80) NOT NULL REFERENCES capstone_seed_batches(batch_id) ON DELETE CASCADE,
+            guard_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+            firearm_id VARCHAR(36) NOT NULL REFERENCES firearms(id) ON DELETE RESTRICT,
+            site_id VARCHAR(36),
+            source_kind VARCHAR(32) NOT NULL,
+            source_allocation_id VARCHAR(36),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (batch_id, guard_id),
+            UNIQUE (batch_id, firearm_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS capstone_firearm_custody_reconciliations (
+            batch_id VARCHAR(80) NOT NULL REFERENCES capstone_seed_batches(batch_id) ON DELETE CASCADE,
+            allocation_id VARCHAR(36) NOT NULL REFERENCES firearm_allocations(id) ON DELETE RESTRICT,
+            firearm_id VARCHAR(36) NOT NULL REFERENCES firearms(id) ON DELETE RESTRICT,
+            prior_allocation_status VARCHAR(50) NOT NULL,
+            prior_firearm_status VARCHAR(50) NOT NULL,
+            classification VARCHAR(32) NOT NULL,
+            reconciled_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (batch_id, allocation_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn track_batch_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    batch_id: &str,
+    table_name: &str,
+    record_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO capstone_seed_records (batch_id, table_name, record_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(batch_id)
+    .bind(table_name)
+    .bind(record_id)
+    .execute(&mut **transaction)
     .await?;
     Ok(())
 }
@@ -385,6 +565,7 @@ async fn reset_tracked_batch(pool: &PgPool, batch_id: &str) -> Result<()> {
 }
 
 async fn reset_batch(pool: &PgPool) -> Result<()> {
+    reset_fleet_enrichment(pool).await?;
     reset_tracked_batch(pool, AUDIT_ACTIVITY_BATCH_ID).await?;
     reset_tracked_batch(pool, ENRICHMENT_BATCH_ID).await?;
     reset_tracked_batch(pool, BATCH_ID).await
@@ -3086,6 +3267,718 @@ fn print_seed_plan(
     );
 }
 
+fn has_usable_firearm_serial(serial_number: &str) -> bool {
+    let normalized = serial_number.trim();
+    !normalized.is_empty()
+        && !matches!(
+            normalized.to_ascii_uppercase().as_str(),
+            "NO/FIREARM" | "SAMPLE" | "N/A" | "UNKNOWN"
+        )
+}
+
+fn custody_minutes(parts: &[&str], minimum: i64, maximum: i64) -> i64 {
+    let hash = parts
+        .iter()
+        .flat_map(|part| part.bytes())
+        .fold(0_u64, |hash, byte| {
+            hash.wrapping_mul(31).wrapping_add(byte as u64)
+        });
+    minimum + (hash % (maximum - minimum + 1) as u64) as i64
+}
+
+async fn read_custody_guards(pool: &PgPool) -> Result<Vec<CustodyGuard>> {
+    let rows = sqlx::query(
+        r#"
+        WITH capstone_guards AS (
+            SELECT DISTINCT shifts.guard_id
+            FROM shifts
+            JOIN capstone_seed_records records
+              ON records.batch_id = $1
+             AND records.table_name = 'shifts'
+             AND records.record_id = shifts.id
+        ), primary_sites AS (
+            SELECT shifts.guard_id, MIN(shifts.client_site) AS site_name
+            FROM shifts
+            JOIN capstone_seed_records records
+              ON records.batch_id = $1
+             AND records.table_name = 'shifts'
+             AND records.record_id = shifts.id
+            GROUP BY shifts.guard_id
+        )
+        SELECT u.id, u.guard_code, u.full_name, cs.id AS site_id, ps.site_name
+        FROM capstone_guards cg
+        JOIN users u ON u.id = cg.guard_id
+        LEFT JOIN primary_sites ps ON ps.guard_id = u.id
+        LEFT JOIN client_sites cs ON cs.name = ps.site_name
+        WHERE LOWER(BTRIM(u.role)) = 'guard'
+          AND COALESCE(LOWER(BTRIM(u.status)), 'active') = 'active'
+        ORDER BY COALESCE(u.guard_code, ''), u.full_name, u.id
+        "#,
+    )
+    .bind(BATCH_ID)
+    .fetch_all(pool)
+    .await?;
+
+    let guards = rows
+        .into_iter()
+        .map(|row| {
+            Ok(CustodyGuard {
+                id: row.try_get("id")?,
+                guard_code: row.try_get("guard_code")?,
+                full_name: row.try_get("full_name")?,
+                site_id: row.try_get("site_id")?,
+                site_name: row.try_get("site_name")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if guards.len() != MAX_PARTICIPATING_GUARDS {
+        bail!(
+            "Expected {MAX_PARTICIPATING_GUARDS} active capstone guards for firearm custody, found {}",
+            guards.len()
+        )
+    }
+    Ok(guards)
+}
+
+async fn read_persisted_custody_mappings(
+    pool: &PgPool,
+    guards: &[CustodyGuard],
+) -> Result<Option<Vec<CustodyMapping>>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT m.guard_id, m.source_kind, m.source_allocation_id,
+               f.id AS firearm_id, f.serial_number, f.make
+        FROM capstone_firearm_custody_mappings m
+        JOIN firearms f ON f.id = m.firearm_id
+        WHERE m.batch_id = $1
+        ORDER BY m.guard_id
+        "#,
+    )
+    .bind(FIREARM_CUSTODY_BATCH_ID)
+    .fetch_all(pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    if rows.len() != MAX_PARTICIPATING_GUARDS {
+        bail!("Persisted firearm custody mapping is incomplete")
+    }
+
+    let mut guards_by_id = guards
+        .iter()
+        .cloned()
+        .map(|guard| (guard.id.clone(), guard))
+        .collect::<HashMap<_, _>>();
+    let mut mappings = Vec::with_capacity(rows.len());
+    for row in rows {
+        let guard_id: String = row.try_get("guard_id")?;
+        let guard = guards_by_id.remove(&guard_id).ok_or_else(|| {
+            anyhow!("Persisted firearm custody mapping includes a non-capstone guard")
+        })?;
+        let serial_number: String = row.try_get("serial_number")?;
+        if !has_usable_firearm_serial(&serial_number) {
+            bail!("Persisted firearm custody mapping includes an unusable firearm serial")
+        }
+        mappings.push(CustodyMapping {
+            guard,
+            firearm: CustodyFirearm {
+                id: row.try_get("firearm_id")?,
+                serial_number,
+                make: row.try_get("make")?,
+                source_allocation_id: row.try_get("source_allocation_id")?,
+                source_kind: row.try_get("source_kind")?,
+            },
+        });
+    }
+    if !guards_by_id.is_empty() {
+        bail!("Persisted firearm custody mapping is missing a capstone guard")
+    }
+    Ok(Some(mappings))
+}
+
+async fn build_custody_mappings(pool: &PgPool) -> Result<Vec<CustodyMapping>> {
+    let guards = read_custody_guards(pool).await?;
+    if let Some(mappings) = read_persisted_custody_mappings(pool, &guards).await? {
+        return Ok(mappings);
+    }
+    let preferred_rows = sqlx::query(
+        r#"
+        WITH capstone_guards AS (
+            SELECT DISTINCT shifts.guard_id
+            FROM shifts
+            JOIN capstone_seed_records records
+              ON records.batch_id = $1
+             AND records.table_name = 'shifts'
+             AND records.record_id = shifts.id
+        )
+        SELECT fa.guard_id, fa.id AS source_allocation_id, f.id, f.serial_number, f.make, f.model
+        FROM firearm_allocations fa
+        JOIN capstone_guards cg ON cg.guard_id = fa.guard_id
+        JOIN firearms f ON f.id = fa.firearm_id
+        WHERE LOWER(BTRIM(fa.status)) = 'active'
+          AND fa.mdr_batch_id IS NOT NULL
+          AND LOWER(BTRIM(f.status)) <> 'maintenance'
+        ORDER BY fa.guard_id, fa.id
+        "#,
+    )
+    .bind(BATCH_ID)
+    .fetch_all(pool)
+    .await?;
+    let mut preferred = HashMap::new();
+    for row in preferred_rows {
+        let serial_number: String = row.try_get("serial_number")?;
+        if has_usable_firearm_serial(&serial_number) {
+            preferred.insert(
+                row.try_get::<String, _>("guard_id")?,
+                CustodyFirearm {
+                    id: row.try_get("id")?,
+                    serial_number,
+                    make: row.try_get("make")?,
+                    source_allocation_id: row.try_get("source_allocation_id")?,
+                    source_kind: "existing_mdr_pair".to_string(),
+                },
+            );
+        }
+    }
+
+    let candidate_rows = sqlx::query(
+        r#"
+        SELECT f.id, f.serial_number, f.make, f.model, fa.id AS source_allocation_id,
+               CASE WHEN fa.id IS NULL THEN 'available_inventory' ELSE 'isolated_mdr_inventory' END AS source_kind
+        FROM firearms f
+        LEFT JOIN firearm_allocations fa
+          ON fa.firearm_id = f.id
+         AND LOWER(BTRIM(fa.status)) = 'active'
+         AND fa.mdr_batch_id IS NOT NULL
+        WHERE LOWER(BTRIM(f.status)) <> 'maintenance'
+          AND (LOWER(BTRIM(f.status)) = 'available' OR fa.id IS NOT NULL)
+        ORDER BY CASE WHEN LOWER(BTRIM(f.status)) = 'available' THEN 0 ELSE 1 END,
+                 f.serial_number, f.id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let reserved_preferred_firearms = preferred
+        .values()
+        .map(|firearm| firearm.id.clone())
+        .collect::<HashSet<_>>();
+    if reserved_preferred_firearms.len() != preferred.len() {
+        bail!("Source firearm mappings are not one-to-one")
+    }
+    let mut candidates = candidate_rows
+        .into_iter()
+        .filter_map(|row| {
+            let serial_number = row.try_get::<String, _>("serial_number").ok()?;
+            has_usable_firearm_serial(&serial_number).then(|| {
+                Ok(CustodyFirearm {
+                    id: row.try_get("id")?,
+                    serial_number,
+                    make: row.try_get("make")?,
+                    source_allocation_id: row.try_get("source_allocation_id")?,
+                    source_kind: row.try_get("source_kind")?,
+                })
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    candidates.retain(|candidate| !reserved_preferred_firearms.contains(&candidate.id));
+    let mut used_firearms = HashSet::new();
+    let mut mappings = Vec::with_capacity(guards.len());
+    for guard in guards {
+        let firearm = if let Some(firearm) = preferred.remove(&guard.id) {
+            firearm
+        } else {
+            let next_index = candidates
+                .iter()
+                .position(|candidate| !used_firearms.contains(&candidate.id))
+                .ok_or_else(|| anyhow!("Insufficient safe firearms to map every capstone guard"))?;
+            candidates.remove(next_index)
+        };
+        if !used_firearms.insert(firearm.id.clone()) {
+            bail!("A firearm was selected for more than one primary guard mapping")
+        }
+        mappings.push(CustodyMapping { guard, firearm });
+    }
+    if mappings.len() != MAX_PARTICIPATING_GUARDS || used_firearms.len() != mappings.len() {
+        bail!("Firearm custody mapping is not one-to-one")
+    }
+    Ok(mappings)
+}
+
+async fn read_custody_shifts(
+    pool: &PgPool,
+    mappings: &[CustodyMapping],
+) -> Result<Vec<CustodyShift>> {
+    let firearm_by_guard = mappings
+        .iter()
+        .map(|mapping| (mapping.guard.id.clone(), mapping.firearm.id.clone()))
+        .collect::<HashMap<_, _>>();
+    let rows = sqlx::query(
+        r#"
+        SELECT s.id AS shift_id, s.guard_id, s.start_time, a.check_out_time
+        FROM shifts s
+        JOIN capstone_seed_records shift_records
+          ON shift_records.batch_id = $1
+         AND shift_records.table_name = 'shifts'
+         AND shift_records.record_id = s.id
+        JOIN attendance a ON a.shift_id = s.id AND a.guard_id = s.guard_id
+        JOIN capstone_seed_records attendance_records
+          ON attendance_records.batch_id = $1
+         AND attendance_records.table_name = 'attendance'
+         AND attendance_records.record_id = a.id
+        WHERE LOWER(BTRIM(a.status)) = 'completed'
+          AND a.check_out_time IS NOT NULL
+          AND s.start_time >= $2
+          AND s.start_time < $3
+        ORDER BY s.start_time, s.id
+        "#,
+    )
+    .bind(BATCH_ID)
+    .bind(manila_time(1, 0, 0)?)
+    .bind(manila_time(PLANNED_DAY, 0, 0)?)
+    .fetch_all(pool)
+    .await?;
+    let mut shifts = Vec::with_capacity(rows.len());
+    for row in rows {
+        let guard_id: String = row.try_get("guard_id")?;
+        let firearm_id = firearm_by_guard
+            .get(&guard_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Completed capstone shift has no primary firearm mapping"))?;
+        shifts.push(CustodyShift {
+            shift_id: row.try_get("shift_id")?,
+            guard_id,
+            firearm_id,
+            start: row.try_get("start_time")?,
+            check_out: row.try_get("check_out_time")?,
+        });
+    }
+    if shifts.is_empty() {
+        bail!("No completed capstone shifts are available for firearm custody history")
+    }
+    Ok(shifts)
+}
+
+fn custody_metrics(shifts: &[CustodyShift], mapping_count: usize) -> Result<FirearmCustodyMetrics> {
+    let offset = FixedOffset::east_opt(MANILA_OFFSET_SECONDS)
+        .ok_or_else(|| anyhow!("Invalid Manila offset"))?;
+    let mut metrics = FirearmCustodyMetrics {
+        mapped_guards: mapping_count,
+        unique_firearms: mapping_count,
+        created_cycles: shifts.len(),
+        ..Default::default()
+    };
+    for shift in shifts {
+        match shift.start.with_timezone(&offset).hour() {
+            7 => metrics.day_cycles += 1,
+            15 => metrics.evening_cycles += 1,
+            23 => metrics.night_cycles += 1,
+            hour => bail!("Unexpected capstone custody shift start hour {hour}"),
+        }
+        if shift.start.with_timezone(&offset).weekday() == Weekday::Sun {
+            metrics.sunday_cycles += 1;
+        }
+    }
+    Ok(metrics)
+}
+
+fn print_custody_mappings(mappings: &[CustodyMapping]) {
+    println!("FIREARM CUSTODY MAPPING: guards={}", mappings.len());
+    for mapping in mappings {
+        println!(
+            "CUSTODY_MAPPING|guard_id={}|guard_code={}|guard_name={}|site={}|firearm_id={}|serial={}|make={}",
+            mapping.guard.id,
+            mapping.guard.guard_code.as_deref().unwrap_or("(none)"),
+            mapping.guard.full_name,
+            mapping.guard.site_name.as_deref().unwrap_or("(unassigned)"),
+            mapping.firearm.id,
+            mapping.firearm.serial_number,
+            mapping.firearm.make.as_deref().unwrap_or("(unspecified)"),
+        );
+    }
+}
+
+async fn firearm_custody_preflight(pool: &PgPool) -> Result<()> {
+    ensure_firearm_custody_schema(pool).await?;
+    let mappings = build_custody_mappings(pool).await?;
+    let shifts = read_custody_shifts(pool, &mappings).await?;
+    let metrics = custody_metrics(&shifts, mappings.len())?;
+    print_custody_mappings(&mappings);
+    println!(
+        "FIREARM CUSTODY PREFLIGHT: mapped_guards={}, unique_firearms={}, completed_shift_cycles={}, day={}, evening={}, night={}, sunday={}",
+        metrics.mapped_guards,
+        metrics.unique_firearms,
+        metrics.created_cycles,
+        metrics.day_cycles,
+        metrics.evening_cycles,
+        metrics.night_cycles,
+        metrics.sunday_cycles,
+    );
+    Ok(())
+}
+
+async fn reset_firearm_custody(pool: &PgPool) -> Result<()> {
+    ensure_firearm_custody_schema(pool).await?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM capstone_seed_batches WHERE batch_id = $1)",
+    )
+    .bind(FIREARM_CUSTODY_BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    if !exists {
+        println!("No firearm custody batch is present.");
+        return Ok(());
+    }
+
+    let reconciliations = sqlx::query(
+        "SELECT allocation_id, firearm_id, prior_allocation_status, prior_firearm_status FROM capstone_firearm_custody_reconciliations WHERE batch_id = $1 ORDER BY allocation_id",
+    )
+    .bind(FIREARM_CUSTODY_BATCH_ID)
+    .fetch_all(pool)
+    .await?;
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM firearm_allocations WHERE id IN (SELECT record_id FROM capstone_seed_records WHERE batch_id = $1 AND table_name = 'firearm_allocations')",
+    )
+    .bind(FIREARM_CUSTODY_BATCH_ID)
+    .execute(&mut *transaction)
+    .await?;
+
+    for row in reconciliations {
+        let allocation_id: String = row.try_get("allocation_id")?;
+        let firearm_id: String = row.try_get("firearm_id")?;
+        let prior_allocation_status: String = row.try_get("prior_allocation_status")?;
+        let prior_firearm_status: String = row.try_get("prior_firearm_status")?;
+        let restored_inventory = sqlx::query(
+            "UPDATE firearms SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND (LOWER(BTRIM(status)) = LOWER(BTRIM($1)) OR (LOWER(BTRIM(status)) = 'available' AND NOT EXISTS (SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = $2 AND LOWER(BTRIM(fa.status)) = 'active')))",
+        )
+        .bind(prior_firearm_status)
+        .bind(&firearm_id)
+        .execute(&mut *transaction)
+        .await?;
+        if restored_inventory.rows_affected() != 1 {
+            bail!("Cannot safely reset firearm custody: firearm {firearm_id} state changed after reconciliation")
+        }
+        let restored = sqlx::query(
+            "UPDATE firearm_allocations SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND LOWER(BTRIM(status)) = 'imported'",
+        )
+        .bind(prior_allocation_status)
+        .bind(&allocation_id)
+        .execute(&mut *transaction)
+        .await?;
+        if restored.rows_affected() != 1 {
+            bail!("Cannot safely reset firearm custody: source allocation {allocation_id} changed after reconciliation")
+        }
+    }
+
+    sqlx::query("DELETE FROM capstone_seed_batches WHERE batch_id = $1")
+        .bind(FIREARM_CUSTODY_BATCH_ID)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    println!("Reset only firearm custody batch {FIREARM_CUSTODY_BATCH_ID}.");
+    Ok(())
+}
+
+async fn seed_firearm_custody(pool: &PgPool) -> Result<()> {
+    ensure_firearm_custody_schema(pool).await?;
+    let existing_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM capstone_seed_batches WHERE batch_id = $1")
+            .bind(FIREARM_CUSTODY_BATCH_ID)
+            .fetch_optional(pool)
+            .await?;
+    if existing_status.as_deref() == Some("complete") {
+        validate_firearm_custody(pool).await?;
+        println!("Firearm custody batch is already complete; no records were duplicated.");
+        return Ok(());
+    }
+    if existing_status.is_some() {
+        reset_firearm_custody(pool).await?;
+    }
+
+    let mappings = build_custody_mappings(pool).await?;
+    let shifts = read_custody_shifts(pool, &mappings).await?;
+    let metrics = custody_metrics(&shifts, mappings.len())?;
+    let reference_at =
+        DateTime::parse_from_rfc3339(&require_env("CAPSTONE_REFERENCE_DATE")?)?.with_timezone(&Utc);
+    let mapping_firearms = mappings
+        .iter()
+        .map(|mapping| mapping.firearm.id.clone())
+        .collect::<HashSet<_>>();
+    let selected_source_allocations = mappings
+        .iter()
+        .filter_map(|mapping| mapping.firearm.source_allocation_id.clone())
+        .collect::<HashSet<_>>();
+    let source_rows = sqlx::query(
+        r#"
+        SELECT fa.id AS allocation_id, fa.firearm_id, fa.status AS allocation_status, f.status AS firearm_status
+        FROM firearm_allocations fa
+        JOIN firearms f ON f.id = fa.firearm_id
+        WHERE LOWER(BTRIM(fa.status)) = 'active'
+          AND fa.mdr_batch_id IS NOT NULL
+        ORDER BY fa.id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    if source_rows.is_empty() {
+        bail!("No active MDR source allocations are available for controlled reconciliation")
+    }
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO capstone_seed_batches (batch_id, data_origin, reference_at, status, metadata) VALUES ($1, $2, $3, 'running', $4)",
+    )
+    .bind(FIREARM_CUSTODY_BATCH_ID)
+    .bind(FIREARM_CUSTODY_DATA_ORIGIN)
+    .bind(reference_at)
+    .bind(json!({
+        "parentBatchId": BATCH_ID,
+        "historyThrough": "2026-10-16",
+        "derivedFrom": "completed capstone shifts and attendance",
+        "sourceAllocationHandling": "MDR rows remain preserved as imported source records",
+        "generatedBy": "capstone-dataset seed-firearm-custody",
+    }))
+    .execute(&mut *transaction)
+    .await?;
+
+    for row in source_rows {
+        let allocation_id: String = row.try_get("allocation_id")?;
+        let firearm_id: String = row.try_get("firearm_id")?;
+        let classification = if selected_source_allocations.contains(&allocation_id) {
+            "superseded_pairing"
+        } else if mapping_firearms.contains(&firearm_id) {
+            "reassigned_source"
+        } else {
+            "import_source_isolated"
+        };
+        sqlx::query(
+            "INSERT INTO capstone_firearm_custody_reconciliations (batch_id, allocation_id, firearm_id, prior_allocation_status, prior_firearm_status, classification) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(FIREARM_CUSTODY_BATCH_ID)
+        .bind(&allocation_id)
+        .bind(&firearm_id)
+        .bind(row.try_get::<String, _>("allocation_status")?)
+        .bind(row.try_get::<String, _>("firearm_status")?)
+        .bind(classification)
+        .execute(&mut *transaction)
+        .await?;
+    }
+
+    sqlx::query(
+        "UPDATE firearm_allocations SET status = 'imported', updated_at = CURRENT_TIMESTAMP WHERE LOWER(BTRIM(status)) = 'active' AND mdr_batch_id IS NOT NULL",
+    )
+    .execute(&mut *transaction)
+    .await?;
+
+    for mapping in &mappings {
+        sqlx::query(
+            "INSERT INTO capstone_firearm_custody_mappings (batch_id, guard_id, firearm_id, site_id, source_kind, source_allocation_id) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(FIREARM_CUSTODY_BATCH_ID)
+        .bind(&mapping.guard.id)
+        .bind(&mapping.firearm.id)
+        .bind(&mapping.guard.site_id)
+        .bind(&mapping.firearm.source_kind)
+        .bind(&mapping.firearm.source_allocation_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE firearms SET status = 'available', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND LOWER(BTRIM(status)) <> 'maintenance'",
+        )
+        .bind(&mapping.firearm.id)
+        .execute(&mut *transaction)
+        .await?;
+    }
+
+    for shift in &shifts {
+        let issued_at = shift.start
+            - Duration::minutes(custody_minutes(&[&shift.guard_id, &shift.shift_id], 10, 25));
+        let returned_at = shift.check_out
+            + Duration::minutes(custody_minutes(
+                &[&shift.firearm_id, &shift.shift_id],
+                5,
+                25,
+            ));
+        if returned_at <= issued_at {
+            bail!(
+                "Generated firearm custody chronology is invalid for shift {}",
+                shift.shift_id
+            )
+        }
+        let allocation_id = new_id();
+        sqlx::query(
+            r#"
+            INSERT INTO firearm_allocations (
+                id, guard_id, firearm_id, allocation_date, return_date, status, shift_id,
+                source, capstone_batch_id, issued_by_role, received_by_role, notes
+            ) VALUES ($1, $2, $3, $4, $5, 'returned', $6, 'capstone_custody', $7, 'supervisor', 'supervisor', $8)
+            "#,
+        )
+        .bind(&allocation_id)
+        .bind(&shift.guard_id)
+        .bind(&shift.firearm_id)
+        .bind(issued_at)
+        .bind(returned_at)
+        .bind(&shift.shift_id)
+        .bind(FIREARM_CUSTODY_BATCH_ID)
+        .bind("Daily completed-duty firearm custody cycle")
+        .execute(&mut *transaction)
+        .await?;
+        track_batch_transaction(
+            &mut transaction,
+            FIREARM_CUSTODY_BATCH_ID,
+            "firearm_allocations",
+            &allocation_id,
+        )
+        .await?;
+    }
+
+    let audit_id = new_id();
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs (
+            id, actor_user_id, action_key, entity_type, entity_id, result, reason, metadata,
+            source, actor_attribution_mode, capstone_batch_id, seeded_at, scenario_occurred_at
+        ) VALUES ($1, NULL, 'CAPSTONE_FIREARM_CUSTODY_BATCH_CREATED', 'capstone_seed_batch', $2,
+                  'success', $3, $4, 'capstone_seed', 'synthetic_seeded', $2, CURRENT_TIMESTAMP, $5)
+        "#,
+    )
+    .bind(&audit_id)
+    .bind(FIREARM_CUSTODY_BATCH_ID)
+    .bind("Daily firearm custody history was derived from completed duty records without attributing actions to a named user.")
+    .bind(json!({
+        "batchId": FIREARM_CUSTODY_BATCH_ID,
+        "mappedGuards": metrics.mapped_guards,
+        "custodyCycles": metrics.created_cycles,
+        "dataOrigin": FIREARM_CUSTODY_DATA_ORIGIN,
+    }))
+    .bind(reference_at)
+    .execute(&mut *transaction)
+    .await?;
+    track_batch_transaction(
+        &mut transaction,
+        FIREARM_CUSTODY_BATCH_ID,
+        "audit_logs",
+        &audit_id,
+    )
+    .await?;
+
+    sqlx::query(
+        "UPDATE capstone_seed_batches SET status = 'complete', completed_at = CURRENT_TIMESTAMP WHERE batch_id = $1",
+    )
+    .bind(FIREARM_CUSTODY_BATCH_ID)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    print_custody_mappings(&mappings);
+    println!(
+        "FIREARM CUSTODY SEEDED: cycles={}, day={}, evening={}, night={}, sunday={}",
+        metrics.created_cycles,
+        metrics.day_cycles,
+        metrics.evening_cycles,
+        metrics.night_cycles,
+        metrics.sunday_cycles,
+    );
+    Ok(())
+}
+
+async fn validate_firearm_custody(pool: &PgPool) -> Result<()> {
+    ensure_firearm_custody_schema(pool).await?;
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM capstone_seed_batches WHERE batch_id = $1")
+            .bind(FIREARM_CUSTODY_BATCH_ID)
+            .fetch_optional(pool)
+            .await?;
+    let Some(status) = status else {
+        println!("FIREARM CUSTODY VALIDATION: no firearm custody batch is present.");
+        return Ok(());
+    };
+    if status != "complete" {
+        bail!("Firearm custody batch is not complete")
+    }
+    let reference_at =
+        DateTime::parse_from_rfc3339(&require_env("CAPSTONE_REFERENCE_DATE")?)?.with_timezone(&Utc);
+    let checks = [
+        ("mapping_guard_count", "SELECT COUNT(*)::BIGINT FROM capstone_firearm_custody_mappings WHERE batch_id = $1", 55_i64),
+        ("mapping_duplicate_firearms", "SELECT COUNT(*)::BIGINT FROM (SELECT firearm_id FROM capstone_firearm_custody_mappings WHERE batch_id = $1 GROUP BY firearm_id HAVING COUNT(*) > 1) duplicate", 0_i64),
+        ("completed_cycles_without_completed_duty", "SELECT COUNT(*)::BIGINT FROM firearm_allocations fa LEFT JOIN attendance a ON a.shift_id = fa.shift_id AND a.guard_id = fa.guard_id AND LOWER(BTRIM(a.status)) = 'completed' LEFT JOIN capstone_seed_records attendance_records ON attendance_records.batch_id = 'capstone-live-october-2026' AND attendance_records.table_name = 'attendance' AND attendance_records.record_id = a.id WHERE fa.capstone_batch_id = $1 AND a.id IS NULL", 0_i64),
+        ("invalid_chronology", "SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE capstone_batch_id = $1 AND (return_date IS NULL OR return_date <= allocation_date OR LOWER(BTRIM(status)) <> 'returned')", 0_i64),
+        ("invalid_issue_window", "SELECT COUNT(*)::BIGINT FROM firearm_allocations fa JOIN shifts s ON s.id = fa.shift_id WHERE fa.capstone_batch_id = $1 AND (s.start_time - fa.allocation_date < INTERVAL '10 minutes' OR s.start_time - fa.allocation_date > INTERVAL '25 minutes')", 0_i64),
+        ("invalid_return_window", "SELECT COUNT(*)::BIGINT FROM firearm_allocations fa JOIN attendance a ON a.shift_id = fa.shift_id AND a.guard_id = fa.guard_id WHERE fa.capstone_batch_id = $1 AND (fa.return_date - a.check_out_time < INTERVAL '5 minutes' OR fa.return_date - a.check_out_time > INTERVAL '25 minutes')", 0_i64),
+        ("firearm_overlap", "SELECT COUNT(*)::BIGINT FROM firearm_allocations first_row JOIN firearm_allocations second_row ON second_row.capstone_batch_id = first_row.capstone_batch_id AND second_row.firearm_id = first_row.firearm_id AND second_row.id > first_row.id AND second_row.allocation_date < first_row.return_date AND second_row.return_date > first_row.allocation_date WHERE first_row.capstone_batch_id = $1", 0_i64),
+        ("guard_overlap", "SELECT COUNT(*)::BIGINT FROM firearm_allocations first_row JOIN firearm_allocations second_row ON second_row.capstone_batch_id = first_row.capstone_batch_id AND second_row.guard_id = first_row.guard_id AND second_row.id > first_row.id AND second_row.allocation_date < first_row.return_date AND second_row.return_date > first_row.allocation_date WHERE first_row.capstone_batch_id = $1", 0_i64),
+        ("future_completed_rows", "SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE capstone_batch_id = $1 AND return_date >= $2", 0_i64),
+        ("maintenance_firearms_used", "SELECT COUNT(*)::BIGINT FROM firearm_allocations fa JOIN firearms f ON f.id = fa.firearm_id WHERE fa.capstone_batch_id = $1 AND LOWER(BTRIM(f.status)) = 'maintenance'", 0_i64),
+        ("custody_review_firearms_used", "SELECT COUNT(*)::BIGINT FROM capstone_firearm_custody_mappings WHERE batch_id = $1 AND source_kind = 'custody_review'", 0_i64),
+        ("active_generated_rows", "SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE capstone_batch_id = $1 AND LOWER(BTRIM(status)) = 'active'", 0_i64),
+    ];
+    for (label, query, expected) in checks {
+        let actual: i64 = if query.contains("$2") {
+            sqlx::query_scalar(query)
+                .bind(FIREARM_CUSTODY_BATCH_ID)
+                .bind(reference_at)
+                .fetch_one(pool)
+                .await?
+        } else {
+            sqlx::query_scalar(query)
+                .bind(FIREARM_CUSTODY_BATCH_ID)
+                .fetch_one(pool)
+                .await?
+        };
+        if actual != expected {
+            bail!("Firearm custody validation failed: {label}={actual}, expected {expected}")
+        }
+    }
+    let cycle_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE capstone_batch_id = $1",
+    )
+    .bind(FIREARM_CUSTODY_BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    let expected_cycles: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM attendance a JOIN capstone_seed_records records ON records.batch_id = $1 AND records.table_name = 'attendance' AND records.record_id = a.id JOIN shifts s ON s.id = a.shift_id WHERE LOWER(BTRIM(a.status)) = 'completed' AND a.check_out_time IS NOT NULL AND s.start_time >= $2 AND s.start_time < $3",
+    )
+    .bind(BATCH_ID)
+    .bind(manila_time(1, 0, 0)?)
+    .bind(manila_time(PLANNED_DAY, 0, 0)?)
+    .fetch_one(pool)
+    .await?;
+    if cycle_count != expected_cycles {
+        bail!("Firearm custody validation expected {expected_cycles} daily cycles, found {cycle_count}")
+    }
+    println!("FIREARM CUSTODY VALIDATION: mappings=55, cycles={cycle_count}, completed_returned={cycle_count}, active=0, overlap_violations=0, chronology_violations=0, future_completed=0, maintenance_used=0, custody_review_used=0");
+    Ok(())
+}
+
+async fn firearm_custody_status(pool: &PgPool) -> Result<()> {
+    ensure_firearm_custody_schema(pool).await?;
+    let batch_present = print_batch_status(pool, FIREARM_CUSTODY_BATCH_ID).await?;
+    if !batch_present {
+        println!("No firearm custody batch is present.");
+        return Ok(());
+    }
+    let row = sqlx::query(
+        r#"
+        SELECT
+            (SELECT COUNT(*)::BIGINT FROM capstone_firearm_custody_mappings WHERE batch_id = $1) AS mappings,
+            (SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE capstone_batch_id = $1) AS cycles,
+            (SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE capstone_batch_id = $1 AND LOWER(BTRIM(status)) = 'returned') AS returned,
+            (SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE capstone_batch_id = $1 AND LOWER(BTRIM(status)) = 'active') AS active
+        "#,
+    )
+    .bind(FIREARM_CUSTODY_BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    println!(
+        "FIREARM CUSTODY STATUS: mappings={}, cycles={}, returned={}, active={}",
+        row.try_get::<i64, _>("mappings")?,
+        row.try_get::<i64, _>("cycles")?,
+        row.try_get::<i64, _>("returned")?,
+        row.try_get::<i64, _>("active")?,
+    );
+    Ok(())
+}
+
 async fn verify_protected_superadmin(pool: &PgPool) -> Result<()> {
     let protected_id = require_env("CAPSTONE_PROTECTED_SUPERADMIN_ID")?;
     let is_protected: bool = sqlx::query_scalar(
@@ -3183,6 +4076,447 @@ async fn preflight(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+const FLEET_BANKS: [(&str, &str); 5] = [
+    ("RCBC Tagum", "Pioneer Avenue"),
+    ("RCBC Panabo", "Davao-Agusan National Highway"),
+    ("BPI Direct Banko Kapalong", "Quezon Street"),
+    ("BPI Direct Banko Nabunturan", "L Evangelio Avenue"),
+    ("BPI Direct Banko Tagum Branch", "Dalisay Gante Road"),
+];
+
+fn normalize_site_match(value: &str) -> String {
+    value
+        .to_ascii_lowercase()
+        .replace("avenue", "ave")
+        .replace("national", "nat")
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect()
+}
+
+fn fleet_operating_days() -> Vec<u32> {
+    (1..=PLANNED_DAY)
+        .filter(|day| {
+            manila_time(*day, 12, 0)
+                .map(|time| {
+                    time.with_timezone(
+                        &FixedOffset::east_opt(MANILA_OFFSET_SECONDS).expect("valid offset"),
+                    )
+                    .weekday()
+                        != Weekday::Sun
+                })
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn fleet_trip_plan(car_id: &str, vehicle_index: usize, day: u32) -> Result<FleetTripPlan> {
+    // The small deterministic variation avoids implausibly identical timestamps without
+    // inventing any downstream bank-controlled route, stops, distance, or coordinates.
+    let dispatch_minute = 15 + ((vehicle_index * 5 + day as usize * 3) % 28) as u32;
+    let bank_arrival_minute = dispatch_minute + 25 + ((vehicle_index + day as usize) % 6) as u32;
+    let return_departure_minute = (vehicle_index * 4 + day as usize * 2) % 21;
+    let return_arrival_minute =
+        return_departure_minute + 26 + ((vehicle_index * 3 + day as usize) % 14);
+    let start_time = manila_time(day, 8, dispatch_minute)?;
+    Ok(FleetTripPlan {
+        car_id: car_id.to_string(),
+        start_time,
+        bank_arrival: start_time
+            + Duration::minutes((bank_arrival_minute - dispatch_minute) as i64),
+        return_departure: manila_time(day, 16, return_departure_minute as u32)?,
+        end_time: manila_time(day, 16, return_arrival_minute as u32)?,
+    })
+}
+
+fn fleet_time_label(time: DateTime<Utc>) -> String {
+    let offset = FixedOffset::east_opt(MANILA_OFFSET_SECONDS).expect("valid offset");
+    time.with_timezone(&offset)
+        .format("%b %-d, %Y %-I:%M %p PHT")
+        .to_string()
+}
+
+async fn read_fleet_counts(pool: &PgPool) -> Result<FleetCounts> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            (SELECT COUNT(*)::BIGINT FROM armored_cars) AS total_vehicles,
+            (SELECT COUNT(*)::BIGINT FROM armored_cars WHERE status = 'available') AS available,
+            (SELECT COUNT(*)::BIGINT FROM armored_cars WHERE status = 'allocated') AS allocated,
+            (SELECT COUNT(*)::BIGINT FROM armored_cars WHERE status = 'maintenance') AS maintenance,
+            (SELECT COUNT(*)::BIGINT FROM trips WHERE status IN ('in_transit', 'active')) AS active_trips,
+            (SELECT COUNT(*)::BIGINT FROM trips) AS trip_history_records,
+            (SELECT COUNT(*)::BIGINT FROM capstone_seed_records WHERE batch_id = $1 AND table_name = 'shifts') AS capstone_shifts,
+            (SELECT COUNT(DISTINCT guard_id)::BIGINT FROM shifts WHERE id IN (SELECT record_id FROM capstone_seed_records WHERE batch_id = $1 AND table_name = 'shifts')) AS capstone_guards,
+            (SELECT COUNT(*)::BIGINT FROM firearms) AS firearms
+        "#,
+    )
+    .bind(BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    Ok(FleetCounts {
+        total_vehicles: row.try_get("total_vehicles")?,
+        available: row.try_get("available")?,
+        allocated: row.try_get("allocated")?,
+        maintenance: row.try_get("maintenance")?,
+        active_trips: row.try_get("active_trips")?,
+        trip_history_records: row.try_get("trip_history_records")?,
+        capstone_shifts: row.try_get("capstone_shifts")?,
+        capstone_guards: row.try_get("capstone_guards")?,
+        firearms: row.try_get("firearms")?,
+    })
+}
+
+async fn read_fleet_context(pool: &PgPool) -> Result<Vec<FleetVehicleContext>> {
+    let vehicles = sqlx::query(
+        "SELECT id, license_plate, COALESCE(plate_number, license_plate) AS plate, status FROM armored_cars ORDER BY COALESCE(NULLIF(plate_number, ''), license_plate), license_plate",
+    )
+    .fetch_all(pool)
+    .await?;
+    if vehicles.len() != FLEET_BANKS.len() {
+        bail!(
+            "Fleet enrichment requires exactly {} existing armored vehicles; found {}",
+            FLEET_BANKS.len(),
+            vehicles.len()
+        )
+    }
+
+    let sites = sqlx::query("SELECT id, name, COALESCE(address, '') AS address FROM client_sites WHERE is_active = true")
+        .fetch_all(pool)
+        .await?;
+    let mut selected_sites = Vec::with_capacity(FLEET_BANKS.len());
+    for (bank_name, address_fragment) in FLEET_BANKS {
+        let matches = sites
+            .iter()
+            .filter(|site| {
+                let name: String = site.try_get("name").unwrap_or_default();
+                let address: String = site.try_get("address").unwrap_or_default();
+                normalize_site_match(&name).contains(&normalize_site_match(bank_name))
+                    && normalize_site_match(&address)
+                        .contains(&normalize_site_match(address_fragment))
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            bail!("Fleet enrichment requires exactly one active site matching '{bank_name}' at '{address_fragment}'; found {}", matches.len())
+        }
+        selected_sites.push((
+            matches[0].try_get::<String, _>("id")?,
+            matches[0].try_get::<String, _>("name")?,
+        ));
+    }
+
+    let driver_rows = sqlx::query(
+        r#"
+        SELECT da.car_id, da.guard_id, u.full_name
+        FROM driver_assignments da
+        JOIN users u ON u.id = da.guard_id
+        WHERE da.status = 'active' AND da.end_date IS NULL
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let allocation_rows = sqlx::query(
+        "SELECT id, car_id, client_id FROM car_allocations WHERE status = 'active' AND return_date IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut contexts = Vec::with_capacity(FLEET_BANKS.len());
+    for (index, vehicle) in vehicles.iter().enumerate() {
+        let car_id: String = vehicle.try_get("id")?;
+        let driver_matches = driver_rows
+            .iter()
+            .filter(|row| {
+                row.try_get::<String, _>("car_id").ok().as_deref() == Some(car_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        if driver_matches.len() != 1 {
+            bail!(
+                "Vehicle {} must have exactly one active assigned driver; found {}",
+                vehicle.try_get::<String, _>("license_plate")?,
+                driver_matches.len()
+            )
+        }
+        let allocation_matches = allocation_rows
+            .iter()
+            .filter(|row| {
+                row.try_get::<String, _>("car_id").ok().as_deref() == Some(car_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        if allocation_matches.len() > 1 {
+            bail!(
+                "Vehicle {} has multiple active allocations",
+                vehicle.try_get::<String, _>("license_plate")?
+            )
+        }
+        let (client_id, client_name) = selected_sites[index].clone();
+        if let Some(allocation) = allocation_matches.first() {
+            let existing_client: String = allocation.try_get("client_id")?;
+            if existing_client != client_id {
+                bail!("Vehicle {} already has an active allocation to a different client; resolve it before fleet enrichment", vehicle.try_get::<String, _>("license_plate")?)
+            }
+        }
+        contexts.push(FleetVehicleContext {
+            car_id,
+            vehicle: vehicle.try_get("license_plate")?,
+            plate: vehicle.try_get("plate")?,
+            current_status: vehicle.try_get("status")?,
+            driver_id: driver_matches[0].try_get("guard_id")?,
+            driver_name: driver_matches[0].try_get("full_name")?,
+            client_id,
+            client_name,
+            allocation_id: allocation_matches
+                .first()
+                .map(|allocation| allocation.try_get("id"))
+                .transpose()?,
+        });
+    }
+    Ok(contexts)
+}
+
+fn print_fleet_counts(label: &str, counts: &FleetCounts) {
+    println!("{label} FLEET COUNTS: total_vehicles={}, available={}, allocated={}, maintenance={}, active_trips={}, trip_history_records={}, capstone_shifts={}, capstone_guards={}, firearms={}", counts.total_vehicles, counts.available, counts.allocated, counts.maintenance, counts.active_trips, counts.trip_history_records, counts.capstone_shifts, counts.capstone_guards, counts.firearms);
+}
+
+fn print_fleet_plan(contexts: &[FleetVehicleContext], counts: &FleetCounts) -> Result<()> {
+    let days = fleet_operating_days();
+    if days.len() != 15 || days.iter().any(|day| matches!(day, 4 | 11)) {
+        bail!("Fleet operating-day plan must contain 15 Monday-Saturday days and no Sundays")
+    }
+    println!("VEHICLE | PLATE | DRIVER | PRIMARY BANK");
+    for context in contexts {
+        println!(
+            "{} | {} | {} | {}",
+            context.vehicle, context.plate, context.driver_name, context.client_name
+        );
+    }
+    println!("FLEET PREFLIGHT: operating_days={:?}, daily_trip_records={}, morning_dispatches={}, returns={}, route=DASIA Base -> assigned bank -> DASIA Base, bank_controlled_downstream_route=not recorded", days, contexts.len() * days.len(), contexts.len() * days.len(), contexts.len() * days.len());
+    print_fleet_counts("BEFORE", counts);
+    Ok(())
+}
+
+async fn fleet_preflight(pool: &PgPool) -> Result<(Vec<FleetVehicleContext>, FleetCounts)> {
+    ensure_ledger(pool).await?;
+    let contexts = read_fleet_context(pool).await?;
+    let counts = read_fleet_counts(pool).await?;
+    print_fleet_plan(&contexts, &counts)?;
+    Ok((contexts, counts))
+}
+
+async fn reset_fleet_enrichment(pool: &PgPool) -> Result<()> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM capstone_seed_batches WHERE batch_id = $1)",
+    )
+    .bind(FLEET_ENRICHMENT_BATCH_ID)
+    .fetch_one(pool)
+    .await?;
+    if !exists {
+        return Ok(());
+    }
+    sqlx::query("DELETE FROM trips WHERE id IN (SELECT record_id FROM capstone_seed_records WHERE batch_id = $1 AND table_name = 'trips')")
+        .bind(FLEET_ENRICHMENT_BATCH_ID)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM car_allocations WHERE id IN (SELECT record_id FROM capstone_seed_records WHERE batch_id = $1 AND table_name = 'car_allocations')")
+        .bind(FLEET_ENRICHMENT_BATCH_ID)
+        .execute(pool)
+        .await?;
+    // Restore only the status that this batch applied; later operational updates win.
+    sqlx::query(
+        r#"
+        UPDATE armored_cars car
+        SET status = state.previous_status, updated_at = CURRENT_TIMESTAMP
+        FROM capstone_fleet_vehicle_state state
+        WHERE state.batch_id = $1 AND state.car_id = car.id AND car.status = state.applied_status
+        "#,
+    )
+    .bind(FLEET_ENRICHMENT_BATCH_ID)
+    .execute(pool)
+    .await?;
+    sqlx::query("DELETE FROM capstone_fleet_vehicle_state WHERE batch_id = $1")
+        .bind(FLEET_ENRICHMENT_BATCH_ID)
+        .execute(pool)
+        .await?;
+    reset_tracked_batch(pool, FLEET_ENRICHMENT_BATCH_ID).await
+}
+
+async fn enrich_fleet(pool: &PgPool) -> Result<()> {
+    ensure_ledger(pool).await?;
+    let existing_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM capstone_seed_batches WHERE batch_id = $1")
+            .bind(FLEET_ENRICHMENT_BATCH_ID)
+            .fetch_optional(pool)
+            .await?;
+    if existing_status.as_deref() == Some("complete") {
+        validate_fleet_enrichment(pool).await?;
+        println!("Fleet enrichment batch is already complete; no records were duplicated.");
+        return Ok(());
+    }
+    if existing_status.is_some() {
+        reset_fleet_enrichment(pool).await?;
+    }
+    let (contexts, before) = fleet_preflight(pool).await?;
+    let reference_at =
+        DateTime::parse_from_rfc3339(&require_env("CAPSTONE_REFERENCE_DATE")?)?.with_timezone(&Utc);
+    sqlx::query("CREATE TABLE IF NOT EXISTS capstone_fleet_vehicle_state (batch_id VARCHAR(80) NOT NULL, car_id VARCHAR(36) NOT NULL, previous_status VARCHAR(32) NOT NULL, applied_status VARCHAR(32) NOT NULL, PRIMARY KEY (batch_id, car_id))")
+        .execute(pool)
+        .await?;
+    sqlx::query("INSERT INTO capstone_seed_batches (batch_id, data_origin, reference_at, status, metadata) VALUES ($1, $2, $3, 'running', $4)")
+        .bind(FLEET_ENRICHMENT_BATCH_ID)
+        .bind(FLEET_ENRICHMENT_DATA_ORIGIN)
+        .bind(reference_at)
+        .bind(json!({
+            "parentBatchId": BATCH_ID,
+            "presentationContext": true,
+            "generatedBy": "capstone-dataset enrich-fleet",
+            "operatingDays": fleet_operating_days(),
+            "knownRoute": "DASIA Base -> assigned bank -> DASIA Base",
+            "bankControlledRoute": "not recorded",
+            "before": { "totalVehicles": before.total_vehicles, "available": before.available, "allocated": before.allocated, "maintenance": before.maintenance, "activeTrips": before.active_trips, "tripHistoryRecords": before.trip_history_records, "capstoneShifts": before.capstone_shifts, "capstoneGuards": before.capstone_guards, "firearms": before.firearms },
+            "vehicleMappings": contexts.iter().map(|context| json!({"carId": context.car_id, "vehicle": context.vehicle, "plate": context.plate, "driverId": context.driver_id, "driver": context.driver_name, "clientId": context.client_id, "primaryBank": context.client_name})).collect::<Vec<_>>()
+        }))
+        .execute(pool)
+        .await?;
+    for context in &contexts {
+        let allocation_id = match &context.allocation_id {
+            Some(id) => id.clone(),
+            None => {
+                let id = new_id();
+                sqlx::query("INSERT INTO car_allocations (id, car_id, client_id, allocation_date, notes, status) VALUES ($1, $2, $3, $4, $5, 'active')")
+                    .bind(&id)
+                    .bind(&context.car_id)
+                    .bind(&context.client_id)
+                    .bind(manila_time(1, 8, 0)?)
+                    .bind("Primary bank assignment for capstone presentation fleet enrichment. Bank-controlled operating route is not recorded by DASIA.")
+                    .execute(pool)
+                    .await?;
+                track_batch(pool, FLEET_ENRICHMENT_BATCH_ID, "car_allocations", &id).await?;
+                sqlx::query("INSERT INTO capstone_fleet_vehicle_state (batch_id, car_id, previous_status, applied_status) VALUES ($1, $2, $3, 'allocated')")
+                    .bind(FLEET_ENRICHMENT_BATCH_ID)
+                    .bind(&context.car_id)
+                    .bind(&context.current_status)
+                    .execute(pool)
+                    .await?;
+                sqlx::query("UPDATE armored_cars SET status = 'allocated', updated_at = CURRENT_TIMESTAMP WHERE id = $1")
+                    .bind(&context.car_id)
+                    .execute(pool)
+                    .await?;
+                id
+            }
+        };
+        if context.current_status != "allocated" {
+            sqlx::query("INSERT INTO capstone_fleet_vehicle_state (batch_id, car_id, previous_status, applied_status) VALUES ($1, $2, $3, 'allocated') ON CONFLICT (batch_id, car_id) DO NOTHING")
+                .bind(FLEET_ENRICHMENT_BATCH_ID)
+                .bind(&context.car_id)
+                .bind(&context.current_status)
+                .execute(pool)
+                .await?;
+            sqlx::query("UPDATE armored_cars SET status = 'allocated', updated_at = CURRENT_TIMESTAMP WHERE id = $1")
+                .bind(&context.car_id)
+                .execute(pool)
+                .await?;
+        }
+        for day in fleet_operating_days() {
+            let plan = fleet_trip_plan(
+                &context.car_id,
+                contexts
+                    .iter()
+                    .position(|candidate| candidate.car_id == context.car_id)
+                    .unwrap_or_default(),
+                day,
+            )?;
+            if plan.end_time > reference_at {
+                bail!("Fleet trip plan would mark a future trip completed")
+            }
+            let trip_id = new_id();
+            let mission_details = format!("Assigned bank: {}. Morning dispatch arrived at the assigned bank at {}. Bank-controlled operating route is not recorded by DASIA. Return to DASIA Base departed at {} and completed at {}.", context.client_name, fleet_time_label(plan.bank_arrival), fleet_time_label(plan.return_departure), fleet_time_label(plan.end_time));
+            sqlx::query("INSERT INTO trips (id, car_id, driver_id, allocation_id, start_location, end_location, start_time, end_time, status, mission_details) VALUES ($1, $2, $3, $4, 'DASIA Base', 'DASIA Base', $5, $6, 'completed', $7)")
+                .bind(&trip_id)
+                .bind(&plan.car_id)
+                .bind(&context.driver_id)
+                .bind(&allocation_id)
+                .bind(plan.start_time)
+                .bind(plan.end_time)
+                .bind(mission_details)
+                .execute(pool)
+                .await?;
+            track_batch(pool, FLEET_ENRICHMENT_BATCH_ID, "trips", &trip_id).await?;
+        }
+    }
+    let audit_id = new_id();
+    sqlx::query("INSERT INTO audit_logs (id, actor_user_id, action_key, entity_type, entity_id, result, reason, source_ip, user_agent, metadata, created_at) VALUES ($1, NULL, 'CAPSTONE_FLEET_ENRICHED', 'capstone_seed_batch', $2, 'success', $3, NULL, 'SENTINEL CAPSTONE FLEET ENRICHER', $4, $5)")
+        .bind(&audit_id)
+        .bind(FLEET_ENRICHMENT_BATCH_ID)
+        .bind("Armored fleet history added for assigned banks. Bank-controlled downstream route details were not recorded.")
+        .bind(json!({"data_origin": FLEET_ENRICHMENT_DATA_ORIGIN, "batch_id": FLEET_ENRICHMENT_BATCH_ID, "daily_trip_records": 75, "morning_dispatches": 75, "returns": 75}))
+        .bind(Utc::now())
+        .execute(pool)
+        .await?;
+    track_batch(pool, FLEET_ENRICHMENT_BATCH_ID, "audit_logs", &audit_id).await?;
+    sqlx::query("UPDATE capstone_seed_batches SET status = 'complete', completed_at = CURRENT_TIMESTAMP WHERE batch_id = $1")
+        .bind(FLEET_ENRICHMENT_BATCH_ID)
+        .execute(pool)
+        .await?;
+    validate_fleet_enrichment(pool).await?;
+    print_fleet_counts("AFTER", &read_fleet_counts(pool).await?);
+    Ok(())
+}
+
+async fn validate_fleet_enrichment(pool: &PgPool) -> Result<()> {
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM capstone_seed_batches WHERE batch_id = $1")
+            .bind(FLEET_ENRICHMENT_BATCH_ID)
+            .fetch_optional(pool)
+            .await?;
+    if status.is_none() {
+        println!("FLEET VALIDATION: no fleet enrichment batch is present.");
+        return Ok(());
+    }
+    if status.as_deref() != Some("complete") {
+        bail!("Fleet enrichment batch is not complete")
+    }
+    let expected_records = (fleet_operating_days().len() * FLEET_BANKS.len()) as i64;
+    let violations = sqlx::query(
+        r#"
+        SELECT
+          (SELECT COUNT(*)::BIGINT FROM capstone_seed_records WHERE batch_id = $1 AND table_name = 'trips') AS tracked_trips,
+          (SELECT COUNT(DISTINCT trips.car_id)::BIGINT FROM trips JOIN capstone_seed_records records ON records.batch_id = $1 AND records.table_name = 'trips' AND records.record_id = trips.id) AS trip_vehicles,
+          (SELECT COUNT(*)::BIGINT FROM trips JOIN capstone_seed_records records ON records.batch_id = $1 AND records.table_name = 'trips' AND records.record_id = trips.id WHERE EXTRACT(DOW FROM trips.start_time AT TIME ZONE 'Asia/Manila') = 0) AS sunday_trips,
+          (SELECT COUNT(*)::BIGINT FROM trips JOIN capstone_seed_records records ON records.batch_id = $1 AND records.table_name = 'trips' AND records.record_id = trips.id WHERE trips.status <> 'completed' OR trips.end_time IS NULL OR trips.end_time <= trips.start_time OR trips.start_location <> 'DASIA Base' OR trips.end_location <> 'DASIA Base' OR trips.mission_details NOT LIKE '%Bank-controlled operating route is not recorded by DASIA.%') AS invalid_trips,
+          (SELECT COUNT(*)::BIGINT FROM trips first_trip JOIN capstone_seed_records first_record ON first_record.batch_id = $1 AND first_record.table_name = 'trips' AND first_record.record_id = first_trip.id JOIN trips second_trip ON second_trip.car_id = first_trip.car_id AND second_trip.id > first_trip.id AND second_trip.start_time < first_trip.end_time AND second_trip.end_time > first_trip.start_time JOIN capstone_seed_records second_record ON second_record.batch_id = $1 AND second_record.table_name = 'trips' AND second_record.record_id = second_trip.id) AS overlap_violations,
+          (SELECT COUNT(*)::BIGINT FROM trips JOIN capstone_seed_records records ON records.batch_id = $1 AND records.table_name = 'trips' AND records.record_id = trips.id WHERE trips.end_time > $2) AS future_completed,
+          (SELECT COUNT(*)::BIGINT FROM car_allocations WHERE status = 'active' AND return_date IS NULL AND car_id IN (SELECT DISTINCT trips.car_id FROM trips JOIN capstone_seed_records records ON records.batch_id = $1 AND records.table_name = 'trips' AND records.record_id = trips.id)) AS active_allocations
+        "#,
+    )
+    .bind(FLEET_ENRICHMENT_BATCH_ID)
+    .bind(DateTime::parse_from_rfc3339(&require_env("CAPSTONE_REFERENCE_DATE")?)?.with_timezone(&Utc))
+    .fetch_one(pool)
+    .await?;
+    let tracked_trips: i64 = violations.try_get("tracked_trips")?;
+    let trip_vehicles: i64 = violations.try_get("trip_vehicles")?;
+    let sunday_trips: i64 = violations.try_get("sunday_trips")?;
+    let invalid_trips: i64 = violations.try_get("invalid_trips")?;
+    let overlap_violations: i64 = violations.try_get("overlap_violations")?;
+    let future_completed: i64 = violations.try_get("future_completed")?;
+    let active_allocations: i64 = violations.try_get("active_allocations")?;
+    if tracked_trips != expected_records
+        || trip_vehicles != 5
+        || sunday_trips != 0
+        || invalid_trips != 0
+        || overlap_violations != 0
+        || future_completed != 0
+        || active_allocations != 5
+    {
+        bail!("Fleet validation failed: trips={tracked_trips}/{expected_records}, vehicles={trip_vehicles}, sunday={sunday_trips}, invalid={invalid_trips}, overlaps={overlap_violations}, future_completed={future_completed}, active_allocations={active_allocations}")
+    }
+    let counts = read_fleet_counts(pool).await?;
+    if counts.capstone_shifts != 564 || counts.capstone_guards != 55 || counts.firearms != 110 {
+        bail!("Fleet enrichment changed protected capstone baseline counts")
+    }
+    println!("FLEET VALIDATION: trips={tracked_trips}, vehicles={trip_vehicles}, sunday_trips=0, overlap_violations=0, future_completed=0, active_allocations=5, capstone_shifts=564, capstone_guards=55, firearms=110");
+    Ok(())
+}
+
 async fn validate(pool: &PgPool) -> Result<()> {
     validate_schedule_integrity(pool).await?;
     let future_attendance: i64 = sqlx::query_scalar(
@@ -3221,6 +4555,254 @@ async fn validate(pool: &PgPool) -> Result<()> {
         println!("ENRICHMENT VALIDATION: causal timestamps and completed-shift tracking points are valid.");
     }
     validate_audit_activity(pool).await?;
+    validate_fleet_enrichment(pool).await?;
+    validate_firearm_custody(pool).await?;
+    Ok(())
+}
+
+async fn print_consistency_count(pool: &PgPool, check: &str, query: &str) -> Result<()> {
+    let count: i64 = sqlx::query_scalar(query)
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("Consistency check failed: {check}"))?;
+    println!("CONSISTENCY|{check}|{count}");
+    Ok(())
+}
+
+async fn print_consistency_distribution(pool: &PgPool, check: &str, query: &str) -> Result<()> {
+    let rows = sqlx::query(query)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("Consistency distribution failed: {check}"))?;
+    for row in rows {
+        let value: String = row.try_get("value")?;
+        let count: i64 = row.try_get("count")?;
+        println!("DISTRIBUTION|{check}|{value}|{count}");
+    }
+    Ok(())
+}
+
+// This command is deliberately read-only. It is intended for the presentation
+// dataset audit and gives stable, machine-readable reconciliation evidence.
+async fn consistency_audit(pool: &PgPool) -> Result<()> {
+    println!("CONSISTENCY_AUDIT|mode|read_only");
+
+    for (check, query) in [
+        ("users.total", "SELECT COUNT(*)::BIGINT FROM users"),
+        ("users.active", "SELECT COUNT(*)::BIGINT FROM users WHERE COALESCE(LOWER(BTRIM(status)), 'active') = 'active'"),
+        ("users.inactive", "SELECT COUNT(*)::BIGINT FROM users WHERE COALESCE(LOWER(BTRIM(status)), 'active') <> 'active'"),
+        ("users.duplicate_guard_codes", "SELECT COUNT(*)::BIGINT FROM (SELECT guard_code FROM users WHERE NULLIF(BTRIM(COALESCE(guard_code, '')), '') IS NOT NULL GROUP BY guard_code HAVING COUNT(*) > 1) duplicates"),
+        ("firearms.total", "SELECT COUNT(*)::BIGINT FROM firearms"),
+        ("firearms.available", "SELECT COUNT(*)::BIGINT FROM firearms WHERE LOWER(BTRIM(status)) = 'available'"),
+        ("firearms.allocated", "SELECT COUNT(*)::BIGINT FROM firearms WHERE LOWER(BTRIM(status)) IN ('allocated', 'deployed')"),
+        ("firearms.active_custody", "SELECT COUNT(*)::BIGINT FROM firearms f WHERE EXISTS (SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active')"),
+        ("firearms.custody_review", "SELECT COUNT(*)::BIGINT FROM firearms f WHERE LOWER(BTRIM(f.status)) IN ('allocated', 'deployed') AND NOT EXISTS (SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active')"),
+        ("firearms.issued_without_active_custody", "SELECT COUNT(*)::BIGINT FROM firearms f WHERE LOWER(BTRIM(f.status)) IN ('allocated', 'deployed') AND NOT EXISTS (SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active')"),
+        ("firearms.issued_without_active_custody_mdr_linked", "SELECT COUNT(*)::BIGINT FROM firearms f WHERE LOWER(BTRIM(f.status)) IN ('allocated', 'deployed') AND f.mdr_batch_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active')"),
+        ("firearms.maintenance", "SELECT COUNT(*)::BIGINT FROM firearms WHERE LOWER(BTRIM(status)) = 'maintenance'"),
+        ("firearms.unknown_status", "SELECT COUNT(*)::BIGINT FROM firearms WHERE LOWER(BTRIM(status)) NOT IN ('available', 'allocated', 'deployed', 'maintenance')"),
+        ("firearms.duplicate_serials", "SELECT COUNT(*)::BIGINT FROM (SELECT serial_number FROM firearms GROUP BY serial_number HAVING COUNT(*) > 1) duplicates"),
+        ("firearms.inventory_state_equation_gap", "SELECT COUNT(*)::BIGINT FROM firearms WHERE LOWER(BTRIM(status)) NOT IN ('available', 'allocated', 'deployed', 'maintenance')"),
+        ("firearms.custody_classification_gap", "SELECT COUNT(*)::BIGINT FROM firearms f WHERE NOT (LOWER(BTRIM(f.status)) IN ('available', 'maintenance') OR EXISTS (SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active') OR (LOWER(BTRIM(f.status)) IN ('allocated', 'deployed') AND NOT EXISTS (SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active')))"),
+        ("allocations.total", "SELECT COUNT(*)::BIGINT FROM firearm_allocations"),
+        ("allocations.active", "SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'active'"),
+        ("allocations.returned", "SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'returned'"),
+        ("allocations.unique_active_guards", "SELECT COUNT(DISTINCT guard_id)::BIGINT FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'active'"),
+        ("allocations.duplicate_active_firearms", "SELECT COUNT(*)::BIGINT FROM (SELECT firearm_id FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'active' GROUP BY firearm_id HAVING COUNT(*) > 1) duplicates"),
+        ("allocations.guards_with_multiple_active", "SELECT COUNT(*)::BIGINT FROM (SELECT guard_id FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'active' GROUP BY guard_id HAVING COUNT(*) > 1) duplicates"),
+        ("allocations.active_firearm_status_mismatch", "SELECT COUNT(*)::BIGINT FROM firearm_allocations fa JOIN firearms f ON f.id = fa.firearm_id WHERE LOWER(BTRIM(fa.status)) = 'active' AND LOWER(BTRIM(f.status)) NOT IN ('allocated', 'deployed')"),
+        ("allocations.active_on_maintenance", "SELECT COUNT(*)::BIGINT FROM firearm_allocations fa JOIN firearms f ON f.id = fa.firearm_id WHERE LOWER(BTRIM(fa.status)) = 'active' AND LOWER(BTRIM(f.status)) = 'maintenance'"),
+        ("allocations.returned_missing_timestamp", "SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'returned' AND return_date IS NULL"),
+        ("allocations.active_with_return_timestamp", "SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'active' AND return_date IS NOT NULL"),
+        ("allocations.invalid_chronology", "SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE return_date IS NOT NULL AND allocation_date IS NOT NULL AND return_date < allocation_date"),
+        ("allocations.returned_with_unverified_issued_status", "SELECT COUNT(*)::BIGINT FROM firearm_allocations fa JOIN firearms f ON f.id = fa.firearm_id WHERE LOWER(BTRIM(fa.status)) = 'returned' AND LOWER(BTRIM(f.status)) IN ('allocated', 'deployed') AND NOT EXISTS (SELECT 1 FROM firearm_allocations active WHERE active.firearm_id = fa.firearm_id AND LOWER(BTRIM(active.status)) = 'active')"),
+        ("allocations.september_18_2026", "SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE allocation_date AT TIME ZONE 'Asia/Manila' >= DATE '2026-09-18' AND allocation_date AT TIME ZONE 'Asia/Manila' < DATE '2026-09-19'"),
+        ("allocations.mdr_linked", "SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE mdr_batch_id IS NOT NULL"),
+        ("guards.issue_eligible", "SELECT COUNT(*)::BIGINT FROM users u WHERE LOWER(BTRIM(u.role)) = 'guard' AND COALESCE(LOWER(BTRIM(u.status)), 'active') = 'active' AND COALESCE(LOWER(BTRIM(u.approval_status)), 'approved') = 'approved' AND EXISTS (SELECT 1 FROM guard_firearm_permits p WHERE p.guard_id = u.id AND LOWER(BTRIM(p.status)) = 'active' AND p.expiry_date > sentinel_now()) AND EXISTS (SELECT 1 FROM training_records t WHERE t.guard_id = u.id AND LOWER(BTRIM(t.training_type)) = 'firearms_handling' AND LOWER(BTRIM(t.status)) = 'valid' AND (t.expiry_date IS NULL OR t.expiry_date > sentinel_now()))"),
+        ("shifts.total", "SELECT COUNT(*)::BIGINT FROM shifts"),
+        ("attendance.total", "SELECT COUNT(*)::BIGINT FROM attendance"),
+        ("attendance.without_shift", "SELECT COUNT(*)::BIGINT FROM attendance a LEFT JOIN shifts s ON s.id = a.shift_id WHERE s.id IS NULL"),
+        ("attendance.guard_shift_mismatch", "SELECT COUNT(*)::BIGINT FROM attendance a JOIN shifts s ON s.id = a.shift_id WHERE a.guard_id <> s.guard_id"),
+        ("attendance.checkout_before_checkin", "SELECT COUNT(*)::BIGINT FROM attendance WHERE check_out_time IS NOT NULL AND check_out_time <= check_in_time"),
+        ("attendance.completed_without_checkout", "SELECT COUNT(*)::BIGINT FROM attendance WHERE LOWER(BTRIM(status)) IN ('completed', 'checked_out') AND check_out_time IS NULL"),
+        ("attendance.future_completed", "SELECT COUNT(*)::BIGINT FROM attendance WHERE check_in_time > sentinel_now()"),
+        ("shifts.overlap_violations", "SELECT COUNT(*)::BIGINT FROM shifts first_shift JOIN shifts second_shift ON second_shift.guard_id = first_shift.guard_id AND second_shift.id > first_shift.id AND second_shift.start_time < first_shift.end_time AND second_shift.end_time > first_shift.start_time"),
+        ("shifts.insufficient_rest_violations", "WITH ordered AS (SELECT guard_id, start_time, end_time, LAG(end_time) OVER (PARTITION BY guard_id ORDER BY start_time, id) AS previous_end FROM shifts) SELECT COUNT(*)::BIGINT FROM ordered WHERE previous_end IS NOT NULL AND start_time >= previous_end AND start_time - previous_end < INTERVAL '8 hours'"),
+        ("vehicles.total", "SELECT COUNT(*)::BIGINT FROM armored_cars"),
+        ("vehicle_allocations.active", "SELECT COUNT(*)::BIGINT FROM car_allocations WHERE LOWER(BTRIM(status)) = 'active'"),
+        ("vehicle_allocations.duplicate_active_vehicles", "SELECT COUNT(*)::BIGINT FROM (SELECT car_id FROM car_allocations WHERE LOWER(BTRIM(status)) = 'active' GROUP BY car_id HAVING COUNT(*) > 1) duplicates"),
+        ("trips.total", "SELECT COUNT(*)::BIGINT FROM trips"),
+        ("trips.completed", "SELECT COUNT(*)::BIGINT FROM trips WHERE LOWER(BTRIM(status)) = 'completed'"),
+        ("trips.invalid_chronology", "SELECT COUNT(*)::BIGINT FROM trips WHERE end_time IS NOT NULL AND end_time <= start_time"),
+        ("trips.completed_without_end", "SELECT COUNT(*)::BIGINT FROM trips WHERE LOWER(BTRIM(status)) = 'completed' AND end_time IS NULL"),
+        ("trips.overlap_violations", "SELECT COUNT(*)::BIGINT FROM trips first_trip JOIN trips second_trip ON second_trip.car_id = first_trip.car_id AND second_trip.id > first_trip.id AND second_trip.start_time < COALESCE(first_trip.end_time, sentinel_now()) AND COALESCE(second_trip.end_time, sentinel_now()) > first_trip.start_time"),
+        ("trips.sunday_completed", "SELECT COUNT(*)::BIGINT FROM trips WHERE LOWER(BTRIM(status)) = 'completed' AND EXTRACT(DOW FROM start_time AT TIME ZONE 'Asia/Manila') = 0"),
+        ("trips.future_completed", "SELECT COUNT(*)::BIGINT FROM trips WHERE LOWER(BTRIM(status)) = 'completed' AND end_time > sentinel_now()"),
+        ("incidents.total", "SELECT COUNT(*)::BIGINT FROM incidents"),
+        ("incident_classifications.total", "SELECT COUNT(*)::BIGINT FROM incident_severity_classifications"),
+        ("incident_classifications.orphaned", "SELECT COUNT(*)::BIGINT FROM incident_severity_classifications c LEFT JOIN incidents i ON i.id = c.incident_id WHERE i.id IS NULL"),
+        ("requests.total", "SELECT COUNT(*)::BIGINT FROM operational_requests"),
+        ("request_events.total", "SELECT COUNT(*)::BIGINT FROM operational_request_events"),
+        ("request_events.orphaned", "SELECT COUNT(*)::BIGINT FROM operational_request_events e LEFT JOIN operational_requests r ON r.id = e.request_id WHERE r.id IS NULL"),
+        ("request_events.before_request", "SELECT COUNT(*)::BIGINT FROM operational_request_events e JOIN operational_requests r ON r.id = e.request_id WHERE e.created_at < r.created_at"),
+        ("notifications.total", "SELECT COUNT(*)::BIGINT FROM notifications"),
+        ("notifications.unread", "SELECT COUNT(*)::BIGINT FROM notifications WHERE read = false"),
+        ("notifications.orphaned_users", "SELECT COUNT(*)::BIGINT FROM notifications n LEFT JOIN users u ON u.id = n.user_id WHERE u.id IS NULL"),
+        ("tracking_points.total", "SELECT COUNT(*)::BIGINT FROM tracking_points"),
+        ("tracking_points.orphaned_guard_targets", "SELECT COUNT(*)::BIGINT FROM tracking_points p LEFT JOIN users u ON u.id = p.entity_id WHERE LOWER(BTRIM(p.entity_type)) = 'guard' AND u.id IS NULL"),
+        ("tracking_points.orphaned_guard_targets_capstone", "SELECT COUNT(*)::BIGINT FROM tracking_points p LEFT JOIN users u ON u.id = p.entity_id JOIN capstone_seed_records csr ON csr.table_name = 'tracking_points' AND csr.record_id = p.id WHERE LOWER(BTRIM(p.entity_type)) = 'guard' AND u.id IS NULL"),
+        ("feedback.total", "SELECT COUNT(*)::BIGINT FROM feedback"),
+        ("feedback.orphaned_users", "SELECT COUNT(*)::BIGINT FROM feedback f LEFT JOIN users u ON u.id = f.user_id WHERE u.id IS NULL"),
+        ("support_tickets.total", "SELECT COUNT(*)::BIGINT FROM support_tickets"),
+        ("support_tickets.orphaned_guards", "SELECT COUNT(*)::BIGINT FROM support_tickets t LEFT JOIN users u ON u.id = t.guard_id WHERE u.id IS NULL"),
+        ("audit_logs.total", "SELECT COUNT(*)::BIGINT FROM audit_logs"),
+        ("audit_logs.orphaned_actors", "SELECT COUNT(*)::BIGINT FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_user_id WHERE a.actor_user_id IS NOT NULL AND u.id IS NULL"),
+        ("audit_logs.seeded_actor_outside_batch", "SELECT COUNT(*)::BIGINT FROM audit_logs a WHERE a.source = 'capstone_seed' AND a.actor_user_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM capstone_seed_actors actors WHERE actors.user_id = a.actor_user_id)"),
+    ] {
+        print_consistency_count(pool, check, query).await?;
+    }
+
+    for (check, query) in [
+        ("users.role", "SELECT LOWER(BTRIM(role)) AS value, COUNT(*)::BIGINT AS count FROM users GROUP BY LOWER(BTRIM(role)) ORDER BY value"),
+        ("firearms.status", "SELECT LOWER(BTRIM(status)) AS value, COUNT(*)::BIGINT AS count FROM firearms GROUP BY LOWER(BTRIM(status)) ORDER BY value"),
+        ("allocations.status", "SELECT LOWER(BTRIM(status)) AS value, COUNT(*)::BIGINT AS count FROM firearm_allocations GROUP BY LOWER(BTRIM(status)) ORDER BY value"),
+        ("allocations.date", "SELECT TO_CHAR(allocation_date AT TIME ZONE 'Asia/Manila', 'YYYY-MM-DD') AS value, COUNT(*)::BIGINT AS count FROM firearm_allocations GROUP BY value ORDER BY value"),
+        ("allocations.mdr_batch", "SELECT COALESCE(NULLIF(BTRIM(mdr_batch_id), ''), '(none)') AS value, COUNT(*)::BIGINT AS count FROM firearm_allocations GROUP BY value ORDER BY value"),
+        ("firearms.make", "SELECT COALESCE(NULLIF(BTRIM(make), ''), '(blank)') AS value, COUNT(*)::BIGINT AS count FROM firearms GROUP BY value ORDER BY value"),
+        ("vehicles.status", "SELECT LOWER(BTRIM(status)) AS value, COUNT(*)::BIGINT AS count FROM armored_cars GROUP BY LOWER(BTRIM(status)) ORDER BY value"),
+        ("trips.status", "SELECT LOWER(BTRIM(status)) AS value, COUNT(*)::BIGINT AS count FROM trips GROUP BY LOWER(BTRIM(status)) ORDER BY value"),
+        ("incidents.status", "SELECT LOWER(BTRIM(status)) AS value, COUNT(*)::BIGINT AS count FROM incidents GROUP BY LOWER(BTRIM(status)) ORDER BY value"),
+        ("requests.status", "SELECT LOWER(BTRIM(status)) AS value, COUNT(*)::BIGINT AS count FROM operational_requests GROUP BY LOWER(BTRIM(status)) ORDER BY value"),
+        ("notifications.read_state", "SELECT CASE WHEN read THEN 'read' ELSE 'unread' END AS value, COUNT(*)::BIGINT AS count FROM notifications GROUP BY value ORDER BY value"),
+        ("tracking_points.entity_type", "SELECT LOWER(BTRIM(entity_type)) AS value, COUNT(*)::BIGINT AS count FROM tracking_points GROUP BY LOWER(BTRIM(entity_type)) ORDER BY value"),
+        ("feedback.role", "SELECT LOWER(BTRIM(u.role)) AS value, COUNT(*)::BIGINT AS count FROM feedback f JOIN users u ON u.id = f.user_id GROUP BY LOWER(BTRIM(u.role)) ORDER BY value"),
+        ("support_tickets.status", "SELECT LOWER(BTRIM(status)) AS value, COUNT(*)::BIGINT AS count FROM support_tickets GROUP BY LOWER(BTRIM(status)) ORDER BY value"),
+        ("audit_logs.source", "SELECT COALESCE(NULLIF(BTRIM(source), ''), 'runtime') AS value, COUNT(*)::BIGINT AS count FROM audit_logs GROUP BY value ORDER BY value"),
+    ] {
+        print_consistency_distribution(pool, check, query).await?;
+    }
+
+    let average_feedback_rating: Option<f64> =
+        sqlx::query_scalar("SELECT AVG(rating)::DOUBLE PRECISION FROM feedback")
+            .fetch_one(pool)
+            .await?;
+    println!(
+        "CONSISTENCY|feedback.average_rating|{:.2}",
+        average_feedback_rating.unwrap_or(0.0)
+    );
+    Ok(())
+}
+
+// Read-only evidence for the two historical data backlogs. This command does
+// not repair, hide, or alter any presentation record.
+async fn review_inventory(pool: &PgPool) -> Result<()> {
+    println!("REVIEW_INVENTORY|mode|read_only");
+
+    let tracking_total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::BIGINT FROM tracking_points p LEFT JOIN users u ON u.id = p.entity_id WHERE LOWER(BTRIM(p.entity_type)) = 'guard' AND u.id IS NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    println!("TRACKING_REVIEW|orphan_guard_points|{tracking_total}");
+
+    for row in sqlx::query(
+        "SELECT CASE WHEN p.recorded_at >= sentinel_now() - INTERVAL '7 days' THEN '0-7_days' WHEN p.recorded_at >= sentinel_now() - INTERVAL '30 days' THEN '8-30_days' ELSE 'over_30_days' END AS value, COUNT(*)::BIGINT AS count FROM tracking_points p LEFT JOIN users u ON u.id = p.entity_id WHERE LOWER(BTRIM(p.entity_type)) = 'guard' AND u.id IS NULL GROUP BY value ORDER BY value",
+    )
+    .fetch_all(pool)
+    .await?
+    {
+        println!(
+            "TRACKING_AGE|{}|{}",
+            row.try_get::<String, _>("value")?,
+            row.try_get::<i64, _>("count")?
+        );
+    }
+
+    for row in sqlx::query(
+        "SELECT p.entity_id, COUNT(*)::BIGINT AS count, TO_CHAR(MIN(p.recorded_at) AT TIME ZONE 'Asia/Manila', 'YYYY-MM-DD HH24:MI:SS') AS first_seen, TO_CHAR(MAX(p.recorded_at) AT TIME ZONE 'Asia/Manila', 'YYYY-MM-DD HH24:MI:SS') AS last_seen, COALESCE(STRING_AGG(DISTINCT REPLACE(COALESCE(NULLIF(BTRIM(p.label), ''), '(blank)'), '|', '/') , '; ' ORDER BY REPLACE(COALESCE(NULLIF(BTRIM(p.label), ''), '(blank)'), '|', '/')), '(blank)') AS labels, BOOL_OR(u.id IS NOT NULL) AS target_user_exists, BOOL_OR(p.user_id IS NOT NULL) AS has_user_reference, BOOL_OR(p.created_by IS NOT NULL) AS has_creator_reference, BOOL_OR(csr.record_id IS NOT NULL) AS capstone_tracked FROM tracking_points p LEFT JOIN users u ON u.id = p.entity_id LEFT JOIN capstone_seed_records csr ON csr.table_name = 'tracking_points' AND csr.record_id = p.id WHERE LOWER(BTRIM(p.entity_type)) = 'guard' AND u.id IS NULL GROUP BY p.entity_id ORDER BY p.entity_id",
+    )
+    .fetch_all(pool)
+    .await?
+    {
+        println!(
+            "TRACKING_ENTITY|{}|{}|{}|{}|{}|target_user_exists={}|user_ref={}|creator_ref={}|capstone_tracked={}",
+            row.try_get::<String, _>("entity_id")?,
+            row.try_get::<i64, _>("count")?,
+            row.try_get::<String, _>("first_seen")?,
+            row.try_get::<String, _>("last_seen")?,
+            row.try_get::<String, _>("labels")?,
+            row.try_get::<bool, _>("target_user_exists")?,
+            row.try_get::<bool, _>("has_user_reference")?,
+            row.try_get::<bool, _>("has_creator_reference")?,
+            row.try_get::<bool, _>("capstone_tracked")?,
+        );
+    }
+
+    for row in sqlx::query(
+        "SELECT p.id, p.entity_id, TO_CHAR(p.recorded_at AT TIME ZONE 'Asia/Manila', 'YYYY-MM-DD HH24:MI:SS') AS recorded_at, COALESCE(NULLIF(BTRIM(p.label), ''), '(blank)') AS label, COALESCE(p.user_id, '(none)') AS user_id, COALESCE(p.created_by, '(none)') AS created_by, BOOL_OR(csr.record_id IS NOT NULL) AS capstone_tracked FROM tracking_points p LEFT JOIN capstone_seed_records csr ON csr.table_name = 'tracking_points' AND csr.record_id = p.id LEFT JOIN users u ON u.id = p.entity_id WHERE LOWER(BTRIM(p.entity_type)) = 'guard' AND u.id IS NULL GROUP BY p.id, p.entity_id, p.recorded_at, p.label, p.user_id, p.created_by ORDER BY p.recorded_at, p.id",
+    )
+    .fetch_all(pool)
+    .await?
+    {
+        println!(
+            "TRACKING_POINT|{}|entity={}|recorded_at={}|label={}|user_ref={}|creator_ref={}|capstone_tracked={}",
+            row.try_get::<String, _>("id")?,
+            row.try_get::<String, _>("entity_id")?,
+            row.try_get::<String, _>("recorded_at")?,
+            row.try_get::<String, _>("label")?,
+            row.try_get::<String, _>("user_id")?,
+            row.try_get::<String, _>("created_by")?,
+            row.try_get::<bool, _>("capstone_tracked")?,
+        );
+    }
+
+    let unread_total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::BIGINT FROM notifications WHERE read = false")
+            .fetch_one(pool)
+            .await?;
+    println!("NOTIFICATION_REVIEW|unread_total|{unread_total}");
+
+    for row in sqlx::query(
+        "SELECT CASE WHEN created_at >= sentinel_now() - INTERVAL '7 days' THEN '0-7_days' WHEN created_at >= sentinel_now() - INTERVAL '30 days' THEN '8-30_days' ELSE 'over_30_days' END AS value, COUNT(*)::BIGINT AS count FROM notifications WHERE read = false GROUP BY value ORDER BY value",
+    )
+    .fetch_all(pool)
+    .await?
+    {
+        println!(
+            "NOTIFICATION_AGE|{}|{}",
+            row.try_get::<String, _>("value")?,
+            row.try_get::<i64, _>("count")?
+        );
+    }
+
+    for (dimension, query) in [
+        ("type", "SELECT COALESCE(NULLIF(BTRIM(type), ''), '(blank)') AS value, COUNT(*)::BIGINT AS count FROM notifications WHERE read = false GROUP BY value ORDER BY value"),
+        ("role", "SELECT COALESCE(NULLIF(LOWER(BTRIM(u.role)), ''), '(missing)') AS value, COUNT(*)::BIGINT AS count FROM notifications n LEFT JOIN users u ON u.id = n.user_id WHERE n.read = false GROUP BY value ORDER BY value"),
+    ] {
+        for row in sqlx::query(query).fetch_all(pool).await? {
+            println!(
+                "NOTIFICATION_{dimension}|{}|{}",
+                row.try_get::<String, _>("value")?,
+                row.try_get::<i64, _>("count")?
+            );
+        }
+    }
+
+    let range = sqlx::query("SELECT TO_CHAR(MIN(created_at) AT TIME ZONE 'Asia/Manila', 'YYYY-MM-DD HH24:MI:SS') AS oldest, TO_CHAR(MAX(created_at) AT TIME ZONE 'Asia/Manila', 'YYYY-MM-DD HH24:MI:SS') AS newest FROM notifications WHERE read = false")
+        .fetch_one(pool)
+        .await?;
+    println!(
+        "NOTIFICATION_RANGE|oldest|{}",
+        range
+            .try_get::<Option<String>, _>("oldest")?
+            .unwrap_or_else(|| "(none)".to_string())
+    );
+    println!(
+        "NOTIFICATION_RANGE|newest|{}",
+        range
+            .try_get::<Option<String>, _>("newest")?
+            .unwrap_or_else(|| "(none)".to_string())
+    );
     Ok(())
 }
 
@@ -3250,7 +4832,14 @@ async fn status(pool: &PgPool) -> Result<()> {
     let base_present = print_batch_status(pool, BATCH_ID).await?;
     let enrichment_present = print_batch_status(pool, ENRICHMENT_BATCH_ID).await?;
     let audit_activity_present = print_batch_status(pool, AUDIT_ACTIVITY_BATCH_ID).await?;
-    if !base_present && !enrichment_present && !audit_activity_present {
+    let fleet_present = print_batch_status(pool, FLEET_ENRICHMENT_BATCH_ID).await?;
+    let firearm_custody_present = print_batch_status(pool, FIREARM_CUSTODY_BATCH_ID).await?;
+    if !base_present
+        && !enrichment_present
+        && !audit_activity_present
+        && !fleet_present
+        && !firearm_custody_present
+    {
         println!("No {} dataset is present.", BATCH_ID);
     }
     Ok(())
@@ -3296,7 +4885,33 @@ async fn main() {
                 validate(&target_pool).await?;
                 print_capstone_audit_counts(&target_pool, "AFTER").await?;
             }
+            "fleet-preflight" => {
+                fleet_preflight(&target_pool).await?;
+            }
+            "enrich-fleet" => {
+                enrich_fleet(&target_pool).await?;
+                verify_protected_superadmin(&target_pool).await?;
+                status(&target_pool).await?;
+                validate(&target_pool).await?;
+            }
+            "fleet-validate" => validate_fleet_enrichment(&target_pool).await?,
+            "firearm-custody-preflight" => firearm_custody_preflight(&target_pool).await?,
+            "seed-firearm-custody" => {
+                firearm_custody_preflight(&target_pool).await?;
+                seed_firearm_custody(&target_pool).await?;
+                verify_protected_superadmin(&target_pool).await?;
+                validate(&target_pool).await?;
+                firearm_custody_status(&target_pool).await?;
+            }
+            "firearm-custody-validate" => validate_firearm_custody(&target_pool).await?,
+            "firearm-custody-status" => firearm_custody_status(&target_pool).await?,
+            "reset-firearm-custody" => {
+                reset_firearm_custody(&target_pool).await?;
+                verify_protected_superadmin(&target_pool).await?;
+            }
             "validate" => validate(&target_pool).await?,
+            "consistency-audit" => consistency_audit(&target_pool).await?,
+            "review-inventory" => review_inventory(&target_pool).await?,
             _ => unreachable!(),
         }
         Ok::<(), anyhow::Error>(())
@@ -3384,5 +4999,59 @@ mod tests {
         assert!(!actions.iter().any(|action| action.contains("MFA")));
         assert!(!actions.iter().any(|action| action.contains("DELETE")));
         assert!(!actions.iter().any(|action| action.contains("ROLE")));
+    }
+
+    #[test]
+    fn fleet_plan_covers_monday_to_saturday_only() {
+        let operating_days = fleet_operating_days();
+
+        assert_eq!(
+            operating_days,
+            vec![1, 2, 3, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17]
+        );
+        assert_eq!(operating_days.len() * FLEET_BANKS.len(), 75);
+        assert!(operating_days.iter().all(|day| {
+            manila_time(*day, 12, 0)
+                .expect("valid scheduled day")
+                .with_timezone(
+                    &FixedOffset::east_opt(MANILA_OFFSET_SECONDS).expect("Manila offset"),
+                )
+                .weekday()
+                != Weekday::Sun
+        }));
+    }
+
+    #[test]
+    fn fleet_trip_plan_is_chronological_and_returns_after_four_pm() {
+        let plan = fleet_trip_plan("vehicle-1", 4, 17).expect("fleet trip plan");
+        let offset = FixedOffset::east_opt(MANILA_OFFSET_SECONDS).expect("Manila offset");
+
+        assert!(plan.start_time < plan.bank_arrival);
+        assert!(plan.bank_arrival < plan.return_departure);
+        assert!(plan.return_departure < plan.end_time);
+        assert!(plan.start_time.with_timezone(&offset).hour() < 9);
+        assert!(plan.return_departure.with_timezone(&offset).hour() >= 16);
+        assert!(plan.end_time.with_timezone(&offset).hour() >= 16);
+    }
+
+    #[test]
+    fn custody_offsets_are_deterministic_and_within_duty_windows() {
+        let issue_offset = custody_minutes(&["guard-1", "shift-1"], 10, 25);
+        let return_offset = custody_minutes(&["guard-1", "shift-1", "return"], 5, 25);
+
+        assert_eq!(
+            issue_offset,
+            custody_minutes(&["guard-1", "shift-1"], 10, 25)
+        );
+        assert!((10..=25).contains(&issue_offset));
+        assert!((5..=25).contains(&return_offset));
+    }
+
+    #[test]
+    fn placeholder_firearm_serials_are_not_custody_candidates() {
+        assert!(!has_usable_firearm_serial("NO/FIREARM"));
+        assert!(!has_usable_firearm_serial("sample"));
+        assert!(!has_usable_firearm_serial("N/A"));
+        assert!(has_usable_firearm_serial("RIA2015487"));
     }
 }

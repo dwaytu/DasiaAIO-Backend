@@ -1148,8 +1148,11 @@ async fn fetch_map_snapshot(
                        tp.recorded_at,
                        ROW_NUMBER() OVER (PARTITION BY tp.entity_id ORDER BY tp.recorded_at DESC) AS rn
                    FROM tracking_points tp
+                   JOIN users tracked_guard ON tracked_guard.id = tp.entity_id
                    WHERE tp.entity_type IN ('guard')
                      AND tp.entity_id = $1
+                     AND LOWER(BTRIM(tracked_guard.role)) = 'guard'
+                     AND COALESCE(LOWER(BTRIM(tracked_guard.status)), 'active') = 'active'
                      AND tp.recorded_at >= (CURRENT_TIMESTAMP - ($2 || ' minutes')::interval)
                ),
                selected AS (
@@ -1232,30 +1235,35 @@ async fn fetch_map_snapshot(
         sqlx::query(
             r#"WITH ranked_points AS (
                    SELECT
-                       id,
-                       entity_type,
-                       entity_id,
-                       user_id,
-                       label,
-                       status,
-                       latitude,
-                       longitude,
-                       heading,
-                       speed_kph,
-                       accuracy_meters,
-                       recorded_at,
+                       tp.id,
+                       tp.entity_type,
+                       tp.entity_id,
+                       tp.user_id,
+                       tp.label,
+                       tp.status,
+                       tp.latitude,
+                       tp.longitude,
+                       tp.heading,
+                       tp.speed_kph,
+                       tp.accuracy_meters,
+                       tp.recorded_at,
                        ROW_NUMBER() OVER (
-                           PARTITION BY entity_type, entity_id
-                           ORDER BY recorded_at DESC
+                           PARTITION BY tp.entity_type, tp.entity_id
+                           ORDER BY tp.recorded_at DESC
                        ) AS rn
-                   FROM tracking_points
+                   FROM tracking_points tp
+                   LEFT JOIN users tracked_guard
+                     ON tracked_guard.id = tp.entity_id
+                    AND tp.entity_type = 'guard'
                    WHERE (
-                       entity_type IN ('guard')
-                       AND recorded_at >= (CURRENT_TIMESTAMP - ($1 || ' minutes')::interval)
+                       tp.entity_type IN ('guard')
+                       AND LOWER(BTRIM(tracked_guard.role)) = 'guard'
+                       AND COALESCE(LOWER(BTRIM(tracked_guard.status)), 'active') = 'active'
+                       AND tp.recorded_at >= (CURRENT_TIMESTAMP - ($1 || ' minutes')::interval)
                    )
                    OR (
-                       entity_type = 'vehicle'
-                       AND recorded_at >= (CURRENT_TIMESTAMP - ($2 || ' minutes')::interval)
+                       tp.entity_type = 'vehicle'
+                       AND tp.recorded_at >= (CURRENT_TIMESTAMP - ($2 || ' minutes')::interval)
                    )
                ),
                selected AS (
@@ -1864,8 +1872,11 @@ pub async fn get_active_guards(
                        tp.recorded_at,
                        ROW_NUMBER() OVER (PARTITION BY tp.entity_id ORDER BY tp.recorded_at DESC) AS rn
                    FROM tracking_points tp
+                   JOIN users tracked_guard ON tracked_guard.id = tp.entity_id
                    WHERE tp.entity_type IN ('guard')
                      AND tp.entity_id = $1
+                     AND LOWER(BTRIM(tracked_guard.role)) = 'guard'
+                     AND COALESCE(LOWER(BTRIM(tracked_guard.status)), 'active') = 'active'
                      AND tp.recorded_at >= (CURRENT_TIMESTAMP - ($2 || ' minutes')::interval)
                ),
                selected AS (
@@ -1948,7 +1959,10 @@ pub async fn get_active_guards(
                        tp.recorded_at,
                        ROW_NUMBER() OVER (PARTITION BY tp.entity_id ORDER BY tp.recorded_at DESC) AS rn
                    FROM tracking_points tp
+                   JOIN users tracked_guard ON tracked_guard.id = tp.entity_id
                    WHERE tp.entity_type IN ('guard')
+                     AND LOWER(BTRIM(tracked_guard.role)) = 'guard'
+                     AND COALESCE(LOWER(BTRIM(tracked_guard.status)), 'active') = 'active'
                      AND tp.recorded_at >= (CURRENT_TIMESTAMP - ($1 || ' minutes')::interval)
                ),
                selected AS (

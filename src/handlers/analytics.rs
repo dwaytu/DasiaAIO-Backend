@@ -73,6 +73,8 @@ pub struct ResourceUtilization {
     pub firearms_in_use: i64,
     pub firearms_available: i64,
     pub firearms_unavailable: i64,
+    pub firearms_custody_review: i64,
+    pub firearms_maintenance: i64,
     pub vehicles_deployed: i64,
     pub vehicles_available: i64,
     pub vehicles_unavailable: i64,
@@ -304,7 +306,7 @@ pub async fn get_analytics(
     };
 
     let average_mission_duration = sqlx::query_scalar::<_, Option<f64>>(
-        "SELECT AVG(EXTRACT(EPOCH FROM (end_time - start_time)) / 3600.0) 
+        "SELECT AVG(EXTRACT(EPOCH FROM (end_time - start_time)) / 3600.0)::DOUBLE PRECISION
          FROM trips WHERE end_time IS NOT NULL AND start_time IS NOT NULL",
     )
     .fetch_one(db.as_ref())
@@ -357,7 +359,7 @@ pub async fn get_analytics(
             })?;
 
     let average_guards_per_mission = sqlx::query_scalar::<_, Option<f64>>(
-        "SELECT AVG(guard_count) FROM (
+        "SELECT AVG(guard_count)::DOUBLE PRECISION FROM (
             SELECT t.id, COUNT(DISTINCT s.guard_id) as guard_count
             FROM trips t
             LEFT JOIN shifts s ON DATE(t.start_time) = DATE(s.start_time)
@@ -473,6 +475,8 @@ pub async fn get_analytics(
             firearms_in_use: resource_snapshot.firearms_in_use,
             firearms_available: resource_snapshot.firearms_available,
             firearms_unavailable: resource_snapshot.firearms_unavailable(),
+            firearms_custody_review: resource_snapshot.firearms_custody_review,
+            firearms_maintenance: resource_snapshot.firearms_maintenance,
             vehicles_deployed: resource_snapshot.vehicles_deployed,
             vehicles_available: resource_snapshot.vehicles_available,
             vehicles_unavailable: resource_snapshot.vehicles_unavailable(),

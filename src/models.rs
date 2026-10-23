@@ -191,6 +191,7 @@ pub struct Firearm {
     pub name: String,
     pub serial_number: String,
     pub model: String,
+    pub make: Option<String>,
     pub caliber: String,
     pub status: String,
     #[serde(rename = "licenseExpiryDate")]
@@ -248,6 +249,8 @@ pub struct AllocationListView {
     pub guard_name: Option<String>,
     pub firearm_serial_number: Option<String>,
     pub firearm_model: Option<String>,
+    pub mdr_batch_id: Option<String>,
+    pub issue_date_source: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -568,6 +571,9 @@ pub struct Trip {
     pub mission_details: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
+    pub vehicle_number: Option<String>,
+    pub driver_name: Option<String>,
+    pub client_site_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -56,9 +56,20 @@ pub async fn get_user_notifications(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to count unread notifications: {}", e)))?;
 
+    // The quick inbox is intentionally limited to current attention. Historical
+    // notifications remain available in the full inbox and are never modified here.
+    let current_unread_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND read = false AND created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'",
+    )
+    .bind(&user_id)
+    .fetch_one(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to count current unread notifications: {}", e)))?;
+
     Ok(Json(json!({
         "total": total,
         "unreadCount": unread_count,
+        "currentUnreadCount": current_unread_count,
         "notifications": notifications
     })))
 }

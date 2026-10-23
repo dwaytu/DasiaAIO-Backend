@@ -12,6 +12,8 @@ pub struct ResourceSnapshot {
     pub total_firearms: i64,
     pub firearms_in_use: i64,
     pub firearms_available: i64,
+    pub firearms_custody_review: i64,
+    pub firearms_maintenance: i64,
     pub total_vehicles: i64,
     pub vehicles_deployed: i64,
     pub vehicles_available: i64,
@@ -75,13 +77,21 @@ fn round_metric(value: f64) -> f64 {
 pub async fn fetch_resource_snapshot(pool: &PgPool) -> AppResult<ResourceSnapshot> {
     sqlx::query_as::<_, ResourceSnapshot>(
         r#"
-        WITH eligible_guards AS (
+        WITH capstone_roster AS (
+            SELECT DISTINCT guard_id
+            FROM capstone_firearm_custody_mappings
+            WHERE batch_id = 'sentinel-october-2026-firearm-custody-v1'
+        ), eligible_guards AS (
             SELECT u.id
             FROM users u
             WHERE LOWER(BTRIM(u.role)) = 'guard'
               AND COALESCE(u.status, 'active') = 'active'
               AND u.verified = true
               AND COALESCE(u.approval_status, 'approved') = 'approved'
+              AND (
+                  NOT EXISTS (SELECT 1 FROM capstone_roster)
+                  OR u.id IN (SELECT guard_id FROM capstone_roster)
+              )
         ), current_assignments AS (
             SELECT DISTINCT s.guard_id
             FROM shifts s
@@ -111,8 +121,10 @@ pub async fn fetch_resource_snapshot(pool: &PgPool) -> AppResult<ResourceSnapsho
                   AND ca.guard_id IS NULL
             )::BIGINT AS guards_available,
             (SELECT COUNT(*) FROM firearms)::BIGINT AS total_firearms,
-            (SELECT COUNT(*) FROM firearms WHERE status IN ('allocated', 'deployed'))::BIGINT AS firearms_in_use,
+            (SELECT COUNT(*) FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'active')::BIGINT AS firearms_in_use,
             (SELECT COUNT(*) FROM firearms WHERE status = 'available')::BIGINT AS firearms_available,
+            (SELECT COUNT(*) FROM firearms f WHERE LOWER(BTRIM(f.status)) IN ('allocated', 'deployed') AND NOT EXISTS (SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active'))::BIGINT AS firearms_custody_review,
+            (SELECT COUNT(*) FROM firearms WHERE LOWER(BTRIM(status)) = 'maintenance')::BIGINT AS firearms_maintenance,
             (SELECT COUNT(*) FROM armored_cars)::BIGINT AS total_vehicles,
             (SELECT COUNT(*) FROM armored_cars WHERE status IN ('allocated', 'in_transit', 'deployed'))::BIGINT AS vehicles_deployed,
             (SELECT COUNT(*) FROM armored_cars WHERE status = 'available')::BIGINT AS vehicles_available
@@ -226,6 +238,8 @@ mod tests {
             total_firearms: 1,
             firearms_in_use: 0,
             firearms_available: 2,
+            firearms_custody_review: 0,
+            firearms_maintenance: 0,
             total_vehicles: 1,
             vehicles_deployed: 0,
             vehicles_available: 2,

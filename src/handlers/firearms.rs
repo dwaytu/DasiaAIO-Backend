@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -13,6 +14,41 @@ use crate::{
     models::{CreateFirearmRequest, Firearm, FirearmAllocation, UpdateFirearmRequest},
     utils,
 };
+
+#[derive(Debug, Deserialize)]
+pub struct FirearmListQuery {
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+    pub state: Option<String>,
+    pub search: Option<String>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+struct FirearmInventoryRow {
+    id: String,
+    name: String,
+    serial_number: String,
+    model: String,
+    make: Option<String>,
+    caliber: String,
+    status: String,
+    license_expiry_date: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    active_custody: bool,
+    custody_review: bool,
+    mdr_batch_id: Option<String>,
+    mdr_row_ref: Option<String>,
+    source_guard_text: Option<String>,
+    direct_guard_match: bool,
+}
+
+fn normalized_filter(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 
 fn validate_firearm_status(status: &str) -> AppResult<&'static str> {
     let normalized = status.trim().to_ascii_lowercase();
@@ -96,18 +132,82 @@ pub async fn add_firearm(
 
 pub async fn get_all_firearms(
     State(db): State<Arc<PgPool>>,
-    Query(pagination): Query<utils::PaginationQuery>,
+    Query(query): Query<FirearmListQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let (page, page_size, offset) = utils::resolve_pagination(pagination, 50, 200);
+    let (page, page_size, offset) = utils::resolve_pagination(
+        utils::PaginationQuery {
+            page: query.page,
+            page_size: query.page_size,
+        },
+        50,
+        200,
+    );
+    let state = normalized_filter(query.state).map(|value| value.to_ascii_lowercase());
+    if let Some(state) = state.as_deref() {
+        if !matches!(
+            state,
+            "available" | "active_custody" | "custody_review" | "maintenance"
+        ) {
+            return Err(AppError::BadRequest(
+                "state must be available, active_custody, custody_review, or maintenance"
+                    .to_string(),
+            ));
+        }
+    }
+    let search = normalized_filter(query.search);
 
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM firearms")
+    let total: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*)::BIGINT
+           FROM firearms f
+           WHERE ($1::TEXT IS NULL
+                  OR ($1 = 'available' AND LOWER(BTRIM(f.status)) = 'available')
+                  OR ($1 = 'maintenance' AND LOWER(BTRIM(f.status)) = 'maintenance')
+                  OR ($1 = 'active_custody' AND EXISTS (
+                    SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active'))
+                  OR ($1 = 'custody_review' AND LOWER(BTRIM(f.status)) IN ('allocated', 'deployed') AND NOT EXISTS (
+                    SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active')))
+             AND ($2::TEXT IS NULL OR f.serial_number ILIKE '%' || $2 || '%' OR COALESCE(f.make, '') ILIKE '%' || $2 || '%' OR f.model ILIKE '%' || $2 || '%')"#,
+    )
+    .bind(&state)
+    .bind(&search)
         .fetch_one(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
-    let firearms = sqlx::query_as::<_, Firearm>(
-        "SELECT id, name, serial_number, model, caliber, status, validity_date AS license_expiry_date, created_at, updated_at FROM firearms ORDER BY created_at DESC LIMIT $1 OFFSET $2"
+    let firearms = sqlx::query_as::<_, FirearmInventoryRow>(
+        r#"SELECT f.id, f.name, f.serial_number, f.model, f.make, f.caliber, f.status,
+                  f.validity_date AS license_expiry_date, f.created_at, f.updated_at,
+                  EXISTS (SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active') AS active_custody,
+                  (LOWER(BTRIM(f.status)) IN ('allocated', 'deployed') AND NOT EXISTS (
+                    SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active')) AS custody_review,
+                  f.mdr_batch_id,
+                  source.mdr_row_ref,
+                  source.source_guard_text,
+                  COALESCE(source.direct_guard_match, false) AS direct_guard_match
+           FROM firearms f
+           LEFT JOIN LATERAL (
+             SELECT s.sheet_name || ':' || s.row_number::TEXT AS mdr_row_ref,
+                    s.guard_name AS source_guard_text,
+                    s.matched_guard_id IS NOT NULL AS direct_guard_match
+             FROM mdr_staging_rows s
+             WHERE s.batch_id = f.mdr_batch_id
+               AND regexp_replace(UPPER(BTRIM(COALESCE(s.serial_number, ''))), '[^A-Z0-9]', '', 'g') = regexp_replace(UPPER(BTRIM(f.serial_number)), '[^A-Z0-9]', '', 'g')
+             ORDER BY s.created_at DESC, s.sheet_name, s.row_number
+             LIMIT 1
+           ) source ON TRUE
+           WHERE ($1::TEXT IS NULL
+                  OR ($1 = 'available' AND LOWER(BTRIM(f.status)) = 'available')
+                  OR ($1 = 'maintenance' AND LOWER(BTRIM(f.status)) = 'maintenance')
+                  OR ($1 = 'active_custody' AND EXISTS (
+                    SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active'))
+                  OR ($1 = 'custody_review' AND LOWER(BTRIM(f.status)) IN ('allocated', 'deployed') AND NOT EXISTS (
+                    SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active')))
+             AND ($2::TEXT IS NULL OR f.serial_number ILIKE '%' || $2 || '%' OR COALESCE(f.make, '') ILIKE '%' || $2 || '%' OR f.model ILIKE '%' || $2 || '%')
+           ORDER BY f.created_at DESC
+           LIMIT $3 OFFSET $4"#,
     )
+    .bind(&state)
+    .bind(&search)
     .bind(page_size)
     .bind(offset)
     .fetch_all(db.as_ref())
@@ -127,7 +227,7 @@ pub async fn get_firearm_by_id(
     Path(id): Path<String>,
 ) -> AppResult<Json<serde_json::Value>> {
     let firearm = sqlx::query_as::<_, Firearm>(
-        "SELECT id, name, serial_number, model, caliber, status, validity_date AS license_expiry_date, created_at, updated_at FROM firearms WHERE id = $1"
+        "SELECT id, name, serial_number, model, make, caliber, status, validity_date AS license_expiry_date, created_at, updated_at FROM firearms WHERE id = $1"
     )
     .bind(&id)
     .fetch_optional(db.as_ref())

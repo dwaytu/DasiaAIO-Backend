@@ -1269,12 +1269,38 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS expected_return_date TIMESTAMP WITH TIME ZONE",
         "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS notes TEXT",
         "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS issued_by VARCHAR(36)",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS shift_id VARCHAR(36)",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS source VARCHAR(32) NOT NULL DEFAULT 'runtime'",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS capstone_batch_id VARCHAR(80)",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS issued_by_role VARCHAR(32)",
+        "ALTER TABLE firearm_allocations ADD COLUMN IF NOT EXISTS received_by_role VARCHAR(32)",
     ] {
         sqlx::query(alter_sql)
             .execute(pool)
             .await
             .map_err(|e| AppError::DatabaseError(format!("Failed firearm schema alter: {}", e)))?;
     }
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_firearm_allocations_one_active_firearm ON firearm_allocations (firearm_id) WHERE LOWER(BTRIM(status)) = 'active'",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to enforce active firearm custody uniqueness: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_firearm_allocations_shift_id ON firearm_allocations(shift_id) WHERE shift_id IS NOT NULL",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to index firearm allocation shifts: {}", e)))?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_firearm_allocations_capstone_batch ON firearm_allocations(capstone_batch_id, allocation_date DESC) WHERE capstone_batch_id IS NOT NULL",
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to index firearm allocation provenance: {}", e)))?;
 
     // Create shifts table
     sqlx::query(
@@ -1990,6 +2016,35 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
         AppError::DatabaseError(format!("Failed to create training_records table: {}", e))
     })?;
 
+    sqlx::query(
+        r#"CREATE OR REPLACE VIEW firearm_eligible_guards AS
+           SELECT u.id, u.full_name, u.guard_code
+           FROM users u
+           WHERE LOWER(BTRIM(u.role)) = 'guard'
+             AND COALESCE(LOWER(BTRIM(u.status)), 'active') = 'active'
+             AND COALESCE(LOWER(BTRIM(u.approval_status)), 'approved') = 'approved'
+             AND EXISTS (
+                 SELECT 1
+                 FROM guard_firearm_permits p
+                 WHERE p.guard_id = u.id
+                   AND LOWER(BTRIM(p.status)) = 'active'
+                   AND p.expiry_date > NOW()
+             )
+             AND EXISTS (
+                 SELECT 1
+                 FROM training_records t
+                 WHERE t.guard_id = u.id
+                   AND LOWER(BTRIM(t.training_type)) = 'firearms_handling'
+                   AND LOWER(BTRIM(t.status)) = 'valid'
+                   AND (t.expiry_date IS NULL OR t.expiry_date > NOW())
+             )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create firearm eligibility view: {}", e))
+    })?;
+
     // Create firearm_maintenance table
     sqlx::query(
         r#"
@@ -2404,6 +2459,45 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .execute(pool)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create capstone seed record ledger: {}", e)))?;
+
+    // Keep generated firearm custody history independently reversible while preserving
+    // imported source allocation records and their original inventory state.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS capstone_firearm_custody_mappings (
+            batch_id VARCHAR(80) NOT NULL REFERENCES capstone_seed_batches(batch_id) ON DELETE CASCADE,
+            guard_id VARCHAR(36) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+            firearm_id VARCHAR(36) NOT NULL REFERENCES firearms(id) ON DELETE RESTRICT,
+            site_id VARCHAR(36),
+            source_kind VARCHAR(32) NOT NULL,
+            source_allocation_id VARCHAR(36),
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (batch_id, guard_id),
+            UNIQUE (batch_id, firearm_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create firearm custody mapping ledger: {}", e)))?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS capstone_firearm_custody_reconciliations (
+            batch_id VARCHAR(80) NOT NULL REFERENCES capstone_seed_batches(batch_id) ON DELETE CASCADE,
+            allocation_id VARCHAR(36) NOT NULL REFERENCES firearm_allocations(id) ON DELETE RESTRICT,
+            firearm_id VARCHAR(36) NOT NULL REFERENCES firearms(id) ON DELETE RESTRICT,
+            prior_allocation_status VARCHAR(50) NOT NULL,
+            prior_firearm_status VARCHAR(50) NOT NULL,
+            classification VARCHAR(32) NOT NULL,
+            reconciled_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (batch_id, allocation_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create firearm custody reconciliation ledger: {}", e)))?;
 
     // Create indexes for password_reset_tokens table
     for index in &[

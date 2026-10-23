@@ -642,7 +642,7 @@ pub async fn get_car_trips(
     Path(car_id): Path<String>,
 ) -> AppResult<Json<Vec<Trip>>> {
     let trips = sqlx::query_as::<_, Trip>(
-        "SELECT id, car_id, driver_id, allocation_id, start_location, end_location, start_time, end_time, distance_km::FLOAT8 as distance_km, status, mission_details, created_at, updated_at FROM trips WHERE car_id = $1 ORDER BY start_time DESC"
+        "SELECT trips.id, trips.car_id, trips.driver_id, trips.allocation_id, trips.start_location, trips.end_location, trips.start_time, trips.end_time, trips.distance_km::FLOAT8 as distance_km, trips.status, trips.mission_details, trips.created_at, trips.updated_at, armored_cars.license_plate AS vehicle_number, users.full_name AS driver_name, client_sites.name AS client_site_name FROM trips LEFT JOIN armored_cars ON armored_cars.id = trips.car_id LEFT JOIN users ON users.id = trips.driver_id LEFT JOIN car_allocations ON car_allocations.id = trips.allocation_id LEFT JOIN client_sites ON client_sites.id = car_allocations.client_id WHERE trips.car_id = $1 ORDER BY trips.start_time DESC"
     )
     .bind(&car_id)
     .fetch_all(db.as_ref())
@@ -654,7 +654,7 @@ pub async fn get_car_trips(
 
 pub async fn get_all_trips(State(db): State<Arc<PgPool>>) -> AppResult<Json<Vec<Trip>>> {
     let trips = sqlx::query_as::<_, Trip>(
-        "SELECT id, car_id, driver_id, allocation_id, start_location, end_location, start_time, end_time, distance_km::FLOAT8 as distance_km, status, mission_details, created_at, updated_at FROM trips ORDER BY start_time DESC"
+        "SELECT trips.id, trips.car_id, trips.driver_id, trips.allocation_id, trips.start_location, trips.end_location, trips.start_time, trips.end_time, trips.distance_km::FLOAT8 as distance_km, trips.status, trips.mission_details, trips.created_at, trips.updated_at, armored_cars.license_plate AS vehicle_number, users.full_name AS driver_name, client_sites.name AS client_site_name FROM trips LEFT JOIN armored_cars ON armored_cars.id = trips.car_id LEFT JOIN users ON users.id = trips.driver_id LEFT JOIN car_allocations ON car_allocations.id = trips.allocation_id LEFT JOIN client_sites ON client_sites.id = car_allocations.client_id ORDER BY trips.start_time DESC"
     )
     .fetch_all(db.as_ref())
     .await

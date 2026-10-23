@@ -667,6 +667,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         )
         .route(
+            "/api/firearm-allocations/summary",
+            get(handlers::firearm_allocation::get_allocation_summary).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_firearm_allocation),
+            ),
+        )
+        .route(
+            "/api/firearm-allocations/eligible-guards",
+            get(handlers::firearm_allocation::get_eligible_guards).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_firearm_allocation),
+            ),
+        )
+        .route(
             "/api/firearm-allocations",
             get(handlers::firearm_allocation::get_all_allocations).route_layer(
                 axum_middleware::from_fn(middleware::authz::require_firearm_allocation),
