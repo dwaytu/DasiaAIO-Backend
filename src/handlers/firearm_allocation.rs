@@ -333,10 +333,12 @@ pub async fn get_allocation_summary(
     State(db): State<Arc<PgPool>>,
 ) -> AppResult<Json<serde_json::Value>> {
     let row = sqlx::query(
-        r#"WITH capstone_roster AS (
-                SELECT DISTINCT guard_id
-                FROM capstone_firearm_custody_mappings
-                WHERE batch_id = 'sentinel-october-2026-firearm-custody-v1'
+        r#"WITH active_approved_guards AS (
+                SELECT id
+                FROM users
+                WHERE LOWER(BTRIM(role)) = 'guard'
+                  AND COALESCE(LOWER(BTRIM(status)), 'active') = 'active'
+                  AND COALESCE(LOWER(BTRIM(approval_status)), 'approved') = 'approved'
             )
             SELECT
                 (SELECT COUNT(*)::BIGINT FROM firearms) AS total_firearms,
@@ -351,42 +353,19 @@ pub async fn get_allocation_summary(
                      WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active'
                    )) AS custody_review_firearms,
                 (SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'returned') AS returned_allocations,
+                (SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'imported') AS imported_allocations,
                 (SELECT COUNT(*)::BIGINT FROM firearm_allocations) AS total_allocation_records,
                 (SELECT COUNT(*)::BIGINT FROM firearm_eligible_guards) AS eligible_guards,
-                (SELECT COUNT(*)::BIGINT
-                 FROM users u
-                 WHERE LOWER(BTRIM(u.role)) = 'guard'
-                   AND COALESCE(LOWER(BTRIM(u.status)), 'active') = 'active'
-                   AND COALESCE(LOWER(BTRIM(u.approval_status)), 'approved') = 'approved'
-                   AND (
-                     NOT EXISTS (SELECT 1 FROM capstone_roster)
-                     OR u.id IN (SELECT guard_id FROM capstone_roster)
-                   )) AS active_approved_guards,
-                (SELECT COUNT(*)::BIGINT
-                 FROM users u
-                 WHERE LOWER(BTRIM(u.role)) = 'guard'
-                   AND COALESCE(LOWER(BTRIM(u.status)), 'active') = 'active'
-                   AND COALESCE(LOWER(BTRIM(u.approval_status)), 'approved') = 'approved'
-                   AND (
-                     NOT EXISTS (SELECT 1 FROM capstone_roster)
-                     OR u.id IN (SELECT guard_id FROM capstone_roster)
-                   )
-                   AND EXISTS (
+                (SELECT COUNT(*)::BIGINT FROM active_approved_guards) AS active_approved_guards,
+                (SELECT COUNT(*)::BIGINT FROM active_approved_guards u
+                 WHERE EXISTS (
                      SELECT 1 FROM guard_firearm_permits p
                      WHERE p.guard_id = u.id
                        AND LOWER(BTRIM(p.status)) = 'active'
                        AND p.expiry_date > NOW()
                    )) AS guards_with_active_permit,
-                (SELECT COUNT(*)::BIGINT
-                 FROM users u
-                 WHERE LOWER(BTRIM(u.role)) = 'guard'
-                   AND COALESCE(LOWER(BTRIM(u.status)), 'active') = 'active'
-                   AND COALESCE(LOWER(BTRIM(u.approval_status)), 'approved') = 'approved'
-                   AND (
-                     NOT EXISTS (SELECT 1 FROM capstone_roster)
-                     OR u.id IN (SELECT guard_id FROM capstone_roster)
-                   )
-                   AND EXISTS (
+                (SELECT COUNT(*)::BIGINT FROM active_approved_guards u
+                 WHERE EXISTS (
                      SELECT 1 FROM training_records t
                      WHERE t.guard_id = u.id
                        AND LOWER(BTRIM(t.training_type)) = 'firearms_handling'
@@ -406,6 +385,7 @@ pub async fn get_allocation_summary(
         "activeCustody": row.get::<i64, _>("active_custody"),
         "custodyReviewFirearms": row.get::<i64, _>("custody_review_firearms"),
         "returnedAllocations": row.get::<i64, _>("returned_allocations"),
+        "importedAllocations": row.get::<i64, _>("imported_allocations"),
         "totalAllocationRecords": row.get::<i64, _>("total_allocation_records"),
         "eligibleGuards": row.get::<i64, _>("eligible_guards"),
         "activeApprovedGuards": row.get::<i64, _>("active_approved_guards"),

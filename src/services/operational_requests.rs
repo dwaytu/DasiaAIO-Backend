@@ -504,11 +504,19 @@ pub async fn list_requests(
                   COALESCE(u.full_name, u.username) AS requester_name,
                   o.resource_type, o.resource_id, o.subject, o.reason, o.details,
                   o.priority, o.client_site_id, o.shift_id, o.operational_event_key,
+                  cs.name AS client_site_name, s.start_time AS shift_start_time,
+                  s.end_time AS shift_end_time,
                   o.reviewer_id, o.reviewed_at, o.decision_reason,
                   o.fulfilled_by, o.fulfilled_at, o.archived_by, o.archived_at,
                   o.created_at, o.updated_at
            FROM operational_requests o
            JOIN users u ON u.id = o.requester_id
+           LEFT JOIN shifts s ON s.id = o.shift_id AND ($3::boolean OR s.guard_id = o.requester_id)
+           LEFT JOIN client_sites cs ON cs.id = o.client_site_id
+              AND ($3::boolean OR EXISTS (
+                SELECT 1 FROM shifts accessible
+                WHERE accessible.guard_id = o.requester_id AND accessible.client_site = cs.name
+              ))
            WHERE ($1::text IS NULL OR o.status = $1)
              AND ($2::text IS NULL OR o.request_type = $2)
              AND ($3::boolean OR o.requester_id = $4)
@@ -553,25 +561,34 @@ pub async fn get_request(
     actor_role: &str,
     request_id: &str,
 ) -> AppResult<OperationalRequest> {
+    let full_access = utils::role_rank(actor_role).unwrap_or_default() >= 3;
     let request = sqlx::query_as::<_, OperationalRequest>(
         r#"SELECT o.id, o.request_type, o.status, o.requester_id,
                   COALESCE(u.full_name, u.username) AS requester_name,
                   o.resource_type, o.resource_id, o.subject, o.reason, o.details,
                   o.priority, o.client_site_id, o.shift_id, o.operational_event_key,
+                  cs.name AS client_site_name, s.start_time AS shift_start_time,
+                  s.end_time AS shift_end_time,
                   o.reviewer_id, o.reviewed_at, o.decision_reason,
                   o.fulfilled_by, o.fulfilled_at, o.archived_by, o.archived_at,
                   o.created_at, o.updated_at
            FROM operational_requests o
            JOIN users u ON u.id = o.requester_id
+           LEFT JOIN shifts s ON s.id = o.shift_id AND ($2::boolean OR s.guard_id = o.requester_id)
+           LEFT JOIN client_sites cs ON cs.id = o.client_site_id
+              AND ($2::boolean OR EXISTS (
+                SELECT 1 FROM shifts accessible
+                WHERE accessible.guard_id = o.requester_id AND accessible.client_site = cs.name
+              ))
            WHERE o.id = $1"#,
     )
     .bind(request_id)
+    .bind(full_access)
     .fetch_optional(pool)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to load request: {}", e)))?
     .ok_or_else(|| AppError::NotFound("Operational request not found".to_string()))?;
 
-    let full_access = utils::role_rank(actor_role).unwrap_or_default() >= 3;
     if request.archived_at.is_some() && !full_access {
         return Err(AppError::NotFound(
             "Operational request not found".to_string(),
