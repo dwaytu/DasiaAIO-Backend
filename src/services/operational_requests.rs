@@ -357,12 +357,9 @@ pub async fn create_request(
     requester_role: &str,
     payload: CreateOperationalRequest,
 ) -> AppResult<OperationalRequest> {
-    if !matches!(
-        utils::normalize_role(requester_role).as_str(),
-        "guard" | "supervisor"
-    ) {
+    if !utils::has_permission(requester_role, "create_operational_request") {
         return Err(AppError::Forbidden(
-            "Only guards and supervisors can submit operational requests".to_string(),
+            "This account cannot submit operational requests".to_string(),
         ));
     }
 
@@ -989,12 +986,9 @@ pub async fn resubmit_request(
     request_id: &str,
     payload: ResubmitOperationalRequest,
 ) -> AppResult<OperationalRequest> {
-    if !matches!(
-        utils::normalize_role(actor_role).as_str(),
-        "guard" | "supervisor"
-    ) {
+    if !utils::has_permission(actor_role, "create_operational_request") {
         return Err(AppError::Forbidden(
-            "Only guards and supervisors can resubmit operational requests".to_string(),
+            "This account cannot resubmit operational requests".to_string(),
         ));
     }
 

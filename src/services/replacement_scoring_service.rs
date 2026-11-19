@@ -5,6 +5,8 @@ use sqlx::{FromRow, PgPool};
 
 use crate::error::{AppError, AppResult};
 
+const COVERAGE: &str = "unarmed";
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplacementSuggestion {
@@ -13,7 +15,7 @@ pub struct ReplacementSuggestion {
     pub reliability_score: f64,
     pub distance_km: f64,
     pub availability: bool,
-    pub permit_valid: bool,
+    pub coverage: &'static str,
     pub distance_score: f64,
     pub replacement_score: f64,
     pub formula: String,
@@ -34,7 +36,6 @@ struct CandidateRow {
     guard_name: String,
     reliability_score: Option<f64>,
     availability: Option<bool>,
-    permit_valid: Option<bool>,
     distance_km: Option<f64>,
 }
 
@@ -105,7 +106,7 @@ async fn persist_suggestions(
                 'proposed',
                 NOW(),
                 NOW() + INTERVAL '6 hours',
-                'replacement-heuristic-v1',
+                'replacement-heuristic-v2',
                 NOW(),
                 NOW()
             )
@@ -117,7 +118,7 @@ async fn persist_suggestions(
         .bind((idx + 1) as i32)
         .bind(suggestion.replacement_score)
         .bind(format!(
-            "Selected by deterministic scoring for post {} ({})",
+            "Unarmed staffing candidate for post {} ({})",
             post.name, post.id
         ))
         .bind(json!({
@@ -126,7 +127,7 @@ async fn persist_suggestions(
             "distanceKm": suggestion.distance_km,
             "distanceScore": suggestion.distance_score,
             "availability": suggestion.availability,
-            "permitValid": suggestion.permit_valid,
+            "coverage": suggestion.coverage,
             "formula": suggestion.formula,
         }))
         .bind(json!({
@@ -194,13 +195,6 @@ pub async fn suggest_replacement(
                 ga.available_to IS NULL OR ga.available_to >= NOW()
               )
             ) AS availability,
-            EXISTS (
-                SELECT 1
-                FROM guard_firearm_permits gfp
-                WHERE gfp.guard_id = u.id
-                  AND gfp.status = 'active'
-                  AND gfp.expiry_date > NOW()
-            ) AS permit_valid,
             COALESCE(
                 (
                     6371.0 * ACOS(
@@ -231,7 +225,7 @@ pub async fn suggest_replacement(
     let now = Utc::now();
     let mut scored = candidates
         .into_iter()
-        .filter(|row| row.availability.unwrap_or(false) && row.permit_valid.unwrap_or(false))
+        .filter(|row| row.availability.unwrap_or(false))
         .map(|row| {
             let reliability = row.reliability_score.unwrap_or(0.0).clamp(0.0, 100.0);
             let reliability_component = clamp_unit(reliability / 100.0);
@@ -247,7 +241,7 @@ pub async fn suggest_replacement(
                 reliability_score: (reliability * 100.0).round() / 100.0,
                 distance_km: (distance_km * 100.0).round() / 100.0,
                 availability: row.availability.unwrap_or(false),
-                permit_valid: row.permit_valid.unwrap_or(false),
+                coverage: COVERAGE,
                 distance_score: (distance_component * 100.0).round() / 100.0,
                 replacement_score: (replacement_score * 1000.0).round() / 1000.0,
                 formula: "ReplacementScore = (reliability_score * 0.4) + (availability * 0.3) + (distance_score * 0.3)".to_string(),
@@ -300,4 +294,47 @@ pub async fn suggest_replacement(
     persist_suggestions(pool, &post, shift_id.as_deref(), &top_three).await?;
 
     Ok(top_three)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an isolated PostgreSQL instance"]
+    async fn unarmed_staffing_uses_callouts_and_schedule_conflicts(pool: PgPool) {
+        crate::db::run_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password, role, verified, full_name, phone_number) VALUES
+             ('ready', 'ready', 'ready@example.test', 'fixture', 'guard', true, 'Ready Guard', ''),
+             ('busy', 'busy', 'busy@example.test', 'fixture', 'guard', true, 'Busy Guard', ''),
+             ('off', 'off', 'off@example.test', 'fixture', 'guard', true, 'Off Call Guard', '')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO client_sites (id, name, latitude, longitude) VALUES ('post', 'Fixture Post', 7, 125)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO guard_availability (id, guard_id, available) VALUES ('callout-off', 'off', false)")
+            .execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO shifts (id, guard_id, start_time, end_time, client_site, status) VALUES
+             ('shift', 'busy', NOW(), NOW() + INTERVAL '4 hours', 'post', 'in_progress')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let suggestions = suggest_replacement(&pool, "post").await.unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].guard_id, "ready");
+        assert_eq!(suggestions[0].coverage, "unarmed");
+        let saved_coverage: String = sqlx::query_scalar(
+            "SELECT scoring_breakdown->>'coverage' FROM smart_guard_replacements WHERE shift_id = 'shift'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(saved_coverage, "unarmed");
+    }
 }

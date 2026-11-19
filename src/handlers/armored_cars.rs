@@ -286,36 +286,108 @@ pub async fn return_car(
     Json(payload): Json<ReturnCarRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
+    record_car_return(db.as_ref(), &payload.allocation_id).await?;
+    Ok(Json(json!({ "message": "Car returned successfully" })))
+}
 
-    let allocation = sqlx::query_as::<_, CarAllocation>(
-        "SELECT id, car_id, client_id, allocation_date, return_date, expected_return_date, status, notes, created_at, updated_at FROM car_allocations WHERE id = $1"
+async fn record_car_return(pool: &PgPool, allocation_id: &str) -> AppResult<()> {
+    let mut tx = pool.begin().await.map_err(return_car_error)?;
+    let car_id: String = sqlx::query_scalar(
+        "SELECT c.id FROM armored_cars c JOIN car_allocations a ON a.car_id = c.id
+         WHERE a.id = $1 FOR NO KEY UPDATE OF c",
     )
-    .bind(&payload.allocation_id)
-    .fetch_optional(db.as_ref())
+    .bind(allocation_id)
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
+    .map_err(return_car_error)?
     .ok_or_else(|| AppError::NotFound("Allocation not found".to_string()))?;
 
-    sqlx::query(
-        "UPDATE car_allocations SET return_date = CURRENT_TIMESTAMP, status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+    let result = sqlx::query(
+        "UPDATE car_allocations SET return_date = CURRENT_TIMESTAMP, status = 'returned',
+             updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'active'",
     )
-    .bind("returned")
-    .bind(&payload.allocation_id)
-    .execute(db.as_ref())
+    .bind(allocation_id)
+    .execute(&mut *tx)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to return car: {}", e)))?;
+    .map_err(return_car_error)?;
+    if result.rows_affected() != 1 {
+        return Err(AppError::Conflict(
+            "This allocation is no longer active".to_string(),
+        ));
+    }
 
-    // Update car status to available
     sqlx::query(
-        "UPDATE armored_cars SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+        "UPDATE armored_cars SET status = 'available', updated_at = CURRENT_TIMESTAMP
+         WHERE id = $1 AND status = 'allocated'
+         AND NOT EXISTS (SELECT 1 FROM car_allocations WHERE car_id = $1 AND status = 'active')",
     )
-    .bind("available")
-    .bind(&allocation.car_id)
-    .execute(db.as_ref())
+    .bind(&car_id)
+    .execute(&mut *tx)
     .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to update car status: {}", e)))?;
+    .map_err(return_car_error)?;
+    tx.commit().await.map_err(return_car_error)?;
 
-    Ok(Json(json!({ "message": "Car returned successfully" })))
+    Ok(())
+}
+
+fn return_car_error(error: sqlx::Error) -> AppError {
+    AppError::DatabaseError(format!("Failed to return vehicle: {error}"))
+}
+
+#[cfg(test)]
+mod return_tests {
+    use super::*;
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an isolated PostgreSQL instance"]
+    async fn returns_only_active_allocations_and_preserves_fleet_status(pool: PgPool) {
+        crate::db::run_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO armored_cars (id, license_plate, vin, model, manufacturer, capacity_kg, status) VALUES
+             ('car-1', 'QA-1', 'fixture-vin-1', 'Fixture', 'Fixture', 1000, 'allocated'),
+             ('car-2', 'QA-2', 'fixture-vin-2', 'Fixture', 'Fixture', 1000, 'maintenance')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO car_allocations (id, car_id, client_id, status) VALUES
+             ('first', 'car-1', 'Site A', 'active'),
+             ('second', 'car-1', 'Site B', 'active'),
+             ('third', 'car-2', 'Site A', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        record_car_return(&pool, "first").await.unwrap();
+        assert!(matches!(
+            record_car_return(&pool, "first").await,
+            Err(AppError::Conflict(_))
+        ));
+        let statuses = || {
+            sqlx::query_scalar::<_, String>("SELECT status FROM armored_cars ORDER BY id")
+                .fetch_all(&pool)
+        };
+        assert_eq!(statuses().await.unwrap(), ["allocated", "maintenance"]);
+
+        let (a, b) = tokio::join!(
+            record_car_return(&pool, "second"),
+            record_car_return(&pool, "second")
+        );
+        assert!(matches!(
+            (a, b),
+            (Ok(()), Err(AppError::Conflict(_))) | (Err(AppError::Conflict(_)), Ok(()))
+        ));
+        record_car_return(&pool, "third").await.unwrap();
+        assert_eq!(statuses().await.unwrap(), ["available", "maintenance"]);
+        let returned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM car_allocations WHERE status = 'returned' AND return_date IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(returned, 3);
+    }
 }
 
 pub async fn get_car_allocations(

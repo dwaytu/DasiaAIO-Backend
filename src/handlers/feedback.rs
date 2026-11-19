@@ -51,13 +51,6 @@ pub async fn submit_feedback(
     Json(payload): Json<SubmitFeedbackRequest>,
 ) -> AppResult<Json<FeedbackRecord>> {
     let claims = extract_claims(&headers)?;
-    let role = utils::normalize_role(&claims.role);
-
-    if !matches!(role.as_str(), "guard" | "supervisor" | "admin") {
-        return Err(AppError::Forbidden(
-            "Only guard, supervisor, and admin users can submit feedback".to_string(),
-        ));
-    }
 
     if !(1..=5).contains(&payload.rating) {
         return Err(AppError::BadRequest(

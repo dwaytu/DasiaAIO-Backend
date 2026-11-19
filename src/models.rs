@@ -251,6 +251,7 @@ pub struct AllocationListView {
     pub firearm_model: Option<String>,
     pub mdr_batch_id: Option<String>,
     pub issue_date_source: String,
+    pub record_origin: String,
 }
 
 #[derive(Debug, Deserialize)]

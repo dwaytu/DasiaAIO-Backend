@@ -367,12 +367,15 @@ pub async fn get_missions(
         end_time: Option<chrono::DateTime<chrono::Utc>>,
         status: Option<String>,
         vehicle_model: Option<String>,
+        vehicle_fleet_number: Option<String>,
+        vehicle_plate_number: Option<String>,
         driver_name: Option<String>,
     }
 
     let missions = sqlx::query_as::<_, MissionRow>(
         "SELECT t.id, t.destination, t.start_time, t.end_time, t.status,
-         ac.model as vehicle_model, u.full_name as driver_name
+         ac.model as vehicle_model, ac.license_plate as vehicle_fleet_number,
+         ac.plate_number as vehicle_plate_number, u.full_name as driver_name
          FROM trips t
          LEFT JOIN armored_cars ac ON t.car_id = ac.id
          LEFT JOIN users u ON t.driver_id = u.id
@@ -387,4 +390,44 @@ pub async fn get_missions(
         "total": missions.len(),
         "missions": missions
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an isolated PostgreSQL instance"]
+    async fn history_exposes_vehicle_identifiers_without_replacing_model(pool: PgPool) {
+        crate::db::run_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, email, username, password, role, full_name, phone_number)
+             VALUES ('driver', 'fixture@example.test', 'fixture', 'fixture', 'supervisor', 'Fixture Driver', '')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO armored_cars (id, license_plate, plate_number, vin, model, manufacturer, capacity_kg)
+             VALUES ('car', '3003', 'QA-123', 'fixture-identifiers', 'Not provided', 'Fixture', 1000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO trips (id, car_id, driver_id, start_time, status) VALUES ('trip', 'car', 'driver', CURRENT_TIMESTAMP, 'completed')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let token =
+            utils::generate_access_token("driver", "fixture@example.test", "supervisor", true)
+                .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let Json(result) = get_missions(State(Arc::new(pool)), headers).await.unwrap();
+        let row = &result["missions"][0];
+        assert_eq!(row["vehicle_model"], "Not provided");
+        assert_eq!(row["vehicle_fleet_number"], "3003");
+        assert_eq!(row["vehicle_plate_number"], "QA-123");
+    }
 }

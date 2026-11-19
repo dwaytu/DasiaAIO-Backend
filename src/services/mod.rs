@@ -1,4 +1,5 @@
 pub mod analytics_service;
+pub mod firearm_custody_review;
 pub mod geofence_alert_service;
 pub mod guard_prediction_service;
 pub mod incident_severity_classifier;

@@ -1230,6 +1230,18 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create firearms table: {}", e)))?;
 
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS firearm_custody_review_approvals (
+            firearm_id VARCHAR(36) NOT NULL REFERENCES firearms(id) ON DELETE CASCADE,
+            inventory_updated_at TIMESTAMPTZ NOT NULL,
+            approved_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (firearm_id, inventory_updated_at)
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to create custody review approvals: {e}")))?;
+
     // Create firearm_allocations table
     sqlx::query(
         r#"
@@ -2017,27 +2029,7 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     })?;
 
     sqlx::query(
-        r#"CREATE OR REPLACE VIEW firearm_eligible_guards AS
-           SELECT u.id, u.full_name, u.guard_code
-           FROM users u
-           WHERE LOWER(BTRIM(u.role)) = 'guard'
-             AND COALESCE(LOWER(BTRIM(u.status)), 'active') = 'active'
-             AND COALESCE(LOWER(BTRIM(u.approval_status)), 'approved') = 'approved'
-             AND EXISTS (
-                 SELECT 1
-                 FROM guard_firearm_permits p
-                 WHERE p.guard_id = u.id
-                   AND LOWER(BTRIM(p.status)) = 'active'
-                   AND p.expiry_date > NOW()
-             )
-             AND EXISTS (
-                 SELECT 1
-                 FROM training_records t
-                 WHERE t.guard_id = u.id
-                   AND LOWER(BTRIM(t.training_type)) = 'firearms_handling'
-                   AND LOWER(BTRIM(t.status)) = 'valid'
-                   AND (t.expiry_date IS NULL OR t.expiry_date > NOW())
-             )"#,
+        r#"DROP VIEW IF EXISTS firearm_eligible_guards;"#,
     )
     .execute(pool)
     .await
@@ -2459,6 +2451,36 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     .execute(pool)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to create capstone seed record ledger: {}", e)))?;
+
+    // This view classifies provenance without modifying or verifying source records.
+    sqlx::query(
+        r#"CREATE OR REPLACE VIEW firearm_allocation_register_provenance AS
+           SELECT a.id,
+                  CASE
+                    WHEN a.source IN ('capstone_custody', 'capstone_seed')
+                         OR NULLIF(BTRIM(a.capstone_batch_id), '') IS NOT NULL
+                         OR EXISTS (
+                           SELECT 1 FROM capstone_seed_records r
+                           WHERE r.table_name = 'firearm_allocations' AND r.record_id = a.id
+                         ) THEN 'presentation'
+                    WHEN NULLIF(BTRIM(a.mdr_batch_id), '') IS NOT NULL
+                         OR NULLIF(BTRIM(a.mdr_row_ref), '') IS NOT NULL
+                         OR LOWER(BTRIM(a.status)) = 'imported' THEN 'imported'
+                    WHEN a.source = 'application_recorded' THEN 'application'
+                    ELSE 'unknown'
+                  END AS record_origin,
+                  CASE LOWER(BTRIM(a.status))
+                    WHEN 'active' THEN 'active'
+                    WHEN 'returned' THEN 'returned'
+                    ELSE 'unverified'
+                  END AS register_status
+           FROM firearm_allocations a"#,
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AppError::DatabaseError(format!("Failed to create allocation provenance view: {e}"))
+    })?;
 
     // Keep generated firearm custody history independently reversible while preserving
     // imported source allocation records and their original inventory state.

@@ -265,6 +265,7 @@ pub fn role_permissions(role: &str) -> &'static [&'static str] {
             "view_support_tickets",
             "create_support_ticket",
             "manage_notifications",
+            "create_operational_request",
             "view_operational_requests",
             "review_operational_requests",
             "fulfill_operational_requests",
@@ -676,11 +677,23 @@ mod tests {
         assert!(has_permission("guard", "create_operational_request"));
         assert!(has_permission("supervisor", "create_operational_request"));
         assert!(!has_permission("admin", "create_operational_request"));
-        assert!(!has_permission("superadmin", "create_operational_request"));
+        assert!(has_permission("superadmin", "create_operational_request"));
 
         assert!(!has_permission("supervisor", "review_operational_requests"));
         assert!(has_permission("admin", "review_operational_requests"));
         assert!(has_permission("superadmin", "review_operational_requests"));
+    }
+
+    #[test]
+    fn superadmin_includes_admin_and_supervisor_permissions() {
+        for role in ["admin", "supervisor"] {
+            for permission in super::role_permissions(role) {
+                assert!(
+                    has_permission("superadmin", permission),
+                    "Missing {role} permission: {permission}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -604,6 +604,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
         )
         .route(
+            "/api/firearms/:id/custody-review/approve",
+            post(handlers::firearms::approve_custody_review).route_layer(
+                axum_middleware::from_fn(middleware::authz::require_firearm_management),
+            ),
+        )
+        .route(
             "/api/firearms/compliance-report",
             get(handlers::firearm_compliance::get_compliance_report).route_layer(
                 axum_middleware::from_fn(middleware::authz::require_firearm_management),

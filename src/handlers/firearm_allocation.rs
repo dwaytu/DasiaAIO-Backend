@@ -47,7 +47,7 @@ const CORE_ISSUE_GUARD_SQL: &str = r#"
 "#;
 
 const ELIGIBLE_ISSUE_GUARD_SQL: &str =
-    "SELECT EXISTS(SELECT 1 FROM firearm_eligible_guards WHERE id = $1)";
+    "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND LOWER(BTRIM(role)) = 'guard' AND COALESCE(LOWER(BTRIM(status)), 'active') = 'active' AND COALESCE(LOWER(BTRIM(approval_status)), 'approved') = 'approved')";
 
 fn normalized_filter(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
@@ -184,8 +184,8 @@ pub async fn issue_firearm(
     sqlx::query(
         r#"INSERT INTO firearm_allocations
                (id, guard_id, firearm_id, allocation_date, status,
-                issued_by, expected_return_date, notes)
-           VALUES ($1, $2, $3, CURRENT_TIMESTAMP, 'active', $4, $5, $6)"#,
+                issued_by, expected_return_date, notes, source)
+           VALUES ($1, $2, $3, CURRENT_TIMESTAMP, 'active', $4, $5, $6, 'application_recorded')"#,
     )
     .bind(&allocation_id)
     .bind(&payload.guard_id)
@@ -339,6 +339,13 @@ pub async fn get_allocation_summary(
                 WHERE LOWER(BTRIM(role)) = 'guard'
                   AND COALESCE(LOWER(BTRIM(status)), 'active') = 'active'
                   AND COALESCE(LOWER(BTRIM(approval_status)), 'approved') = 'approved'
+            ), origin_breakdown AS (
+                SELECT record_origin AS origin,
+                       COUNT(*) FILTER (WHERE register_status = 'active') AS active,
+                       COUNT(*) FILTER (WHERE register_status = 'returned') AS returned,
+                       COUNT(*) FILTER (WHERE register_status = 'unverified') AS unverified
+                FROM firearm_allocation_register_provenance
+                GROUP BY record_origin
             )
             SELECT
                 (SELECT COUNT(*)::BIGINT FROM firearms) AS total_firearms,
@@ -355,7 +362,11 @@ pub async fn get_allocation_summary(
                 (SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'returned') AS returned_allocations,
                 (SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'imported') AS imported_allocations,
                 (SELECT COUNT(*)::BIGINT FROM firearm_allocations) AS total_allocation_records,
-                (SELECT COUNT(*)::BIGINT FROM firearm_eligible_guards) AS eligible_guards,
+                (SELECT COALESCE(jsonb_agg(to_jsonb(b) ORDER BY b.origin), '[]'::jsonb)
+                 FROM origin_breakdown b) AS register_breakdown,
+                (SELECT COUNT(*) FROM firearm_allocation_register_provenance
+                 WHERE record_origin IN ('imported', 'unknown') OR register_status <> 'returned'
+                ) AS imported_or_unverified_allocations,
                 (SELECT COUNT(*)::BIGINT FROM active_approved_guards) AS active_approved_guards,
                 (SELECT COUNT(*)::BIGINT FROM active_approved_guards u
                  WHERE EXISTS (
@@ -377,17 +388,36 @@ pub async fn get_allocation_summary(
     .await
     .map_err(|error| AppError::DatabaseError(format!("Failed to load firearm allocation summary: {error}")))?;
 
+    let eligible_guards = Some(
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM users WHERE LOWER(BTRIM(role)) = 'guard' AND COALESCE(LOWER(BTRIM(status)), 'active') = 'active' AND COALESCE(LOWER(BTRIM(approval_status)), 'approved') = 'approved'"
+    )
+    .fetch_one(db.as_ref())
+    .await
+    .map_err(|error| {
+        AppError::DatabaseError(format!(
+            "Failed to load firearm eligibility count: {error}"
+        ))
+    })?,
+);
+
+    let active_custody = row.get::<i64, _>("active_custody");
+    // Active status by itself does not establish that custody documents were verified.
+    let verified_active_custody = (active_custody == 0).then_some(0);
     Ok(Json(json!({
         "totalFirearms": row.get::<i64, _>("total_firearms"),
         "availableFirearms": row.get::<i64, _>("available_firearms"),
         "allocatedFirearms": row.get::<i64, _>("allocated_firearms"),
         "maintenanceFirearms": row.get::<i64, _>("maintenance_firearms"),
-        "activeCustody": row.get::<i64, _>("active_custody"),
+        "activeCustody": active_custody,
+        "verifiedActiveCustody": verified_active_custody,
         "custodyReviewFirearms": row.get::<i64, _>("custody_review_firearms"),
         "returnedAllocations": row.get::<i64, _>("returned_allocations"),
         "importedAllocations": row.get::<i64, _>("imported_allocations"),
         "totalAllocationRecords": row.get::<i64, _>("total_allocation_records"),
-        "eligibleGuards": row.get::<i64, _>("eligible_guards"),
+        "registerBreakdown": row.get::<serde_json::Value, _>("register_breakdown"),
+        "importedOrUnverifiedAllocations": row.get::<i64, _>("imported_or_unverified_allocations"),
+        "eligibleGuards": eligible_guards,
         "activeApprovedGuards": row.get::<i64, _>("active_approved_guards"),
         "guardsWithActivePermit": row.get::<i64, _>("guards_with_active_permit"),
         "guardsWithValidFirearmsTraining": row.get::<i64, _>("guards_with_valid_firearms_training"),
@@ -407,12 +437,15 @@ pub async fn get_eligible_guards(
         200,
     );
     let search = normalized_filter(query.search);
-    let total: i64 = sqlx::query_scalar(
+        let total: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*)::BIGINT
-           FROM firearm_eligible_guards
-           WHERE $1::TEXT IS NULL
+           FROM users
+           WHERE LOWER(BTRIM(role)) = 'guard'
+             AND COALESCE(LOWER(BTRIM(status)), 'active') = 'active'
+             AND COALESCE(LOWER(BTRIM(approval_status)), 'approved') = 'approved'
+             AND ($1::TEXT IS NULL
               OR full_name ILIKE '%' || $1 || '%'
-              OR COALESCE(guard_code, '') ILIKE '%' || $1 || '%'"#,
+              OR COALESCE(guard_code, '') ILIKE '%' || $1 || '%')"#,
     )
     .bind(&search)
     .fetch_one(db.as_ref())
@@ -423,10 +456,13 @@ pub async fn get_eligible_guards(
 
     let guards = sqlx::query(
         r#"SELECT id, full_name, guard_code
-           FROM firearm_eligible_guards
-           WHERE $1::TEXT IS NULL
+           FROM users
+           WHERE LOWER(BTRIM(role)) = 'guard'
+             AND COALESCE(LOWER(BTRIM(status)), 'active') = 'active'
+             AND COALESCE(LOWER(BTRIM(approval_status)), 'approved') = 'approved'
+             AND ($1::TEXT IS NULL
               OR full_name ILIKE '%' || $1 || '%'
-              OR COALESCE(guard_code, '') ILIKE '%' || $1 || '%'
+              OR COALESCE(guard_code, '') ILIKE '%' || $1 || '%')
            ORDER BY full_name ASC
            LIMIT $2 OFFSET $3"#,
     )
@@ -500,9 +536,15 @@ pub async fn get_all_allocations(
                u.full_name AS guard_name,
                f.serial_number AS firearm_serial_number,
                f.model AS firearm_model,
-               fa.mdr_batch_id,
-               CASE WHEN fa.mdr_batch_id IS NULL THEN 'application_recorded' ELSE 'mdr_import_recorded' END AS issue_date_source
+               fa.mdr_batch_id, p.record_origin,
+               CASE p.record_origin
+                 WHEN 'application' THEN 'application_recorded'
+                 WHEN 'imported' THEN 'mdr_import_recorded'
+                 WHEN 'presentation' THEN 'presentation_recorded'
+                 ELSE 'unverified'
+               END AS issue_date_source
         FROM firearm_allocations fa
+        JOIN firearm_allocation_register_provenance p ON p.id = fa.id
         LEFT JOIN users u ON u.id = fa.guard_id
         LEFT JOIN firearms f ON f.id = fa.firearm_id
         WHERE ($1::TEXT IS NULL OR LOWER(BTRIM(fa.status)) = $1)

@@ -210,42 +210,69 @@ pub async fn update_trip_status(
         return Err(AppError::BadRequest("Invalid trip status".to_string()));
     }
 
-    let result = sqlx::query("UPDATE trips SET status = $1 WHERE id = $2")
-        .bind(status)
-        .bind(&trip_id)
-        .execute(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to update trip: {}", e)))?;
-
-    if result.rows_affected() == 0 {
-        return Err(AppError::NotFound("Trip not found".to_string()));
-    }
-
-    // If completed, update vehicle status
-    if status == "completed" {
-        sqlx::query(
-            "UPDATE armored_cars SET status = 'operational' 
-             WHERE id IN (SELECT car_id FROM trips WHERE id = $1)",
-        )
-        .bind(&trip_id)
-        .execute(db.as_ref())
-        .await
-        .ok();
-    } else if status == "in_progress" {
-        sqlx::query(
-            "UPDATE armored_cars SET status = 'deployed' 
-             WHERE id IN (SELECT car_id FROM trips WHERE id = $1)",
-        )
-        .bind(&trip_id)
-        .execute(db.as_ref())
-        .await
-        .ok();
-    }
+    record_trip_status(db.as_ref(), &trip_id, status).await?;
 
     Ok(Json(json!({
         "success": true,
         "message": "Trip status updated"
     })))
+}
+
+async fn record_trip_status(pool: &PgPool, trip_id: &str, status: &str) -> AppResult<()> {
+    let mut tx = pool.begin().await.map_err(trip_status_error)?;
+    // Serialize status changes for the same vehicle, including allocation returns.
+    let car_id: String = sqlx::query_scalar(
+        "SELECT c.id FROM armored_cars c JOIN trips t ON t.car_id = c.id
+         WHERE t.id = $1 FOR NO KEY UPDATE OF c",
+    )
+    .bind(trip_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(trip_status_error)?
+    .ok_or_else(|| AppError::NotFound("Trip not found".to_string()))?;
+
+    let updated =
+        sqlx::query("UPDATE trips SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+            .bind(status)
+            .bind(trip_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(trip_status_error)?;
+    if updated.rows_affected() == 0 {
+        return Err(AppError::NotFound("Trip not found".to_string()));
+    }
+
+    if status == "in_progress" {
+        sqlx::query(
+            "UPDATE armored_cars SET status = 'in_transit', updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 AND status IN ('available', 'operational', 'deployed')",
+        )
+        .bind(&car_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(trip_status_error)?;
+    } else if status == "completed" {
+        sqlx::query(
+            "UPDATE armored_cars SET status = CASE
+                WHEN EXISTS (SELECT 1 FROM trips WHERE car_id = $1 AND status IN ('in_progress', 'in_transit'))
+                    THEN 'in_transit'
+                WHEN EXISTS (SELECT 1 FROM car_allocations WHERE car_id = $1 AND status = 'active')
+                    THEN 'allocated'
+                ELSE 'available'
+             END, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 AND status IN ('available', 'operational', 'in_transit', 'deployed')",
+        )
+        .bind(&car_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(trip_status_error)?;
+    }
+
+    tx.commit().await.map_err(trip_status_error)
+}
+
+fn trip_status_error(error: sqlx::Error) -> AppError {
+    AppError::DatabaseError(format!("Failed to update trip status: {error}"))
 }
 
 // Get driver assignments
@@ -292,4 +319,86 @@ pub struct AssignDriverRequest {
 #[derive(Debug, Deserialize)]
 pub struct UpdateTripStatusRequest {
     pub status: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an isolated PostgreSQL instance"]
+    async fn completing_managed_trips_releases_only_ready_vehicles(pool: PgPool) {
+        crate::db::run_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, email, username, password, role, full_name, phone_number)
+             VALUES ('driver', 'fixture@example.test', 'fixture', 'fixture', 'guard', 'Fixture Driver', '')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO armored_cars (id, license_plate, vin, model, manufacturer, capacity_kg, status) VALUES
+             ('car', 'QA-1', 'qa-vin-1', 'Fixture', 'Fixture', 1000, 'available'),
+             ('loaned', 'QA-2', 'qa-vin-2', 'Fixture', 'Fixture', 1000, 'deployed'),
+             ('service', 'QA-3', 'qa-vin-3', 'Fixture', 'Fixture', 1000, 'maintenance')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO trips (id, car_id, driver_id, start_time, status) VALUES
+             ('first', 'car', 'driver', CURRENT_TIMESTAMP, 'scheduled'),
+             ('other', 'car', 'driver', CURRENT_TIMESTAMP, 'in_transit'),
+             ('client', 'loaned', 'driver', CURRENT_TIMESTAMP, 'in_progress'),
+             ('service', 'service', 'driver', CURRENT_TIMESTAMP, 'in_progress')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO car_allocations (id, car_id, client_id, status)
+             VALUES ('allocation', 'loaned', 'Fixture Site', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        record_trip_status(&pool, "first", "in_progress")
+            .await
+            .unwrap();
+        record_trip_status(&pool, "first", "completed")
+            .await
+            .unwrap();
+        record_trip_status(&pool, "client", "completed")
+            .await
+            .unwrap();
+        record_trip_status(&pool, "service", "completed")
+            .await
+            .unwrap();
+        let fleet_statuses = || async {
+            sqlx::query_scalar::<_, String>("SELECT status FROM armored_cars ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            fleet_statuses().await,
+            ["in_transit", "allocated", "maintenance"]
+        );
+
+        record_trip_status(&pool, "other", "completed")
+            .await
+            .unwrap();
+        assert_eq!(
+            fleet_statuses().await,
+            ["available", "allocated", "maintenance"]
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trips WHERE status = 'completed'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            4,
+        );
+    }
 }

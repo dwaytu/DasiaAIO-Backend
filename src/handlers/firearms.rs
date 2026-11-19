@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crate::{
     error::{AppError, AppResult},
     models::{CreateFirearmRequest, Firearm, FirearmAllocation, UpdateFirearmRequest},
+    services::firearm_custody_review::{self, CustodyReviewApproval},
     utils,
 };
 
@@ -38,6 +39,7 @@ struct FirearmInventoryRow {
     updated_at: DateTime<Utc>,
     active_custody: bool,
     custody_review: bool,
+    custody_review_approved_at: Option<DateTime<Utc>>,
     mdr_batch_id: Option<String>,
     mdr_row_ref: Option<String>,
     source_guard_text: Option<String>,
@@ -180,11 +182,14 @@ pub async fn get_all_firearms(
                   EXISTS (SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active') AS active_custody,
                   (LOWER(BTRIM(f.status)) IN ('allocated', 'deployed') AND NOT EXISTS (
                     SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active')) AS custody_review,
+                  approval.approved_at AS custody_review_approved_at,
                   f.mdr_batch_id,
                   source.mdr_row_ref,
                   source.source_guard_text,
                   COALESCE(source.direct_guard_match, false) AS direct_guard_match
            FROM firearms f
+           LEFT JOIN firearm_custody_review_approvals approval
+             ON approval.firearm_id = f.id AND approval.inventory_updated_at = f.updated_at
            LEFT JOIN LATERAL (
              SELECT s.sheet_name || ':' || s.row_number::TEXT AS mdr_row_ref,
                     s.guard_name AS source_guard_text,
@@ -220,6 +225,31 @@ pub async fn get_all_firearms(
         "pageSize": page_size,
         "firearms": firearms
     })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApproveCustodyReviewRequest {
+    inventory_updated_at: DateTime<Utc>,
+    source_reference: String,
+}
+
+pub async fn approve_custody_review(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(payload): Json<ApproveCustodyReviewRequest>,
+) -> AppResult<(StatusCode, Json<CustodyReviewApproval>)> {
+    let claims = utils::require_min_role(&headers, "supervisor")?;
+    let approval = firearm_custody_review::approve(
+        db.as_ref(),
+        &id,
+        payload.inventory_updated_at,
+        &claims.sub,
+        &payload.source_reference,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(approval)))
 }
 
 pub async fn get_firearm_by_id(
