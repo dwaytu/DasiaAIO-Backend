@@ -1362,7 +1362,13 @@ pub async fn get_all_shifts(
 
     let shifts = sqlx::query_as::<_, ShiftWithGuard>(
         r#"SELECT s.id, s.guard_id, u.full_name as guard_name, u.username as guard_username,
-         s.start_time, s.end_time, s.client_site, s.status,
+         s.start_time, s.end_time, s.client_site,
+         CASE
+             WHEN NOT $3 OR s.status NOT IN ('scheduled', 'in_progress', 'active') THEN s.status
+             WHEN attendance_state.checked_out THEN 'completed'
+             WHEN attendance_state.checked_in THEN 'in_progress'
+             ELSE s.status
+         END AS status,
          check_in.missed AS missed_check_in,
          (
            s.start_time <= CURRENT_TIMESTAMP AND s.end_time > CURRENT_TIMESTAMP
@@ -1381,12 +1387,15 @@ pub async fn get_all_shifts(
          FROM shifts s
          JOIN users u ON s.guard_id = u.id
          CROSS JOIN LATERAL (
+             SELECT COALESCE(BOOL_OR(a.check_in_time IS NOT NULL), false) AS checked_in,
+                    COALESCE(BOOL_OR(a.check_out_time IS NOT NULL OR a.status = 'checked_out'), false) AS checked_out
+             FROM attendance a
+             WHERE a.shift_id = s.id AND a.guard_id = s.guard_id
+         ) attendance_state
+         CROSS JOIN LATERAL (
              SELECT s.status = 'scheduled'
                  AND s.start_time + COALESCE(s.grace_period_minutes::bigint, $4) * INTERVAL '1 minute' <= CURRENT_TIMESTAMP
-                 AND NOT EXISTS (
-                     SELECT 1 FROM attendance a
-                     WHERE a.shift_id = s.id AND a.guard_id = s.guard_id AND a.check_in_time IS NOT NULL
-                 ) AS missed
+                 AND NOT attendance_state.checked_in AS missed
          ) check_in
          LEFT JOIN LATERAL (
              SELECT COALESCE(MAX(cs.id) FILTER (WHERE cs.id = BTRIM(s.client_site)),
@@ -1559,6 +1568,74 @@ mod tests {
 
         let duplicate = vec!["uniform".to_string(), "UNIFORM".to_string()];
         assert!(normalize_readiness_items(&duplicate).is_err());
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an isolated PostgreSQL instance"]
+    async fn todays_shift_status_tracks_saved_attendance(pool: PgPool) {
+        crate::db::run_migrations(&pool).await.unwrap();
+        sqlx::query("INSERT INTO users (id, username, email, password, role, verified, full_name, phone_number) VALUES
+            ('leader', 'leader', 'leader@example.test', 'fixture', 'supervisor', true, 'Fixture Leader', ''),
+            ('guard', 'guard', 'guard@example.test', 'fixture', 'guard', true, 'Fixture Guard', '')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO shifts (id, guard_id, client_site, start_time, end_time, status)
+            VALUES ('fixture-shift', 'guard', 'Fixture Post', NOW() - INTERVAL '1 hour', NOW() + INTERVAL '1 hour', 'scheduled')")
+            .execute(&pool).await.unwrap();
+
+        let leader =
+            utils::generate_access_token("leader", "leader@example.test", "supervisor", true)
+                .unwrap();
+        let guard =
+            utils::generate_access_token("guard", "guard@example.test", "guard", true).unwrap();
+        let auth_headers = |token: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+            headers
+        };
+        let shifts = |scope: Option<String>| {
+            get_all_shifts(
+                State(Arc::new(pool.clone())),
+                auth_headers(&leader),
+                Query(AllShiftsQuery {
+                    page: None,
+                    page_size: None,
+                    scope,
+                }),
+            )
+        };
+
+        let Json(before) = shifts(Some("today".into())).await.unwrap();
+        assert_eq!(before["shifts"][0]["status"], "scheduled");
+
+        let (_, Json(check_in_result)) = check_in(
+            State(Arc::new(pool.clone())),
+            auth_headers(&guard),
+            Json(CheckInRequest {
+                guard_id: "guard".into(),
+                shift_id: "fixture-shift".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(on_duty) = shifts(Some("today".into())).await.unwrap();
+        assert_eq!(on_duty["shifts"][0]["status"], "in_progress");
+        assert_eq!(on_duty["shifts"][0]["missed_check_in"], false);
+
+        let _ = check_out(
+            State(Arc::new(pool.clone())),
+            auth_headers(&guard),
+            Json(CheckOutRequest {
+                attendance_id: check_in_result["attendanceId"].as_str().unwrap().into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(completed) = shifts(Some("today".into())).await.unwrap();
+        assert_eq!(completed["shifts"][0]["status"], "completed");
+        assert_eq!(completed["shifts"][0]["missed_check_in"], false);
+
+        let Json(schedule) = shifts(None).await.unwrap();
+        assert_eq!(schedule["shifts"][0]["status"], "scheduled");
     }
 
     #[sqlx::test(migrations = false)]
