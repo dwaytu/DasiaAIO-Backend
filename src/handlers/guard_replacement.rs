@@ -3,6 +3,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
+use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::{PgPool, Row};
@@ -14,6 +15,7 @@ use crate::{
         Attendance, CheckInRequest, CheckOutRequest, CreateShiftRequest, RequestReplacementRequest,
         SetAvailabilityRequest, SetShiftReadinessRequest, Shift,
     },
+    services::shift_alert_service::check_in_grace_minutes,
     utils,
 };
 
@@ -526,6 +528,271 @@ pub async fn detect_no_shows(
     })))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmReplacementRequest {
+    shift_id: String,
+    original_guard_id: String,
+    replacement_guard_id: String,
+    shift_updated_at: DateTime<Utc>,
+    confirmed_available: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct ReplacementShift {
+    guard_id: String,
+    client_site: String,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    status: String,
+    replacement_status: String,
+    updated_at: DateTime<Utc>,
+    grace_minutes: i64,
+}
+
+fn replacement_database_error(error: sqlx::Error) -> AppError {
+    AppError::DatabaseError(format!("Could not confirm guard replacement: {error}"))
+}
+
+pub async fn confirm_replacement(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Json(payload): Json<ConfirmReplacementRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let claims = utils::require_min_role(&headers, "supervisor")?;
+    if !payload.confirmed_available {
+        return Err(AppError::BadRequest(
+            "Confirm the guard agreed to cover the remaining shift first.".to_string(),
+        ));
+    }
+    if payload.shift_id.trim().is_empty()
+        || payload.original_guard_id.trim().is_empty()
+        || payload.replacement_guard_id.trim().is_empty()
+        || payload.original_guard_id == payload.replacement_guard_id
+    {
+        return Err(AppError::BadRequest(
+            "Select a different guard for this shift.".to_string(),
+        ));
+    }
+
+    let mut tx = db.begin().await.map_err(replacement_database_error)?;
+    let shift: ReplacementShift = sqlx::query_as(
+        r#"SELECT guard_id, client_site, start_time, end_time, status, updated_at,
+                  COALESCE(replacement_status, 'not_needed') AS replacement_status,
+                  COALESCE(grace_period_minutes::bigint, $2) AS grace_minutes
+           FROM shifts WHERE id = $1 FOR UPDATE"#,
+    )
+    .bind(&payload.shift_id)
+    .bind(check_in_grace_minutes())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(replacement_database_error)?
+    .ok_or_else(|| AppError::NotFound("Shift not found.".to_string()))?;
+    if shift.guard_id != payload.original_guard_id
+        || shift.updated_at != payload.shift_updated_at
+        || shift.replacement_status == "accepted"
+    {
+        return Err(AppError::Conflict(
+            "The shift changed. Refresh it before choosing a replacement.".to_string(),
+        ));
+    }
+
+    let has_attendance: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM attendance WHERE shift_id = $1)",
+    )
+    .bind(&payload.shift_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(replacement_database_error)?;
+    if has_attendance {
+        return Err(AppError::Conflict(
+            "Attendance is already recorded for this shift.".to_string(),
+        ));
+    }
+
+    let site_matches: Vec<String> = sqlx::query_scalar(
+        r#"SELECT id FROM client_sites
+           WHERE is_active = true
+             AND LOWER(BTRIM($1)) NOT IN ('', 'n/a', 'na', 'none', 'unassigned', '-', '—')
+             AND (id = BTRIM($1) OR LOWER(BTRIM(name)) = LOWER(BTRIM($1)))
+           ORDER BY (id = BTRIM($1)) DESC, id LIMIT 2 FOR SHARE"#,
+    )
+    .bind(&shift.client_site)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(replacement_database_error)?;
+    let site_id = match site_matches.as_slice() {
+        [id] => id,
+        [id, ..] if id == shift.client_site.trim() => id,
+        _ => {
+            return Err(AppError::Conflict(
+                "Set an active client site on this shift in Schedule before assigning coverage."
+                    .to_string(),
+            ));
+        }
+    };
+
+    let candidate: Option<(String, bool, String, String)> = sqlx::query_as(
+        r#"SELECT role, COALESCE(verified, false), COALESCE(approval_status, 'approved'),
+                  COALESCE(status, 'active')
+           FROM users WHERE id = $1 FOR UPDATE"#,
+    )
+    .bind(&payload.replacement_guard_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(replacement_database_error)?;
+    let candidate_eligible = candidate.is_some_and(|(role, verified, approval, status)| {
+        is_approved_guard(&role, verified, &approval) && status.trim().eq_ignore_ascii_case("active")
+    });
+    if !candidate_eligible {
+        return Err(AppError::Conflict(
+            "The selected guard is no longer active and eligible for coverage.".to_string(),
+        ));
+    }
+
+    let availability: Option<(bool, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> =
+        sqlx::query_as(
+            r#"SELECT available, available_from, available_to FROM guard_availability
+               WHERE guard_id = $1
+               ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, id DESC
+               LIMIT 1 FOR UPDATE"#,
+        )
+        .bind(&payload.replacement_guard_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(replacement_database_error)?;
+
+    // Writes use actual time, even when a presentation read clock is configured.
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(replacement_database_error)?;
+    let explicit_absence = matches!(shift.status.as_str(), "absent" | "no_show");
+    let missed_check_in = shift.status == "scheduled"
+        && shift.start_time + Duration::minutes(shift.grace_minutes) <= now;
+    if shift.start_time > now || shift.end_time <= now || (!explicit_absence && !missed_check_in) {
+        return Err(AppError::Conflict(
+            "This shift no longer needs replacement coverage.".to_string(),
+        ));
+    }
+    if availability.is_some_and(|(available, from, to)| {
+        !available || from.is_some_and(|from| from > now) || to.is_some_and(|to| to < shift.end_time)
+    }) {
+        return Err(AppError::Conflict(
+            "The selected guard is unavailable for the remaining shift.".to_string(),
+        ));
+    }
+    let overlapping: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS (
+               SELECT 1 FROM shifts
+               WHERE guard_id = $1 AND id <> $2 AND status IN ('scheduled', 'in_progress')
+                 AND start_time < $3 AND end_time > $4
+           )"#,
+    )
+    .bind(&payload.replacement_guard_id)
+    .bind(&payload.shift_id)
+    .bind(shift.end_time)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(replacement_database_error)?;
+    if overlapping {
+        return Err(AppError::Conflict(
+            "The selected guard has an overlapping shift during the remaining coverage."
+                .to_string(),
+        ));
+    }
+
+    let covered_from: DateTime<Utc> = sqlx::query_scalar(
+        r#"UPDATE shifts SET guard_id = $1, status = 'scheduled', replacement_status = 'accepted',
+                            start_time = $2, updated_at = $2
+           WHERE id = $3 AND end_time > clock_timestamp() RETURNING start_time"#,
+    )
+    .bind(&payload.replacement_guard_id)
+    .bind(now)
+    .bind(&payload.shift_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(replacement_database_error)?
+    .ok_or_else(|| AppError::Conflict("The shift has already ended.".to_string()))?;
+
+    if explicit_absence {
+        sqlx::query(
+            r#"INSERT INTO punctuality_records (
+                   id, guard_id, shift_id, scheduled_start_time, is_on_time, status
+               ) SELECT $1, $2, $3, $4, false, 'no_show'
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM punctuality_records
+                     WHERE guard_id = $2 AND shift_id = $3 AND status = 'no_show'
+                 )"#,
+        )
+        .bind(utils::generate_id())
+        .bind(&shift.guard_id)
+        .bind(&payload.shift_id)
+        .bind(shift.start_time)
+        .execute(&mut *tx)
+        .await
+        .map_err(replacement_database_error)?;
+    }
+
+    let history_id = utils::generate_id();
+    let metadata = json!({
+        "replacementId": history_id,
+        "originalGuardId": shift.guard_id,
+        "replacementGuardId": payload.replacement_guard_id,
+        "confirmedBy": claims.sub,
+        "confirmationSource": "supervisor_reported_guard_confirmation",
+        "coverage": "unarmed",
+        "siteId": site_id,
+        "clientSite": shift.client_site,
+        "originalStatus": shift.status,
+        "originalShiftUpdatedAt": shift.updated_at,
+        "originalStartTime": shift.start_time,
+        "coverageStartTime": covered_from,
+        "endTime": shift.end_time,
+    });
+
+    // The legacy history table requires numeric scores. This manual decision has no model scores.
+    sqlx::query(
+        r#"INSERT INTO smart_guard_replacements (
+               id, shift_id, absent_guard_id, recommended_guard_id, compatibility_score,
+               confidence_score, rationale, scoring_breakdown, recommendation_status,
+               feature_version
+           ) VALUES ($1, $2, $3, $4, 0, 0, $5, $6, 'accepted', 'supervisor-confirmed-v1')"#,
+    )
+    .bind(&history_id)
+    .bind(&payload.shift_id)
+    .bind(&shift.guard_id)
+    .bind(&payload.replacement_guard_id)
+    .bind("Supervisor confirmed the guard agreed to cover the remaining unarmed shift.")
+    .bind(&metadata)
+    .execute(&mut *tx)
+    .await
+    .map_err(replacement_database_error)?;
+
+    sqlx::query(
+        r#"INSERT INTO audit_logs (id, actor_user_id, action_key, entity_type, entity_id, result, metadata)
+           VALUES ($1, $2, 'shift.replacement.confirmed', 'shift', $3, 'success', $4)"#,
+    )
+    .bind(utils::generate_id())
+    .bind(&claims.sub)
+    .bind(&payload.shift_id)
+    .bind(&metadata)
+    .execute(&mut *tx)
+    .await
+    .map_err(replacement_database_error)?;
+
+    tx.commit().await.map_err(replacement_database_error)?;
+    Ok(Json(json!({
+        "message": "Replacement guard assigned to the remaining shift.",
+        "shiftId": payload.shift_id,
+        "guardId": payload.replacement_guard_id,
+        "replacementId": history_id,
+        "coverageStartTime": covered_from,
+        "endTime": shift.end_time,
+    })))
+}
+
 pub async fn request_replacement(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
@@ -1035,15 +1302,34 @@ pub async fn get_guard_attendance(
     })))
 }
 
+#[derive(Deserialize)]
+pub struct AllShiftsQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    scope: Option<String>,
+}
+
 // Get all shifts with guard information (admin view)
 pub async fn get_all_shifts(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
-    Query(pagination): Query<utils::PaginationQuery>,
+    Query(query): Query<AllShiftsQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
-    let (page, page_size, offset) = utils::resolve_pagination(pagination, 40, 200);
+    let today_only = match query.scope.as_deref() {
+        None => false,
+        Some("today") => true,
+        Some(_) => return Err(AppError::BadRequest("Unknown shift scope.".to_string())),
+    };
+    let (page, page_size, offset) = utils::resolve_pagination(
+        utils::PaginationQuery {
+            page: query.page,
+            page_size: query.page_size,
+        },
+        40,
+        200,
+    );
 
     #[derive(sqlx::FromRow, serde::Serialize)]
     struct ShiftWithGuard {
@@ -1055,6 +1341,10 @@ pub async fn get_all_shifts(
         end_time: chrono::DateTime<chrono::Utc>,
         client_site: String,
         status: String,
+        missed_check_in: bool,
+        replacement_eligible: bool,
+        replacement_status: String,
+        replacement_site_id: Option<String>,
         availability_available: Option<bool>,
         availability_updated_at: Option<chrono::DateTime<chrono::Utc>>,
         readiness_ready: Option<bool>,
@@ -1063,14 +1353,30 @@ pub async fn get_all_shifts(
         updated_at: chrono::DateTime<chrono::Utc>,
     }
 
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shifts")
+    let total: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM shifts
+           WHERE NOT $1 OR (
+               start_time < ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date + 1)::timestamp AT TIME ZONE 'Asia/Manila')
+               AND end_time > (timezone('Asia/Manila', CURRENT_TIMESTAMP)::date::timestamp AT TIME ZONE 'Asia/Manila')
+           )"#,
+    )
+        .bind(today_only)
         .fetch_one(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
     let shifts = sqlx::query_as::<_, ShiftWithGuard>(
-        "SELECT s.id, s.guard_id, u.full_name as guard_name, u.username as guard_username,
+        r#"SELECT s.id, s.guard_id, u.full_name as guard_name, u.username as guard_username,
          s.start_time, s.end_time, s.client_site, s.status,
+         check_in.missed AS missed_check_in,
+         (
+           s.start_time <= CURRENT_TIMESTAMP AND s.end_time > CURRENT_TIMESTAMP
+           AND COALESCE(s.replacement_status, 'not_needed') <> 'accepted'
+           AND (check_in.missed OR s.status IN ('absent', 'no_show'))
+           AND NOT EXISTS (SELECT 1 FROM attendance a WHERE a.shift_id = s.id)
+         ) AS replacement_eligible,
+         COALESCE(s.replacement_status, 'not_needed') AS replacement_status,
+         replacement_site.id AS replacement_site_id,
          ga.available AS availability_available,
          ga.updated_at AS availability_updated_at,
          CASE WHEN gsr.checked_items IS NULL THEN NULL
@@ -1080,6 +1386,22 @@ pub async fn get_all_shifts(
          s.created_at, s.updated_at
          FROM shifts s
          JOIN users u ON s.guard_id = u.id
+         CROSS JOIN LATERAL (
+             SELECT s.status = 'scheduled'
+                 AND s.start_time + COALESCE(s.grace_period_minutes::bigint, $4) * INTERVAL '1 minute' <= CURRENT_TIMESTAMP
+                 AND NOT EXISTS (
+                     SELECT 1 FROM attendance a
+                     WHERE a.shift_id = s.id AND a.guard_id = s.guard_id AND a.check_in_time IS NOT NULL
+                 ) AS missed
+         ) check_in
+         LEFT JOIN LATERAL (
+             SELECT COALESCE(MAX(cs.id) FILTER (WHERE cs.id = BTRIM(s.client_site)),
+                             CASE WHEN COUNT(*) = 1 THEN MIN(cs.id) END) AS id
+             FROM client_sites cs
+             WHERE cs.is_active = true
+               AND LOWER(BTRIM(s.client_site)) NOT IN ('', 'n/a', 'na', 'none', 'unassigned', '-', '—')
+               AND (cs.id = BTRIM(s.client_site) OR LOWER(BTRIM(cs.name)) = LOWER(BTRIM(s.client_site)))
+         ) replacement_site ON true
          LEFT JOIN LATERAL (
              SELECT available, updated_at
              FROM guard_availability
@@ -1089,11 +1411,18 @@ pub async fn get_all_shifts(
          ) ga ON true
          LEFT JOIN guard_shift_readiness gsr
            ON gsr.shift_id = s.id AND gsr.guard_id = s.guard_id
-         ORDER BY s.start_time DESC
-         LIMIT $1 OFFSET $2",
+         WHERE NOT $3 OR (
+             s.start_time < ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date + 1)::timestamp AT TIME ZONE 'Asia/Manila')
+             AND s.end_time > (timezone('Asia/Manila', CURRENT_TIMESTAMP)::date::timestamp AT TIME ZONE 'Asia/Manila')
+         )
+         ORDER BY ($3 AND s.start_time <= CURRENT_TIMESTAMP AND s.end_time > CURRENT_TIMESTAMP) DESC,
+                  s.start_time DESC, s.id
+         LIMIT $1 OFFSET $2"#,
     )
     .bind(page_size)
     .bind(offset)
+    .bind(today_only)
+    .bind(check_in_grace_minutes())
     .fetch_all(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
@@ -1212,7 +1541,7 @@ pub async fn delete_shift(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_approved_guard, normalize_readiness_items};
+    use super::*;
 
     #[test]
     fn approved_guard_check_rejects_wrong_role_or_status() {
@@ -1236,5 +1565,58 @@ mod tests {
 
         let duplicate = vec!["uniform".to_string(), "UNIFORM".to_string()];
         assert!(normalize_readiness_items(&duplicate).is_err());
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an isolated PostgreSQL instance"]
+    async fn supervisor_confirms_exact_remaining_shift_and_preserves_original_guard(pool: PgPool) {
+        crate::db::run_migrations(&pool).await.unwrap();
+        sqlx::query("INSERT INTO users (id, username, email, password, role, verified, full_name, phone_number) VALUES
+            ('leader', 'leader', 'leader@example.test', 'fixture', 'supervisor', true, 'Fixture Leader', ''),
+            ('original', 'original', 'original@example.test', 'fixture', 'guard', true, 'Original Guard', ''),
+            ('replacement', 'replacement', 'replacement@example.test', 'fixture', 'guard', true, 'Replacement Guard', '')")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO client_sites (id, name, latitude, longitude) VALUES ('site', 'Fixture Post', 7, 125)")
+            .execute(&pool).await.unwrap();
+        let (version, original_start): (DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+            "INSERT INTO shifts (id, guard_id, client_site, start_time, end_time, status)
+             VALUES ('target', 'original', 'Fixture Post', NOW() - INTERVAL '45 minutes', NOW() + INTERVAL '2 hours', 'scheduled')
+             RETURNING updated_at, start_time",
+        ).fetch_one(&pool).await.unwrap();
+        let leader_token = utils::generate_access_token("leader", "leader@example.test", "supervisor", true).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {leader_token}").parse().unwrap());
+        let Json(before) = get_all_shifts(State(Arc::new(pool.clone())), headers, Query(AllShiftsQuery {
+            page: None, page_size: None, scope: Some("today".into()),
+        })).await.unwrap();
+        assert_eq!(before["shifts"][0]["missed_check_in"], true);
+        assert_eq!(before["shifts"][0]["replacement_eligible"], true);
+        assert_eq!(before["shifts"][0]["replacement_site_id"], "site");
+        let submit = |id: &str, role: &str, confirmed: bool| {
+            let token = utils::generate_access_token(id, "fixture@example.test", role, true).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+            confirm_replacement(State(Arc::new(pool.clone())), headers, Json(ConfirmReplacementRequest {
+                shift_id: "target".into(), original_guard_id: "original".into(), replacement_guard_id: "replacement".into(),
+                shift_updated_at: version, confirmed_available: confirmed,
+            }))
+        };
+        assert!(matches!(submit("original", "guard", true).await, Err(AppError::Forbidden(_))));
+        assert!(matches!(submit("leader", "supervisor", false).await, Err(AppError::BadRequest(_))));
+        let (first, second) = tokio::join!(submit("leader", "supervisor", true), submit("leader", "supervisor", true));
+        assert!(matches!((first, second), (Ok(_), Err(AppError::Conflict(_))) | (Err(AppError::Conflict(_)), Ok(_))));
+
+        let (assigned, starts_at, status): (String, DateTime<Utc>, String) = sqlx::query_as(
+            "SELECT guard_id, start_time, replacement_status FROM shifts WHERE id = 'target'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!((assigned.as_str(), status.as_str()), ("replacement", "accepted"));
+        assert!(starts_at > original_start);
+        let audit: (i64, Option<String>) = sqlx::query_as(
+            "SELECT COUNT(*), MAX(metadata->>'originalGuardId') FROM audit_logs WHERE action_key = 'shift.replacement.confirmed' AND entity_id = 'target'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(audit, (1, Some("original".into())));
+        let attendance: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attendance WHERE shift_id = 'target'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(attendance, 0);
     }
 }

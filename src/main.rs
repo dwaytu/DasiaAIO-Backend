@@ -822,6 +822,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )),
         )
         .route(
+            "/api/guard-replacement/confirm-replacement",
+            post(handlers::guard_replacement::confirm_replacement)
+                .route_layer(axum_middleware::from_fn(
+                    middleware::authz::require_schedule_management,
+                ))
+                .route_layer(axum_middleware::from_fn_with_state(
+                    db.clone(),
+                    middleware::audit::audit_write_requests,
+                )),
+        )
+        .route(
             "/api/guard-replacement/accept-replacement",
             post(handlers::guard_replacement::accept_replacement)
                 .route_layer(axum_middleware::from_fn(

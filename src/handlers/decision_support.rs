@@ -20,6 +20,7 @@ use crate::{
 #[serde(deny_unknown_fields)]
 pub struct ReplacementSuggestionsQuery {
     pub post_id: String,
+    pub shift_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,8 +156,19 @@ pub async fn get_replacement_suggestions(
 ) -> AppResult<Json<Vec<replacement_scoring_service::ReplacementSuggestion>>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
-    let rows =
-        replacement_scoring_service::suggest_replacement(db.as_ref(), &query.post_id).await?;
+    let rows = match query.shift_id.as_deref() {
+        Some(shift_id) => {
+            replacement_scoring_service::suggest_shift_replacement(
+                db.as_ref(),
+                &query.post_id,
+                shift_id,
+            )
+            .await?
+        }
+        None => {
+            replacement_scoring_service::suggest_replacement(db.as_ref(), &query.post_id).await?
+        }
+    };
     Ok(Json(rows))
 }
 

@@ -14,7 +14,7 @@ fn alert_interval_secs() -> u64 {
         .unwrap_or(DEFAULT_ALERT_INTERVAL_SECS)
 }
 
-fn check_in_grace_minutes() -> i64 {
+pub(crate) fn check_in_grace_minutes() -> i64 {
     std::env::var("SHIFT_CHECK_IN_GRACE_MINUTES")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
@@ -58,13 +58,14 @@ async fn evaluate_missing_check_ins(pool: &PgPool) -> Result<usize, sqlx::Error>
             COALESCE(NULLIF(g.full_name, ''), g.username) AS guard_name,
             s.client_site,
             s.start_time,
+            COALESCE(s.grace_period_minutes::bigint, $1::bigint) AS grace_minutes,
             leadership.id AS recipient_id
         FROM shifts s
         JOIN users g ON g.id = s.guard_id
         CROSS JOIN users leadership
         WHERE s.status = 'scheduled'
-          AND s.start_time <= sentinel_now() - ($1 || ' minutes')::interval
-          AND s.end_time >= sentinel_now() - INTERVAL '24 hours'
+          AND s.start_time <= CURRENT_TIMESTAMP - COALESCE(s.grace_period_minutes::bigint, $1::bigint) * INTERVAL '1 minute'
+          AND s.end_time >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
           AND LOWER(BTRIM(leadership.role)) IN ('supervisor', 'admin', 'superadmin')
           AND COALESCE(leadership.verified, true) = true
           AND COALESCE(leadership.status, 'active') = 'active'
@@ -85,7 +86,7 @@ async fn evaluate_missing_check_ins(pool: &PgPool) -> Result<usize, sqlx::Error>
         ORDER BY s.start_time ASC, leadership.id ASC
         "#,
     )
-    .bind(check_in_grace_minutes().to_string())
+    .bind(check_in_grace_minutes())
     .fetch_all(pool)
     .await?;
 
@@ -95,6 +96,7 @@ async fn evaluate_missing_check_ins(pool: &PgPool) -> Result<usize, sqlx::Error>
         let guard_name: String = candidate.try_get("guard_name")?;
         let client_site: String = candidate.try_get("client_site")?;
         let start_time: DateTime<Utc> = candidate.try_get("start_time")?;
+        let grace_minutes: i64 = candidate.try_get("grace_minutes")?;
         let recipient_id: String = candidate.try_get("recipient_id")?;
 
         sqlx::query(
@@ -110,7 +112,7 @@ async fn evaluate_missing_check_ins(pool: &PgPool) -> Result<usize, sqlx::Error>
             guard_name,
             client_site,
             start_time.format("%I:%M %p"),
-            check_in_grace_minutes()
+            grace_minutes
         ))
         .bind(shift_id)
         .execute(pool)
@@ -120,4 +122,36 @@ async fn evaluate_missing_check_ins(pool: &PgPool) -> Result<usize, sqlx::Error>
     }
 
     Ok(notifications_created)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an isolated PostgreSQL instance"]
+    async fn missed_check_in_uses_real_time_and_the_shifts_grace_period(pool: PgPool) {
+        crate::db::run_migrations(&pool).await.unwrap();
+        let operational_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await.unwrap();
+        sqlx::query("SELECT set_config('sentinel.reference_time', '2000-01-01T00:00:00Z', false)")
+            .execute(&operational_pool).await.unwrap();
+        sqlx::query("INSERT INTO users (id, username, email, password, role, verified, full_name, phone_number) VALUES
+            ('leader', 'leader', 'leader@example.test', 'fixture', 'supervisor', true, 'Fixture Leader', ''),
+            ('guard', 'guard', 'guard@example.test', 'fixture', 'guard', true, 'Fixture Guard', '')")
+            .execute(&operational_pool).await.unwrap();
+        sqlx::query("INSERT INTO shifts (id, guard_id, client_site, start_time, end_time, status, grace_period_minutes) VALUES
+            ('missed', 'guard', 'Fixture Post', NOW() - INTERVAL '10 minutes', NOW() + INTERVAL '1 hour', 'scheduled', 5),
+            ('grace', 'guard', 'Fixture Post', NOW() - INTERVAL '10 minutes', NOW() + INTERVAL '1 hour', 'scheduled', 20)")
+            .execute(&operational_pool).await.unwrap();
+        assert_eq!(evaluate_missing_check_ins(&operational_pool).await.unwrap(), 1);
+        assert_eq!(evaluate_missing_check_ins(&operational_pool).await.unwrap(), 0);
+        let related_shift: String = sqlx::query_scalar("SELECT related_shift_id FROM notifications WHERE type = 'missing_check_in'")
+            .fetch_one(&operational_pool).await.unwrap();
+        assert_eq!(related_shift, "missed");
+        operational_pool.close().await;
+    }
 }
