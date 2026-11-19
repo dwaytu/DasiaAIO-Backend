@@ -232,6 +232,8 @@ pub async fn get_all_firearms(
 pub struct ApproveCustodyReviewRequest {
     inventory_updated_at: DateTime<Utc>,
     source_reference: String,
+    #[serde(default)]
+    confirm_in_stock: bool,
 }
 
 pub async fn approve_custody_review(
@@ -247,6 +249,7 @@ pub async fn approve_custody_review(
         payload.inventory_updated_at,
         &claims.sub,
         &payload.source_reference,
+        payload.confirm_in_stock,
     )
     .await?;
     Ok((StatusCode::CREATED, Json(approval)))
