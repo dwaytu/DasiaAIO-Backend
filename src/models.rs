@@ -908,6 +908,7 @@ pub struct RankedGuardResponse {
     pub merit_rank: Option<String>,
     pub on_time_percentage: f64,
     pub client_rating: f64,
+    pub evaluation_count: i64,
 }
 
 // ── Requirement 3: Firearm Maintenance ──────────────────────────────────────

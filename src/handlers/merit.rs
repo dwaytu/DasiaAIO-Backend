@@ -26,6 +26,16 @@ fn validate_evaluation_rating(rating: f64) -> AppResult<()> {
     Ok(())
 }
 
+async fn guard_evaluation_summary(db: &PgPool, guard_id: &str) -> AppResult<(Option<f64>, i64)> {
+    sqlx::query_as(
+        "SELECT AVG(rating)::FLOAT8, COUNT(*) FROM client_evaluations WHERE guard_id = $1",
+    )
+    .bind(guard_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to query evaluations: {e}")))
+}
+
 // Calculate merit score for a guard based on performance metrics
 pub async fn calculate_merit_score(
     State(db): State<Arc<PgPool>>,
@@ -86,19 +96,13 @@ pub async fn calculate_merit_score(
     };
 
     // 3. Calculate the evaluator rating (average of supervisor/admin evaluations)
-    let (avg_rating, eval_count): (Option<f64>, Option<i64>) = sqlx::query_as(
-        "SELECT CAST(AVG(rating) AS FLOAT8), COUNT(*)::int8 FROM client_evaluations WHERE guard_id = $1"
-    )
-    .bind(guard_id)
-    .fetch_one(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to query evaluations: {}", e)))?;
+    let (avg_rating, eval_count) = guard_evaluation_summary(db.as_ref(), guard_id).await?;
 
     let client_rating = match avg_rating {
         Some(avg) => (avg / 5.0) * 100.0, // Convert 0-5 to 0-100
         None => 0.0,
     };
-    let eval_count = eval_count.unwrap_or(0) as i32;
+    let eval_count = eval_count as i32;
 
     // 4. Calculate Overall Score (weighted average)
     // Attendance: 30%, Punctuality: 35%, Client Rating: 35%
@@ -261,6 +265,9 @@ pub async fn get_guard_merit_score(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
+    let (average_rating, evaluation_count) =
+        guard_evaluation_summary(db.as_ref(), &guard_id).await?;
+    let average_rating = average_rating.unwrap_or(0.0);
     let response = match merit_score {
         Some(merit_score) => MeritScoreResponse {
             guard_id,
@@ -269,14 +276,14 @@ pub async fn get_guard_merit_score(
             rank: merit_score.rank,
             attendance_score: merit_score.attendance_score,
             punctuality_score: merit_score.punctuality_score,
-            client_rating: merit_score.client_rating,
+            client_rating: average_rating * 20.0,
             stats: MeritStats {
                 total_shifts: merit_score.total_shifts_completed.unwrap_or(0),
                 on_time_count: merit_score.on_time_count.unwrap_or(0),
                 late_count: merit_score.late_count.unwrap_or(0),
                 no_show_count: merit_score.no_show_count.unwrap_or(0),
-                evaluations: merit_score.evaluation_count.unwrap_or(0),
-                average_rating: merit_score.average_client_rating.unwrap_or(0.0),
+                evaluations: evaluation_count as i32,
+                average_rating,
             },
         },
         None => MeritScoreResponse {
@@ -286,14 +293,14 @@ pub async fn get_guard_merit_score(
             rank: Some("Not evaluated".to_string()),
             attendance_score: 0.0,
             punctuality_score: 0.0,
-            client_rating: 0.0,
+            client_rating: average_rating * 20.0,
             stats: MeritStats {
                 total_shifts: 0,
                 on_time_count: 0,
                 late_count: 0,
                 no_show_count: 0,
-                evaluations: 0,
-                average_rating: 0.0,
+                evaluations: evaluation_count as i32,
+                average_rating,
             },
         },
     };
@@ -308,14 +315,19 @@ pub async fn get_ranked_guards(
 ) -> AppResult<Json<serde_json::Value>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
-    let guards = sqlx::query_as::<_, (String, String, f64, Option<String>, i32, i32, f64)>(
+    let guards = sqlx::query_as::<_, (String, String, f64, Option<String>, i32, i32, f64, i64)>(
         "SELECT u.id, COALESCE(u.full_name, u.username),
                 COALESCE(gms.overall_score, 0)::FLOAT8, gms.rank,
                 COALESCE(gms.on_time_count, 0),
                 COALESCE(gms.on_time_count, 0) + COALESCE(gms.late_count, 0) + COALESCE(gms.no_show_count, 0),
-                COALESCE(gms.client_rating, 0)::FLOAT8
+                COALESCE(reviews.average_rating, 0) * 20.0,
+                COALESCE(reviews.evaluation_count, 0)
          FROM users u
          LEFT JOIN guard_merit_scores gms ON gms.guard_id = u.id
+         LEFT JOIN (
+             SELECT guard_id, AVG(rating)::FLOAT8 AS average_rating, COUNT(*) AS evaluation_count
+             FROM client_evaluations GROUP BY guard_id
+         ) reviews ON reviews.guard_id = u.id
          WHERE LOWER(BTRIM(COALESCE(u.role, ''))) = 'guard'
            AND COALESCE(u.status, 'active') = 'active'
            AND u.verified = true
@@ -330,7 +342,10 @@ pub async fn get_ranked_guards(
         .into_iter()
         .enumerate()
         .map(
-            |(idx, (guard_id, guard_name, score, rank, on_time, total, rating))| {
+            |(
+                idx,
+                (guard_id, guard_name, score, rank, on_time, total, rating, evaluation_count),
+            )| {
                 let on_time_pct = if total > 0 {
                     (on_time as f64 / total as f64) * 100.0
                 } else {
@@ -345,6 +360,7 @@ pub async fn get_ranked_guards(
                     merit_rank: rank.or_else(|| Some("Not evaluated".to_string())),
                     on_time_percentage: on_time_pct,
                     client_rating: rating,
+                    evaluation_count,
                 }
             },
         )
@@ -539,7 +555,7 @@ pub async fn get_overtime_candidates(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_evaluation_rating;
+    use super::*;
 
     #[test]
     fn evaluation_rating_accepts_the_documented_scale() {
@@ -554,5 +570,56 @@ mod tests {
         assert!(validate_evaluation_rating(5.1).is_err());
         assert!(validate_evaluation_rating(f64::NAN).is_err());
         assert!(validate_evaluation_rating(f64::INFINITY).is_err());
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an isolated PostgreSQL instance"]
+    async fn merit_reads_current_reviews_with_saved_scores(pool: PgPool) {
+        crate::db::run_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, email, username, password, role, full_name, phone_number, verified) VALUES
+             ('reviewed', 'reviewed@example.test', 'reviewed', 'fixture', 'guard', 'Guard A', '', true),
+             ('unreviewed', 'unreviewed@example.test', 'unreviewed', 'fixture', 'guard', 'Guard B', '', true)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO guard_merit_scores (id, guard_id, overall_score, rank) VALUES
+             ('score-a', 'reviewed', 100.0, 'Excellent'), ('score-b', 'unreviewed', 100.0, 'Excellent')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO client_evaluations (id, guard_id, evaluator_name, rating) VALUES
+             ('review-a', 'reviewed', 'Fixture Reviewer', 4), ('review-b', 'reviewed', 'Fixture Reviewer', 5)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let token =
+            utils::generate_access_token("reviewer", "reviewer@example.test", "supervisor", true)
+                .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let db = Arc::new(pool);
+
+        let Json(result) = get_ranked_guards(State(db.clone()), headers.clone())
+            .await
+            .unwrap();
+        let rankings = result["rankings"].as_array().unwrap();
+        assert_eq!(rankings[0]["evaluationCount"], 2);
+        assert_eq!(rankings[0]["clientRating"], 90.0);
+        assert_eq!(rankings[1]["evaluationCount"], 0);
+        assert_eq!(rankings[1]["overallScore"], 100.0);
+
+        let Json(scorecard) = get_guard_merit_score(State(db), headers, Path("reviewed".into()))
+            .await
+            .unwrap();
+        assert_eq!(scorecard.stats.evaluations, 2);
+        assert_eq!(scorecard.stats.average_rating, 4.5);
+        assert_eq!(scorecard.overall_score, 100.0);
     }
 }
