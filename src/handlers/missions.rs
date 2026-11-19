@@ -26,7 +26,7 @@ pub struct MissionAssignmentRequest {
     pub date: String,
     pub start_time: String,
     pub end_time: String,
-    pub destination: String,
+    pub destination: Option<String>,
     pub priority: Option<String>,
     pub special_requirements: Option<String>,
 }
@@ -73,7 +73,7 @@ pub struct VehicleAssignment {
 pub struct MissionDetails {
     pub start_time: chrono::DateTime<chrono::Utc>,
     pub end_time: chrono::DateTime<chrono::Utc>,
-    pub destination: String,
+    pub destination: Option<String>,
     pub estimated_duration_hours: f64,
 }
 
@@ -125,6 +125,10 @@ pub async fn assign_mission(
     }
 
     let duration = (end_time - start_time).num_minutes() as f64 / 60.0;
+    let destination = payload
+        .destination
+        .as_deref()
+        .filter(|site| !site.trim().is_empty());
 
     // 1. Find available guards
     #[derive(sqlx::FromRow)]
@@ -251,7 +255,7 @@ pub async fn assign_mission(
         .bind(&guard.id)
         .bind(start_time)
         .bind(end_time)
-        .bind(&payload.destination)
+        .bind(destination.unwrap_or("Unassigned"))
         .execute(db.as_ref())
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to create shift: {}", e)))?;
@@ -314,7 +318,7 @@ pub async fn assign_mission(
         .bind(&vehicle.id)
         .bind(start_time)
         .bind(end_time)
-        .bind(&payload.destination)
+        .bind(destination)
         .bind(&guards.first().map(|g| g.id.clone()).unwrap_or_default())
         .execute(db.as_ref())
         .await
@@ -342,7 +346,7 @@ pub async fn assign_mission(
         mission_details: MissionDetails {
             start_time,
             end_time,
-            destination: payload.destination.clone(),
+            destination: destination.map(str::to_owned),
             estimated_duration_hours: duration,
         },
         created_at: chrono::Utc::now(),
@@ -395,6 +399,74 @@ pub async fn get_missions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an isolated PostgreSQL instance"]
+    async fn mission_assignment_accepts_omitted_destination(pool: PgPool) {
+        crate::db::run_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, email, username, password, role, full_name, phone_number, verified) VALUES
+             ('leader', 'leader@example.test', 'leader', 'fixture', 'supervisor', 'Fixture Leader', '', true),
+             ('guard', 'guard@example.test', 'guard', 'fixture', 'guard', 'Fixture Guard', '', true)",
+        )
+        .execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO armored_cars (id, license_plate, vin, model, manufacturer, capacity_kg)
+             VALUES ('vehicle', 'QA-123', 'fixture-mission', 'Fixture', 'Fixture', 1000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let token =
+            utils::generate_access_token("leader", "leader@example.test", "supervisor", true)
+                .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let mut request = json!({
+            "mission_name": "Fixture mission", "guards_required": 1, "vehicles_required": 1,
+            "firearms_required": 0, "guard_id": "guard", "vehicle_id": "vehicle",
+            "date": "2030-01-02", "start_time": "08:00", "end_time": "09:00"
+        });
+        let (status, Json(assigned)) = assign_mission(
+            State(Arc::new(pool.clone())),
+            headers.clone(),
+            Json(serde_json::from_value(request.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(assigned["mission_details"]["destination"].is_null());
+
+        request["date"] = json!("2030-01-03");
+        request["destination"] = json!("Existing Client Site");
+        let (_, Json(legacy)) = assign_mission(
+            State(Arc::new(pool.clone())),
+            headers,
+            Json(serde_json::from_value(request).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            legacy["mission_details"]["destination"],
+            "Existing Client Site"
+        );
+
+        let sites: Vec<String> = sqlx::query_scalar(
+            "SELECT client_site FROM shifts WHERE guard_id = 'guard' ORDER BY start_time",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(sites, ["Unassigned", "Existing Client Site"]);
+        let destinations: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT destination FROM trips WHERE car_id = 'vehicle' ORDER BY start_time",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(destinations, [None, Some("Existing Client Site".into())]);
+    }
 
     #[sqlx::test(migrations = false)]
     #[ignore = "requires an isolated PostgreSQL instance"]

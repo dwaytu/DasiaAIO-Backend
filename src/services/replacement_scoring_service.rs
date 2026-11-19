@@ -296,7 +296,6 @@ pub async fn suggest_shift_replacement(
         ) site ON site.id = $2
         WHERE s.id = $1
           AND s.start_time <= CURRENT_TIMESTAMP AND s.end_time > CURRENT_TIMESTAMP
-          AND COALESCE(s.replacement_status, 'not_needed') <> 'accepted'
           AND (s.status IN ('absent', 'no_show') OR (
               s.status = 'scheduled'
               AND s.start_time + COALESCE(s.grace_period_minutes, $3::bigint) * INTERVAL '1 minute' <= CURRENT_TIMESTAMP

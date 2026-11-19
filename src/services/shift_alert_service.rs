@@ -82,6 +82,7 @@ async fn evaluate_missing_check_ins(pool: &PgPool) -> Result<usize, sqlx::Error>
               WHERE n.user_id = leadership.id
                 AND n.type = 'missing_check_in'
                 AND n.related_shift_id = s.id
+                AND n.created_at >= s.start_time
           )
         ORDER BY s.start_time ASC, leadership.id ASC
         "#,
@@ -152,6 +153,12 @@ mod tests {
         let related_shift: String = sqlx::query_scalar("SELECT related_shift_id FROM notifications WHERE type = 'missing_check_in'")
             .fetch_one(&operational_pool).await.unwrap();
         assert_eq!(related_shift, "missed");
+        sqlx::query("UPDATE notifications SET created_at = NOW() - INTERVAL '30 minutes' WHERE related_shift_id = 'missed'")
+            .execute(&operational_pool).await.unwrap();
+        sqlx::query("UPDATE shifts SET replacement_status = 'accepted' WHERE id = 'missed'")
+            .execute(&operational_pool).await.unwrap();
+        assert_eq!(evaluate_missing_check_ins(&operational_pool).await.unwrap(), 1);
+        assert_eq!(evaluate_missing_check_ins(&operational_pool).await.unwrap(), 0);
         operational_pool.close().await;
     }
 }

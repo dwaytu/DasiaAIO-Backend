@@ -545,7 +545,6 @@ struct ReplacementShift {
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
     status: String,
-    replacement_status: String,
     updated_at: DateTime<Utc>,
     grace_minutes: i64,
 }
@@ -578,7 +577,6 @@ pub async fn confirm_replacement(
     let mut tx = db.begin().await.map_err(replacement_database_error)?;
     let shift: ReplacementShift = sqlx::query_as(
         r#"SELECT guard_id, client_site, start_time, end_time, status, updated_at,
-                  COALESCE(replacement_status, 'not_needed') AS replacement_status,
                   COALESCE(grace_period_minutes::bigint, $2) AS grace_minutes
            FROM shifts WHERE id = $1 FOR UPDATE"#,
     )
@@ -588,10 +586,7 @@ pub async fn confirm_replacement(
     .await
     .map_err(replacement_database_error)?
     .ok_or_else(|| AppError::NotFound("Shift not found.".to_string()))?;
-    if shift.guard_id != payload.original_guard_id
-        || shift.updated_at != payload.shift_updated_at
-        || shift.replacement_status == "accepted"
-    {
+    if shift.guard_id != payload.original_guard_id || shift.updated_at != payload.shift_updated_at {
         return Err(AppError::Conflict(
             "The shift changed. Refresh it before choosing a replacement.".to_string(),
         ));
@@ -1371,7 +1366,6 @@ pub async fn get_all_shifts(
          check_in.missed AS missed_check_in,
          (
            s.start_time <= CURRENT_TIMESTAMP AND s.end_time > CURRENT_TIMESTAMP
-           AND COALESCE(s.replacement_status, 'not_needed') <> 'accepted'
            AND (check_in.missed OR s.status IN ('absent', 'no_show'))
            AND NOT EXISTS (SELECT 1 FROM attendance a WHERE a.shift_id = s.id)
          ) AS replacement_eligible,
@@ -1574,7 +1568,8 @@ mod tests {
         sqlx::query("INSERT INTO users (id, username, email, password, role, verified, full_name, phone_number) VALUES
             ('leader', 'leader', 'leader@example.test', 'fixture', 'supervisor', true, 'Fixture Leader', ''),
             ('original', 'original', 'original@example.test', 'fixture', 'guard', true, 'Original Guard', ''),
-            ('replacement', 'replacement', 'replacement@example.test', 'fixture', 'guard', true, 'Replacement Guard', '')")
+            ('replacement', 'replacement', 'replacement@example.test', 'fixture', 'guard', true, 'Replacement Guard', ''),
+            ('backup', 'backup', 'backup@example.test', 'fixture', 'guard', true, 'Backup Guard', '')")
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO client_sites (id, name, latitude, longitude) VALUES ('site', 'Fixture Post', 7, 125)")
             .execute(&pool).await.unwrap();
@@ -1618,5 +1613,35 @@ mod tests {
         let attendance: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attendance WHERE shift_id = 'target'")
             .fetch_one(&pool).await.unwrap();
         assert_eq!(attendance, 0);
+
+        let retry_handoff = |shift_updated_at: DateTime<Utc>| {
+            let mut headers = HeaderMap::new();
+            headers.insert("Authorization", format!("Bearer {leader_token}").parse().unwrap());
+            confirm_replacement(State(Arc::new(pool.clone())), headers, Json(ConfirmReplacementRequest {
+                shift_id: "target".into(), original_guard_id: "replacement".into(), replacement_guard_id: "backup".into(),
+                shift_updated_at, confirmed_available: true,
+            }))
+        };
+        assert!(matches!(retry_handoff(starts_at).await, Err(AppError::Conflict(_))));
+
+        let overdue_version: DateTime<Utc> = sqlx::query_scalar(
+            "UPDATE shifts SET start_time = NOW() - INTERVAL '20 minutes', updated_at = NOW()
+             WHERE id = 'target' RETURNING updated_at",
+        ).fetch_one(&pool).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {leader_token}").parse().unwrap());
+        let Json(overdue) = get_all_shifts(State(Arc::new(pool.clone())), headers, Query(AllShiftsQuery {
+            page: None, page_size: None, scope: Some("today".into()),
+        })).await.unwrap();
+        assert_eq!(overdue["shifts"][0]["replacement_eligible"], true);
+        assert_eq!(overdue["shifts"][0]["guard_id"], "replacement");
+        let candidates = crate::services::replacement_scoring_service::suggest_shift_replacement(&pool, "site", "target").await.unwrap();
+        assert!(candidates.iter().any(|guard| guard.guard_id == "backup"));
+        assert!(!candidates.iter().any(|guard| guard.guard_id == "replacement"));
+        let _ = retry_handoff(overdue_version).await.unwrap();
+        let previous_guards: Vec<String> = sqlx::query_scalar(
+            "SELECT absent_guard_id FROM smart_guard_replacements WHERE shift_id = 'target' ORDER BY created_at",
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(previous_guards, ["original", "replacement"]);
     }
 }
