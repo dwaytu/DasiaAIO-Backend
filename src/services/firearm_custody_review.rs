@@ -109,6 +109,7 @@ mod tests {
     #[sqlx::test(migrations = false)]
     #[ignore = "requires an isolated PostgreSQL instance"]
     async fn records_one_audited_approval_without_mutating_custody(pool: PgPool) {
+        use crate::handlers::firearm_allocation::get_allocation_summary;
         use crate::handlers::firearms::approve_custody_review;
 
         crate::db::run_migrations(&pool).await.unwrap();
@@ -127,6 +128,17 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+
+        let assert_review_counts = |pending: i64| {
+            let pool = pool.clone();
+            async move {
+                let Json(summary) = get_allocation_summary(State(Arc::new(pool))).await.unwrap();
+                assert_eq!(summary["custodyReviewFirearms"], 1);
+                assert_eq!(summary["pendingCustodyReviewFirearms"], pending);
+                assert_eq!(summary["activeCustody"], 0);
+            }
+        };
+        assert_review_counts(1).await;
 
         assert!(matches!(
             approve(&pool, "fixture", snapshot, "reviewer", " ").await,
@@ -163,6 +175,7 @@ mod tests {
             _ => panic!("Expected exactly one approval and one conflict"),
         };
         assert_eq!(status, StatusCode::CREATED);
+        assert_review_counts(0).await;
         let audit: Vec<(Option<String>, String)> = sqlx::query_as(
             r#"SELECT actor_user_id, metadata->>'sourceReference' FROM audit_logs
                WHERE entity_id = 'fixture' AND action_key = 'firearm.custody_review.approved'"#,
@@ -211,6 +224,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        assert_review_counts(1).await;
         assert!(matches!(
             approve(&pool, "fixture", snapshot, "reviewer", "Log 1").await,
             Err(AppError::Conflict(_))

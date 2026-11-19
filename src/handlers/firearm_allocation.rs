@@ -346,6 +346,17 @@ pub async fn get_allocation_summary(
                        COUNT(*) FILTER (WHERE register_status = 'unverified') AS unverified
                 FROM firearm_allocation_register_provenance
                 GROUP BY record_origin
+            ), custody_review_counts AS (
+                SELECT COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE approval.firearm_id IS NULL) AS pending
+                FROM firearms f
+                LEFT JOIN firearm_custody_review_approvals approval
+                  ON approval.firearm_id = f.id AND approval.inventory_updated_at = f.updated_at
+                WHERE LOWER(BTRIM(f.status)) IN ('allocated', 'deployed')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM firearm_allocations fa
+                    WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active'
+                  )
             )
             SELECT
                 (SELECT COUNT(*)::BIGINT FROM firearms) AS total_firearms,
@@ -353,12 +364,8 @@ pub async fn get_allocation_summary(
                 (SELECT COUNT(*)::BIGINT FROM firearms WHERE LOWER(BTRIM(status)) IN ('allocated', 'deployed')) AS allocated_firearms,
                 (SELECT COUNT(*)::BIGINT FROM firearms WHERE LOWER(BTRIM(status)) = 'maintenance') AS maintenance_firearms,
                 (SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'active') AS active_custody,
-                (SELECT COUNT(*)::BIGINT FROM firearms f
-                 WHERE LOWER(BTRIM(f.status)) IN ('allocated', 'deployed')
-                   AND NOT EXISTS (
-                     SELECT 1 FROM firearm_allocations fa
-                     WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active'
-                   )) AS custody_review_firearms,
+                (SELECT total FROM custody_review_counts) AS custody_review_firearms,
+                (SELECT pending FROM custody_review_counts) AS pending_custody_review_firearms,
                 (SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'returned') AS returned_allocations,
                 (SELECT COUNT(*)::BIGINT FROM firearm_allocations WHERE LOWER(BTRIM(status)) = 'imported') AS imported_allocations,
                 (SELECT COUNT(*)::BIGINT FROM firearm_allocations) AS total_allocation_records,
@@ -412,6 +419,7 @@ pub async fn get_allocation_summary(
         "activeCustody": active_custody,
         "verifiedActiveCustody": verified_active_custody,
         "custodyReviewFirearms": row.get::<i64, _>("custody_review_firearms"),
+        "pendingCustodyReviewFirearms": row.get::<i64, _>("pending_custody_review_firearms"),
         "returnedAllocations": row.get::<i64, _>("returned_allocations"),
         "importedAllocations": row.get::<i64, _>("imported_allocations"),
         "totalAllocationRecords": row.get::<i64, _>("total_allocation_records"),
