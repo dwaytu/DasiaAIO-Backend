@@ -267,6 +267,16 @@ fn build_guard_performance_summary(
 }
 
 // Get comprehensive analytics
+const MONTHLY_MISSION_COUNTS_SQL: &str = r#"
+    WITH bounds AS (
+        SELECT date_trunc('month', timezone('Asia/Manila', CURRENT_TIMESTAMP)) AS local_month_start
+    )
+    SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'completed')
+    FROM trips CROSS JOIN bounds
+    WHERE start_time >= timezone('Asia/Manila', local_month_start)
+      AND start_time < timezone('Asia/Manila', local_month_start + INTERVAL '1 month')
+"#;
+
 pub async fn get_analytics(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
@@ -329,26 +339,13 @@ pub async fn get_analytics(
     };
 
     // Mission stats
-    let total_missions_this_month = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM trips 
-         WHERE EXTRACT(MONTH FROM timezone('Asia/Manila', start_time)) = EXTRACT(MONTH FROM timezone('Asia/Manila', sentinel_now()))
-         AND EXTRACT(YEAR FROM timezone('Asia/Manila', start_time)) = EXTRACT(YEAR FROM timezone('Asia/Manila', sentinel_now()))",
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to count monthly missions: {}", e)))?;
-
-    let completed_missions_this_month = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM trips 
-         WHERE status = 'completed'
-         AND EXTRACT(MONTH FROM timezone('Asia/Manila', start_time)) = EXTRACT(MONTH FROM timezone('Asia/Manila', sentinel_now()))
-         AND EXTRACT(YEAR FROM timezone('Asia/Manila', start_time)) = EXTRACT(YEAR FROM timezone('Asia/Manila', sentinel_now()))",
-    )
-    .fetch_one(db.as_ref())
-    .await
-    .map_err(|e| {
-        AppError::DatabaseError(format!("Failed to count monthly completed missions: {}", e))
-    })?;
+    let (total_missions_this_month, completed_missions_this_month) =
+        sqlx::query_as::<_, (i64, i64)>(MONTHLY_MISSION_COUNTS_SQL)
+            .fetch_one(db.as_ref())
+            .await
+            .map_err(|e| {
+                AppError::DatabaseError(format!("Failed to count monthly missions: {e}"))
+            })?;
 
     let pending_missions =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trips WHERE status = 'scheduled'")
@@ -375,8 +372,8 @@ pub async fn get_analytics(
     let attendance_row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
         "WITH bounds AS (
             SELECT
-                ((timezone('Asia/Manila', sentinel_now())::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
-                ((timezone('Asia/Manila', sentinel_now())::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
+                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date - (($1::BIGINT - 1) * INTERVAL '1 day')) AT TIME ZONE 'Asia/Manila') AS starts_at,
+                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date + INTERVAL '1 day') AT TIME ZONE 'Asia/Manila') AS ends_at
         ), scoped_shifts AS (
             SELECT id, start_time, end_time
             FROM shifts
@@ -392,13 +389,13 @@ pub async fn get_analytics(
             ))::BIGINT,
             COUNT(*) FILTER (WHERE EXISTS (
                 SELECT 1 FROM punctuality_records p
-                WHERE p.shift_id = s.id AND p.status IN ('early', 'on_time')
+                WHERE p.shift_id = s.id AND p.is_on_time = TRUE
             ))::BIGINT,
             COUNT(*) FILTER (WHERE EXISTS (
                 SELECT 1 FROM punctuality_records p
                 WHERE p.shift_id = s.id AND p.status = 'late'
             ))::BIGINT,
-            COUNT(*) FILTER (WHERE s.end_time < sentinel_now() AND NOT EXISTS (
+            COUNT(*) FILTER (WHERE s.end_time < CURRENT_TIMESTAMP AND NOT EXISTS (
                 SELECT 1 FROM attendance a
                 WHERE a.shift_id = s.id AND a.check_in_time IS NOT NULL
             ))::BIGINT
@@ -418,8 +415,8 @@ pub async fn get_analytics(
     let attendance_trend = sqlx::query_as::<_, AttendanceTrendPoint>(
         "WITH bounds AS (
             SELECT
-                ((timezone('Asia/Manila', sentinel_now())::date - ($1::BIGINT * INTERVAL '1 day'))::timestamp AT TIME ZONE 'Asia/Manila') AS starts_at,
-                ((timezone('Asia/Manila', sentinel_now())::date + INTERVAL '1 day')::timestamp AT TIME ZONE 'Asia/Manila') AS ends_at
+                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date - (($1::BIGINT - 1) * INTERVAL '1 day')) AT TIME ZONE 'Asia/Manila') AS starts_at,
+                ((timezone('Asia/Manila', CURRENT_TIMESTAMP)::date + INTERVAL '1 day') AT TIME ZONE 'Asia/Manila') AS ends_at
         )
         SELECT
             DATE(timezone('Asia/Manila', s.start_time)) AS date,
@@ -432,7 +429,7 @@ pub async fn get_analytics(
                 SELECT 1 FROM punctuality_records p
                 WHERE p.shift_id = s.id AND p.status = 'late'
             ))::BIGINT AS late_check_ins,
-            COUNT(*) FILTER (WHERE s.end_time < sentinel_now() AND NOT EXISTS (
+            COUNT(*) FILTER (WHERE s.end_time < CURRENT_TIMESTAMP AND NOT EXISTS (
                 SELECT 1 FROM attendance a
                 WHERE a.shift_id = s.id AND a.check_in_time IS NOT NULL
             ))::BIGINT AS no_shows
@@ -861,4 +858,50 @@ pub async fn update_mission_status(
 pub struct UpdateMissionStatusRequest {
     pub mission_id: String,
     pub status: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an isolated PostgreSQL instance"]
+    async fn monthly_missions_use_current_manila_month(pool: PgPool) {
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE trips (start_time TIMESTAMPTZ NOT NULL, status TEXT NOT NULL)",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE FUNCTION sentinel_now() RETURNS TIMESTAMPTZ LANGUAGE sql STABLE AS
+            $$ SELECT CURRENT_TIMESTAMP - INTERVAL '1 month' $$",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            "WITH bounds AS (
+                SELECT date_trunc('month', timezone('Asia/Manila', CURRENT_TIMESTAMP)) AS local_start
+            )
+            INSERT INTO trips (start_time, status)
+            SELECT timezone('Asia/Manila', local_start + relative_start), status
+            FROM bounds CROSS JOIN (VALUES
+                (INTERVAL '-1 microsecond', 'completed'),
+                (INTERVAL '0 seconds', 'completed'),
+                (INTERVAL '1 day', 'scheduled'),
+                (INTERVAL '1 month', 'completed')
+            ) AS fixtures(relative_start, status)",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+
+        let counts: (i64, i64) = sqlx::query_as(MONTHLY_MISSION_COUNTS_SQL)
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+        assert_eq!(counts, (2, 1));
+    }
 }
