@@ -62,7 +62,7 @@ pub async fn get_active_trips(
          FROM trips t
          LEFT JOIN armored_cars ac ON t.car_id = ac.id
          LEFT JOIN users u ON t.driver_id = u.id
-         WHERE t.status IN ('scheduled', 'in_progress')
+         WHERE t.status IN ('scheduled', 'in_progress', 'in_transit', 'active')
          ORDER BY t.start_time ASC",
     )
     .fetch_all(db.as_ref())
@@ -210,7 +210,7 @@ pub async fn update_trip_status(
         return Err(AppError::BadRequest("Invalid trip status".to_string()));
     }
 
-    record_trip_status(db.as_ref(), &trip_id, status).await?;
+    record_trip_status(db.as_ref(), &trip_id, status, payload.expected_status.as_deref()).await?;
 
     Ok(Json(json!({
         "success": true,
@@ -218,7 +218,12 @@ pub async fn update_trip_status(
     })))
 }
 
-async fn record_trip_status(pool: &PgPool, trip_id: &str, status: &str) -> AppResult<()> {
+async fn record_trip_status(
+    pool: &PgPool,
+    trip_id: &str,
+    status: &str,
+    expected_status: Option<&str>,
+) -> AppResult<()> {
     let mut tx = pool.begin().await.map_err(trip_status_error)?;
     // Serialize status changes for the same vehicle, including allocation returns.
     let car_id: String = sqlx::query_scalar(
@@ -231,15 +236,20 @@ async fn record_trip_status(pool: &PgPool, trip_id: &str, status: &str) -> AppRe
     .map_err(trip_status_error)?
     .ok_or_else(|| AppError::NotFound("Trip not found".to_string()))?;
 
-    let updated =
-        sqlx::query("UPDATE trips SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
-            .bind(status)
-            .bind(trip_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(trip_status_error)?;
+    let updated = sqlx::query(
+        "UPDATE trips SET status = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2 AND ($3::TEXT IS NULL OR status IN ($1, $3))",
+    )
+    .bind(status)
+    .bind(trip_id)
+    .bind(expected_status)
+    .execute(&mut *tx)
+    .await
+    .map_err(trip_status_error)?;
     if updated.rows_affected() == 0 {
-        return Err(AppError::NotFound("Trip not found".to_string()));
+        return Err(AppError::Conflict(
+            "Trip status has changed. Refresh before trying again.".to_string(),
+        ));
     }
 
     if status == "in_progress" {
@@ -254,7 +264,7 @@ async fn record_trip_status(pool: &PgPool, trip_id: &str, status: &str) -> AppRe
     } else if status == "completed" {
         sqlx::query(
             "UPDATE armored_cars SET status = CASE
-                WHEN EXISTS (SELECT 1 FROM trips WHERE car_id = $1 AND status IN ('in_progress', 'in_transit'))
+                WHEN EXISTS (SELECT 1 FROM trips WHERE car_id = $1 AND status IN ('in_progress', 'in_transit', 'active'))
                     THEN 'in_transit'
                 WHEN EXISTS (SELECT 1 FROM car_allocations WHERE car_id = $1 AND status = 'active')
                     THEN 'allocated'
@@ -319,6 +329,7 @@ pub struct AssignDriverRequest {
 #[derive(Debug, Deserialize)]
 pub struct UpdateTripStatusRequest {
     pub status: String,
+    pub expected_status: Option<String>,
 }
 
 #[cfg(test)]
@@ -363,16 +374,20 @@ mod tests {
         .await
         .unwrap();
 
-        record_trip_status(&pool, "first", "in_progress")
+        record_trip_status(&pool, "first", "in_progress", Some("scheduled"))
             .await
             .unwrap();
-        record_trip_status(&pool, "first", "completed")
+        record_trip_status(&pool, "first", "completed", Some("in_progress"))
             .await
             .unwrap();
-        record_trip_status(&pool, "client", "completed")
+        assert!(matches!(
+            record_trip_status(&pool, "first", "in_progress", Some("scheduled")).await,
+            Err(AppError::Conflict(_))
+        ));
+        record_trip_status(&pool, "client", "completed", None)
             .await
             .unwrap();
-        record_trip_status(&pool, "service", "completed")
+        record_trip_status(&pool, "service", "completed", None)
             .await
             .unwrap();
         let fleet_statuses = || async {
@@ -386,7 +401,7 @@ mod tests {
             ["in_transit", "allocated", "maintenance"]
         );
 
-        record_trip_status(&pool, "other", "completed")
+        record_trip_status(&pool, "other", "completed", None)
             .await
             .unwrap();
         assert_eq!(

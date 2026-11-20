@@ -129,6 +129,10 @@ pub async fn assign_mission(
         .destination
         .as_deref()
         .filter(|site| !site.trim().is_empty());
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to start mission assignment: {e}")))?;
 
     // 1. Find available guards
     #[derive(sqlx::FromRow)]
@@ -151,13 +155,14 @@ pub async fn assign_mission(
                AND s.start_time < $2
                AND s.end_time > $1
          )
-         LIMIT $3",
+         ORDER BY users.id
+         LIMIT $3 FOR NO KEY UPDATE OF users SKIP LOCKED",
     )
     .bind(start_time)
     .bind(end_time)
     .bind(payload.guards_required as i64)
     .bind(payload.guard_id.as_deref())
-    .fetch_all(db.as_ref())
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to query guards: {}", e)))?;
 
@@ -183,11 +188,12 @@ pub async fn assign_mission(
            AND validity_date IS NOT NULL
            AND validity_date > CURRENT_TIMESTAMP
            AND ($2::TEXT IS NULL OR id = $2)
-         LIMIT $1",
+         ORDER BY id
+         LIMIT $1 FOR NO KEY UPDATE OF firearms SKIP LOCKED",
     )
     .bind(payload.firearms_required as i64)
     .bind(payload.firearm_id.as_deref())
-    .fetch_all(db.as_ref())
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to query firearms: {}", e)))?;
 
@@ -215,17 +221,18 @@ pub async fn assign_mission(
              SELECT 1
              FROM trips t
              WHERE t.car_id = armored_cars.id
-               AND COALESCE(t.status, 'scheduled') IN ('scheduled', 'in_progress')
+               AND COALESCE(t.status, 'scheduled') IN ('scheduled', 'in_progress', 'in_transit', 'active')
                AND t.start_time < $2
                AND t.end_time > $1
          )
-         LIMIT $3",
+         ORDER BY armored_cars.id
+         LIMIT $3 FOR NO KEY UPDATE OF armored_cars SKIP LOCKED",
     )
     .bind(start_time)
     .bind(end_time)
     .bind(payload.vehicles_required as i64)
     .bind(payload.vehicle_id.as_deref())
-    .fetch_all(db.as_ref())
+    .fetch_all(&mut *tx)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to query vehicles: {}", e)))?;
 
@@ -256,7 +263,7 @@ pub async fn assign_mission(
         .bind(start_time)
         .bind(end_time)
         .bind(destination.unwrap_or("Unassigned"))
-        .execute(db.as_ref())
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to create shift: {}", e)))?;
 
@@ -283,14 +290,14 @@ pub async fn assign_mission(
             .bind(&guard.id)
             .bind(&firearm.id)
             .bind(start_time)
-            .execute(db.as_ref())
+            .execute(&mut *tx)
             .await
             .map_err(|e| AppError::DatabaseError(format!("Failed to allocate firearm: {}", e)))?;
 
             // Update firearm status
             sqlx::query("UPDATE firearms SET status = 'allocated' WHERE id = $1")
                 .bind(&firearm.id)
-                .execute(db.as_ref())
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| AppError::DatabaseError(format!("Failed to update firearm: {}", e)))?;
 
@@ -320,7 +327,7 @@ pub async fn assign_mission(
         .bind(end_time)
         .bind(destination)
         .bind(&guards.first().map(|g| g.id.clone()).unwrap_or_default())
-        .execute(db.as_ref())
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to create trip: {}", e)))?;
 
@@ -334,6 +341,10 @@ pub async fn assign_mission(
             deployment_status: "ready".to_string(),
         });
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::DatabaseError(format!("Failed to save mission assignment: {e}")))?;
 
     let response = MissionAssignmentResponse {
         mission_id: mission_id.clone(),
@@ -406,7 +417,7 @@ mod tests {
         crate::db::run_migrations(&pool).await.unwrap();
         sqlx::query(
             "INSERT INTO users (id, email, username, password, role, full_name, phone_number, verified) VALUES
-             ('leader', 'leader@example.test', 'leader', 'fixture', 'supervisor', 'Fixture Leader', '', true),
+             ('leader', 'leader@example.test', 'leader', 'fixture', 'admin', 'Fixture Leader', '', true),
              ('guard', 'guard@example.test', 'guard', 'fixture', 'guard', 'Fixture Guard', '', true)",
         )
         .execute(&pool).await.unwrap();
@@ -419,7 +430,7 @@ mod tests {
         .unwrap();
 
         let token =
-            utils::generate_access_token("leader", "leader@example.test", "supervisor", true)
+            utils::generate_access_token("leader", "leader@example.test", "admin", true)
                 .unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
@@ -442,7 +453,7 @@ mod tests {
         request["destination"] = json!("Existing Client Site");
         let (_, Json(legacy)) = assign_mission(
             State(Arc::new(pool.clone())),
-            headers,
+            headers.clone(),
             Json(serde_json::from_value(request).unwrap()),
         )
         .await
@@ -466,6 +477,33 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(destinations, [None, Some("Existing Client Site".into())]);
+
+        let db = Arc::new(pool);
+        let Json(admin_history) = get_missions(State(db.clone()), headers.clone()).await.unwrap();
+        let trip_id = admin_history["missions"][0]["id"].as_str().unwrap().to_string();
+        for (status, expected_status) in [("in_progress", "scheduled"), ("completed", "in_progress")] {
+            let Json(updated) = crate::handlers::trip_management::update_trip_status(
+                State(db.clone()),
+                headers.clone(),
+                axum::extract::Path(trip_id.clone()),
+                Json(crate::handlers::trip_management::UpdateTripStatusRequest {
+                    status: status.to_string(),
+                    expected_status: Some(expected_status.to_string()),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(updated["success"], true);
+        }
+        let Json(completed_history) = get_missions(State(db.clone()), headers).await.unwrap();
+        assert_eq!(completed_history["missions"][0]["status"], "completed");
+        for role in ["superadmin", "supervisor"] {
+            let token = utils::generate_access_token("viewer", "viewer@example.test", role, true).unwrap();
+            let mut viewer_headers = HeaderMap::new();
+            viewer_headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+            let Json(viewer_history) = get_missions(State(db.clone()), viewer_headers).await.unwrap();
+            assert_eq!(viewer_history, completed_history);
+        }
     }
 
     #[sqlx::test(migrations = false)]

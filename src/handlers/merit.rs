@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::HeaderMap,
     http::StatusCode,
     Json,
@@ -14,6 +14,7 @@ use crate::{
         CalculateMeritScoreRequest, ClientEvaluation, CreateClientEvaluationRequest,
         GuardMeritScore, MeritScoreResponse, MeritStats, RankedGuardResponse,
     },
+    services::guard_performance_history,
     utils,
 };
 
@@ -268,6 +269,16 @@ pub async fn get_guard_merit_score(
     let (average_rating, evaluation_count) =
         guard_evaluation_summary(db.as_ref(), &guard_id).await?;
     let average_rating = average_rating.unwrap_or(0.0);
+    let (total_shifts, on_time, late, no_shows) =
+        guard_performance_history::activity_counts(db.as_ref(), &guard_id).await?;
+    let stats = MeritStats {
+        total_shifts: total_shifts as i32,
+        on_time_count: on_time as i32,
+        late_count: late as i32,
+        no_show_count: no_shows as i32,
+        evaluations: evaluation_count as i32,
+        average_rating,
+    };
     let response = match merit_score {
         Some(merit_score) => MeritScoreResponse {
             guard_id,
@@ -277,14 +288,7 @@ pub async fn get_guard_merit_score(
             attendance_score: merit_score.attendance_score,
             punctuality_score: merit_score.punctuality_score,
             client_rating: average_rating * 20.0,
-            stats: MeritStats {
-                total_shifts: merit_score.total_shifts_completed.unwrap_or(0),
-                on_time_count: merit_score.on_time_count.unwrap_or(0),
-                late_count: merit_score.late_count.unwrap_or(0),
-                no_show_count: merit_score.no_show_count.unwrap_or(0),
-                evaluations: evaluation_count as i32,
-                average_rating,
-            },
+            stats,
         },
         None => MeritScoreResponse {
             guard_id,
@@ -294,18 +298,56 @@ pub async fn get_guard_merit_score(
             attendance_score: 0.0,
             punctuality_score: 0.0,
             client_rating: average_rating * 20.0,
-            stats: MeritStats {
-                total_shifts: 0,
-                on_time_count: 0,
-                late_count: 0,
-                no_show_count: 0,
-                evaluations: evaluation_count as i32,
-                average_rating,
-            },
+            stats,
         },
     };
 
     Ok(Json(response))
+}
+
+#[derive(serde::Deserialize)]
+pub struct GuardPerformanceHistoryQuery {
+    category: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+pub async fn get_guard_performance_history(
+    State(db): State<Arc<PgPool>>,
+    headers: HeaderMap,
+    Path(guard_id): Path<String>,
+    Query(query): Query<GuardPerformanceHistoryQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    utils::require_min_role(&headers, "supervisor")?;
+    let category = query.category.as_deref().unwrap_or("concerns");
+    if !matches!(
+        category,
+        "concerns" | "shifts" | "punctuality" | "on_time" | "late" | "no_show" | "evaluations"
+    ) {
+        return Err(AppError::BadRequest("Unknown history category".to_string()));
+    }
+    if query.page.is_some_and(|page| page > i64::MAX / 50) {
+        return Err(AppError::BadRequest("Page number is out of range".to_string()));
+    }
+    let guard_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND LOWER(BTRIM(role)) = 'guard')",
+    )
+    .bind(&guard_id)
+    .fetch_one(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to look up guard: {e}")))?;
+    if !guard_exists {
+        return Err(AppError::NotFound("Guard not found".to_string()));
+    }
+    let (page, page_size, offset) = utils::resolve_pagination(
+        utils::PaginationQuery { page: query.page, page_size: query.page_size },
+        20,
+        50,
+    );
+    let (total, items) =
+        guard_performance_history::list_history(db.as_ref(), &guard_id, category, page_size, offset)
+            .await?;
+    Ok(Json(json!({ "total": total, "page": page, "pageSize": page_size, "items": items })))
 }
 
 // Get all guards ranked by merit score
@@ -621,5 +663,63 @@ mod tests {
         assert_eq!(scorecard.stats.evaluations, 2);
         assert_eq!(scorecard.stats.average_rating, 4.5);
         assert_eq!(scorecard.overall_score, 100.0);
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "requires an isolated PostgreSQL instance"]
+    async fn guard_history_filters_recorded_activity_for_the_selected_guard(pool: PgPool) {
+        crate::db::run_migrations(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, email, username, password, role, full_name, phone_number, verified) VALUES
+             ('target', 'target@example.test', 'target', 'fixture', 'guard', 'Fixture Guard', '', true),
+             ('other', 'other@example.test', 'other', 'fixture', 'guard', 'Other Fixture Guard', '', true)",
+        ).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO shifts (id, guard_id, client_site, start_time, end_time, status) VALUES
+             ('post', 'target', 'Fixture Site', NOW() - INTERVAL '3 days', NOW() - INTERVAL '3 days' + INTERVAL '1 hour', 'scheduled')",
+        ).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO punctuality_records
+             (id, guard_id, shift_id, scheduled_start_time, actual_check_in_time, minutes_late, is_on_time, status)
+             VALUES
+             ('late-entry', 'target', 'post', NOW() - INTERVAL '3 days', NOW() - INTERVAL '3 days' + INTERVAL '16 minutes', 16, false, 'late'),
+             ('absent-entry', 'target', 'past', NOW() - INTERVAL '2 days', NULL, NULL, false, 'absent'),
+             ('present-entry', 'target', 'past-2', NOW() - INTERVAL '4 days', NOW() - INTERVAL '4 days', 0, true, 'present'),
+             ('other-entry', 'other', 'other-post', NOW(), NOW(), 18, false, 'late')",
+        ).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO client_evaluations (id, guard_id, evaluator_name, rating, comment) VALUES
+             ('review-concern', 'target', 'Fixture Reviewer', 2, 'Recorded review comment'),
+             ('review-positive', 'target', 'Fixture Reviewer', 5, 'Recorded positive comment')",
+        ).execute(&pool).await.unwrap();
+        let db = Arc::new(pool);
+        let read_history = |role: &str, category: &str, page, page_size| {
+            let token = utils::generate_access_token("target", "target@example.test", role, true).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+            let uri = format!("/api/merit/history/target?category={category}&page={page}&page_size={page_size}")
+                .parse().unwrap();
+            get_guard_performance_history(
+                State(db.clone()),
+                headers,
+                Path("target".into()),
+                Query::try_from_uri(&uri).unwrap(),
+            )
+        };
+
+        let Json(first) = read_history("admin", "concerns", 1, 2).await.unwrap();
+        assert_eq!(first["total"], 3);
+        assert_eq!(first["pageSize"], 2);
+        assert_eq!(first["items"][0]["comment"], "Recorded review comment");
+        assert_eq!(first["items"][1]["status"], "absent");
+        let Json(second) = read_history("supervisor", "concerns", 2, 2).await.unwrap();
+        assert_eq!(second["items"][0]["site"], "Fixture Site");
+        assert_eq!(second["items"][0]["minutes_late"], 16);
+
+        let Json(on_time) = read_history("superadmin", "on_time", 1, 20).await.unwrap();
+        assert_eq!(on_time["total"], 1);
+        assert_eq!(on_time["items"][0]["status"], "on_time");
+        assert_eq!(guard_performance_history::activity_counts(&db, "target").await.unwrap(), (1, 1, 1, 1));
+        assert!(matches!(read_history("guard", "concerns", 1, 20).await, Err(AppError::Forbidden(_))));
     }
 }

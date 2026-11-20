@@ -1301,6 +1301,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
         )
         .route(
+            "/api/merit/history/:guard_id",
+            get(handlers::merit::get_guard_performance_history).route_layer(axum_middleware::from_fn(
+                middleware::authz::require_merit_view,
+            )),
+        )
+        .route(
             "/api/merit/overtime-candidates",
             get(handlers::merit::get_overtime_candidates).route_layer(axum_middleware::from_fn(
                 middleware::authz::require_merit_view,
