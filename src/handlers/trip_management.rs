@@ -105,15 +105,15 @@ pub async fn get_trip_details(
         "SELECT DISTINCT u.id, u.full_name as name, u.username
          FROM users u
          JOIN shifts s ON u.id = s.guard_id
-         JOIN trips t ON DATE(s.start_time) = DATE(t.start_time)
-         WHERE t.id = $1 AND s.status IN ('scheduled', 'in_progress')",
+         WHERE s.trip_id = $1
+         ORDER BY name, u.id",
     )
     .bind(&trip_id)
     .fetch_all(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to fetch guards: {}", e)))?;
 
-    // Get allocated firearms
+    // Read allocations linked to the trip's shifts, including returned records.
     #[derive(sqlx::FromRow, Serialize)]
     struct FirearmInfo {
         id: String,
@@ -126,9 +126,9 @@ pub async fn get_trip_details(
         "SELECT DISTINCT f.id, f.name, f.model, f.serial_number
          FROM firearms f
          JOIN firearm_allocations fa ON f.id = fa.firearm_id
-         JOIN shifts s ON fa.guard_id = s.guard_id
-         JOIN trips t ON DATE(s.start_time) = DATE(t.start_time)
-         WHERE t.id = $1 AND fa.status = 'active'",
+         JOIN shifts s ON fa.shift_id = s.id
+         WHERE s.trip_id = $1
+         ORDER BY f.serial_number, f.id",
     )
     .bind(&trip_id)
     .fetch_all(db.as_ref())

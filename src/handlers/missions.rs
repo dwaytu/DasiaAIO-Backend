@@ -3,6 +3,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
+use chrono::{FixedOffset, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
@@ -92,8 +93,6 @@ pub async fn assign_mission(
         ));
     }
 
-    use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-
     // Parse date (YYYY-MM-DD format from HTML date input)
     let date = NaiveDate::parse_from_str(&payload.date, "%Y-%m-%d").map_err(|_| {
         AppError::BadRequest("Invalid date format. Expected YYYY-MM-DD".to_string())
@@ -108,15 +107,17 @@ pub async fn assign_mission(
     let end_time_naive = NaiveTime::parse_from_str(&payload.end_time, "%H:%M")
         .map_err(|_| AppError::BadRequest("Invalid end time format. Expected HH:MM".to_string()))?;
 
-    // Combine date and time
-    let start_datetime = NaiveDateTime::new(date, start_time_naive);
-    let end_datetime = NaiveDateTime::new(date, end_time_naive);
-
-    // Convert to UTC DateTime
-    let start_time =
-        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(start_datetime, chrono::Utc);
-    let end_time =
-        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(end_datetime, chrono::Utc);
+    let manila = FixedOffset::east_opt(8 * 60 * 60)
+        .ok_or_else(|| AppError::InternalServerError("Invalid Manila time offset".to_string()))?;
+    let to_utc = |time| {
+        manila
+            .from_local_datetime(&date.and_time(time))
+            .single()
+            .map(|timestamp| timestamp.with_timezone(&Utc))
+            .ok_or_else(|| AppError::BadRequest("Invalid mission date or time".to_string()))
+    };
+    let start_time = to_utc(start_time_naive)?;
+    let end_time = to_utc(end_time_naive)?;
 
     if end_time <= start_time {
         return Err(AppError::BadRequest(
@@ -246,12 +247,13 @@ pub async fn assign_mission(
 
     let mission_id = format!(
         "MISSION_{}_{}",
-        start_time.format("%Y%m%d"),
+        date.format("%Y%m%d"),
         utils::generate_id().split('-').next().unwrap_or("001")
     );
 
     // 4. Create shifts for guards
     let mut guard_assignments = Vec::new();
+    let mut shift_ids = Vec::with_capacity(guards.len());
     for guard in &guards {
         let shift_id = utils::generate_id();
         sqlx::query(
@@ -267,6 +269,7 @@ pub async fn assign_mission(
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to create shift: {}", e)))?;
 
+        shift_ids.push(shift_id);
         guard_assignments.push(GuardAssignment {
             id: guard.id.clone(),
             name: guard
@@ -283,13 +286,14 @@ pub async fn assign_mission(
         if let Some(guard) = guards.get(i) {
             let allocation_id = utils::generate_id();
             sqlx::query(
-                "INSERT INTO firearm_allocations (id, guard_id, firearm_id, allocation_date, status) 
-                 VALUES ($1, $2, $3, $4, 'active')"
+                "INSERT INTO firearm_allocations (id, guard_id, firearm_id, allocation_date, status, shift_id)
+                 VALUES ($1, $2, $3, $4, 'active', $5)"
             )
             .bind(&allocation_id)
             .bind(&guard.id)
             .bind(&firearm.id)
             .bind(start_time)
+            .bind(&shift_ids[i])
             .execute(&mut *tx)
             .await
             .map_err(|e| AppError::DatabaseError(format!("Failed to allocate firearm: {}", e)))?;
@@ -330,6 +334,17 @@ pub async fn assign_mission(
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to create trip: {}", e)))?;
+
+        // The assignment form records one team. It has no seating assignments
+        // when multiple vehicles are requested through the API.
+        if vehicles.len() == 1 && !shift_ids.is_empty() {
+            sqlx::query("UPDATE shifts SET trip_id = $1 WHERE id = ANY($2)")
+                .bind(&trip_id)
+                .bind(&shift_ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::DatabaseError(format!("Failed to link trip shifts: {e}")))?;
+        }
 
         vehicle_assignments.push(VehicleAssignment {
             id: vehicle.id.clone(),
@@ -418,7 +433,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO users (id, email, username, password, role, full_name, phone_number, verified) VALUES
              ('leader', 'leader@example.test', 'leader', 'fixture', 'admin', 'Fixture Leader', '', true),
-             ('guard', 'guard@example.test', 'guard', 'fixture', 'guard', 'Fixture Guard', '', true)",
+             ('guard', 'guard@example.test', 'guard', 'fixture', 'guard', 'Fixture Guard', '', true),
+             ('other-guard', 'other@example.test', 'other', 'fixture', 'guard', 'Other Guard', '', true)",
         )
         .execute(&pool).await.unwrap();
         sqlx::query(
@@ -430,8 +446,7 @@ mod tests {
         .unwrap();
 
         let token =
-            utils::generate_access_token("leader", "leader@example.test", "admin", true)
-                .unwrap();
+            utils::generate_access_token("leader", "leader@example.test", "admin", true).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
         let mut request = json!({
@@ -448,8 +463,72 @@ mod tests {
         .unwrap();
         assert_eq!(status, StatusCode::CREATED);
         assert!(assigned["mission_details"]["destination"].is_null());
+        assert_eq!(
+            assigned["mission_details"]["start_time"],
+            "2030-01-02T00:00:00Z"
+        );
+        assert_eq!(
+            assigned["mission_details"]["end_time"],
+            "2030-01-02T01:00:00Z"
+        );
+
+        sqlx::query(
+            "INSERT INTO shifts (id, guard_id, start_time, end_time, client_site, status)
+             VALUES ('same-time', 'other-guard', '2030-01-02T00:00:00Z', '2030-01-02T01:00:00Z',
+                     'Other site', 'scheduled')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let trip_id: String = sqlx::query_scalar("SELECT id FROM trips WHERE car_id = 'vehicle'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let actual_start: chrono::DateTime<Utc> =
+            sqlx::query_scalar("SELECT start_time FROM shifts WHERE trip_id = $1")
+                .bind(&trip_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            actual_start.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "2030-01-02T00:00:00Z"
+        );
+        sqlx::query(
+            "INSERT INTO firearms (id, name, serial_number, model, caliber) VALUES
+             ('linked-record', 'Fixture', 'LINKED', 'Fixture', 'Fixture'),
+             ('unrelated-record', 'Fixture', 'UNRELATED', 'Fixture', 'Fixture')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO firearm_allocations (id, guard_id, firearm_id, shift_id, status)
+             SELECT 'linked-allocation', guard_id, 'linked-record', id, 'returned'
+             FROM shifts WHERE trip_id = $1
+             UNION ALL
+             SELECT 'unrelated-allocation', guard_id, 'unrelated-record', id, 'active'
+             FROM shifts WHERE id = 'same-time'",
+        )
+        .bind(&trip_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let Json(details) = crate::handlers::trip_management::get_trip_details(
+            State(Arc::new(pool.clone())),
+            headers.clone(),
+            axum::extract::Path(trip_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(details["guard_count"], 1);
+        assert_eq!(details["guards"][0]["id"], "guard");
+        assert_eq!(details["firearm_count"], 1);
+        assert_eq!(details["firearms"][0]["id"], "linked-record");
 
         request["date"] = json!("2030-01-03");
+        request["start_time"] = json!("07:00");
         request["destination"] = json!("Existing Client Site");
         let (_, Json(legacy)) = assign_mission(
             State(Arc::new(pool.clone())),
@@ -461,6 +540,10 @@ mod tests {
         assert_eq!(
             legacy["mission_details"]["destination"],
             "Existing Client Site"
+        );
+        assert_eq!(
+            legacy["mission_details"]["start_time"],
+            "2030-01-02T23:00:00Z"
         );
 
         let sites: Vec<String> = sqlx::query_scalar(
@@ -479,9 +562,16 @@ mod tests {
         assert_eq!(destinations, [None, Some("Existing Client Site".into())]);
 
         let db = Arc::new(pool);
-        let Json(admin_history) = get_missions(State(db.clone()), headers.clone()).await.unwrap();
-        let trip_id = admin_history["missions"][0]["id"].as_str().unwrap().to_string();
-        for (status, expected_status) in [("in_progress", "scheduled"), ("completed", "in_progress")] {
+        let Json(admin_history) = get_missions(State(db.clone()), headers.clone())
+            .await
+            .unwrap();
+        let trip_id = admin_history["missions"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for (status, expected_status) in
+            [("in_progress", "scheduled"), ("completed", "in_progress")]
+        {
             let Json(updated) = crate::handlers::trip_management::update_trip_status(
                 State(db.clone()),
                 headers.clone(),
@@ -498,10 +588,13 @@ mod tests {
         let Json(completed_history) = get_missions(State(db.clone()), headers).await.unwrap();
         assert_eq!(completed_history["missions"][0]["status"], "completed");
         for role in ["superadmin", "supervisor"] {
-            let token = utils::generate_access_token("viewer", "viewer@example.test", role, true).unwrap();
+            let token =
+                utils::generate_access_token("viewer", "viewer@example.test", role, true).unwrap();
             let mut viewer_headers = HeaderMap::new();
             viewer_headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
-            let Json(viewer_history) = get_missions(State(db.clone()), viewer_headers).await.unwrap();
+            let Json(viewer_history) = get_missions(State(db.clone()), viewer_headers)
+                .await
+                .unwrap();
             assert_eq!(viewer_history, completed_history);
         }
     }
@@ -534,7 +627,19 @@ mod tests {
                 .unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
-        let Json(result) = get_missions(State(Arc::new(pool)), headers).await.unwrap();
+        let db = Arc::new(pool);
+        let Json(details) = crate::handlers::trip_management::get_trip_details(
+            State(db.clone()),
+            headers.clone(),
+            axum::extract::Path("trip".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(details["trip"]["driver_name"], "Fixture Driver");
+        assert_eq!(details["guard_count"], 0);
+        assert_eq!(details["firearm_count"], 0);
+
+        let Json(result) = get_missions(State(db), headers).await.unwrap();
         let row = &result["missions"][0];
         assert_eq!(row["vehicle_model"], "Not provided");
         assert_eq!(row["vehicle_fleet_number"], "3003");

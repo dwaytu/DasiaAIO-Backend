@@ -1595,6 +1595,8 @@ pub async fn run_migrations(pool: &PgPool) -> AppResult<()> {
     for migration in &[
         "ALTER TABLE trips ADD COLUMN IF NOT EXISTS destination VARCHAR(500)",
         "ALTER TABLE trips ALTER COLUMN start_location DROP NOT NULL",
+        "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS trip_id VARCHAR(36) REFERENCES trips(id) ON DELETE SET NULL",
+        "CREATE INDEX IF NOT EXISTS idx_shifts_trip_id ON shifts(trip_id) WHERE trip_id IS NOT NULL",
         "ALTER TABLE armored_cars ADD COLUMN IF NOT EXISTS passenger_capacity INTEGER DEFAULT 4",
         "ALTER TABLE armored_cars ADD COLUMN IF NOT EXISTS plate_number VARCHAR(50)",
     ] {
