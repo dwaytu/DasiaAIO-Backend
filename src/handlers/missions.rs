@@ -22,6 +22,7 @@ pub struct MissionAssignmentRequest {
     pub vehicles_required: i32,
     pub firearms_required: i32,
     pub guard_id: Option<String>,
+    pub guard_ids: Option<Vec<String>>,
     pub firearm_id: Option<String>,
     pub vehicle_id: Option<String>,
     pub date: String,
@@ -86,11 +87,29 @@ pub async fn assign_mission(
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
-    if payload.guards_required < 0 || payload.vehicles_required < 0 || payload.firearms_required < 0
-    {
+    if !(1..=3).contains(&payload.guards_required) {
+        return Err(AppError::BadRequest(
+            "A mission requires one to three guards".to_string(),
+        ));
+    }
+    if payload.vehicles_required < 0 || payload.firearms_required < 0 {
         return Err(AppError::BadRequest(
             "Resource quantities cannot be negative".to_string(),
         ));
+    }
+    let guard_ids = payload
+        .guard_ids
+        .or_else(|| payload.guard_id.map(|id| vec![id]));
+    if let Some(ids) = &guard_ids {
+        let distinct = ids.iter().collect::<std::collections::HashSet<_>>();
+        if ids.len() != payload.guards_required as usize
+            || distinct.len() != ids.len()
+            || ids.iter().any(|id| id.trim().is_empty())
+        {
+            return Err(AppError::BadRequest(
+                "Select one to three distinct guards".to_string(),
+            ));
+        }
     }
 
     // Parse date (YYYY-MM-DD format from HTML date input)
@@ -145,9 +164,11 @@ pub async fn assign_mission(
 
     let guards = sqlx::query_as::<_, GuardRow>(
         "SELECT id, full_name, username FROM users 
-         WHERE role IN ('guard') 
+         WHERE role = 'guard'
          AND verified = true
-         AND ($4::TEXT IS NULL OR users.id = $4)
+         AND COALESCE(approval_status, 'approved') = 'approved'
+         AND COALESCE(status, 'active') = 'active'
+         AND ($4::TEXT[] IS NULL OR users.id = ANY($4))
          AND NOT EXISTS (
              SELECT 1
              FROM shifts s
@@ -156,13 +177,13 @@ pub async fn assign_mission(
                AND s.start_time < $2
                AND s.end_time > $1
          )
-         ORDER BY users.id
+         ORDER BY array_position($4::TEXT[], users.id::TEXT), users.id
          LIMIT $3 FOR NO KEY UPDATE OF users SKIP LOCKED",
     )
     .bind(start_time)
     .bind(end_time)
     .bind(payload.guards_required as i64)
-    .bind(payload.guard_id.as_deref())
+    .bind(guard_ids.as_deref())
     .fetch_all(&mut *tx)
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to query guards: {}", e)))?;
@@ -212,16 +233,28 @@ pub async fn assign_mission(
         id: String,
         model: Option<String>,
         passenger_capacity: Option<i32>,
+        driver_id: String,
     }
 
     let vehicles = sqlx::query_as::<_, VehicleRow>(
-        "SELECT id, model, passenger_capacity FROM armored_cars
-         WHERE status IN ('operational', 'available')
+        "SELECT armored_cars.id, model, passenger_capacity, driver.guard_id AS driver_id
+         FROM armored_cars
+         JOIN LATERAL (
+             SELECT da.guard_id
+             FROM driver_assignments da JOIN users u ON u.id = da.guard_id
+             WHERE da.car_id = armored_cars.id AND da.status = 'active' AND da.end_date IS NULL
+               AND u.role = 'guard' AND u.verified = true
+               AND COALESCE(u.approval_status, 'approved') = 'approved'
+               AND COALESCE(u.status, 'active') = 'active'
+             ORDER BY da.assignment_date DESC NULLS LAST, da.id
+             LIMIT 1 FOR SHARE OF da
+         ) driver ON true
+         WHERE armored_cars.status IN ('operational', 'available')
          AND ($4::TEXT IS NULL OR armored_cars.id = $4)
          AND NOT EXISTS (
              SELECT 1
              FROM trips t
-             WHERE t.car_id = armored_cars.id
+             WHERE (t.car_id = armored_cars.id OR t.driver_id = driver.guard_id)
                AND COALESCE(t.status, 'scheduled') IN ('scheduled', 'in_progress', 'in_transit', 'active')
                AND t.start_time < $2
                AND t.end_time > $1
@@ -239,7 +272,7 @@ pub async fn assign_mission(
 
     if vehicles.len() < payload.vehicles_required as usize {
         return Err(AppError::BadRequest(format!(
-            "Insufficient vehicles available. Requested: {}, Available: {}",
+            "Insufficient available vehicles with an assigned driver. Requested: {}, Available: {}",
             payload.vehicles_required,
             vehicles.len()
         )));
@@ -330,7 +363,7 @@ pub async fn assign_mission(
         .bind(start_time)
         .bind(end_time)
         .bind(destination)
-        .bind(&guards.first().map(|g| g.id.clone()).unwrap_or_default())
+        .bind(&vehicle.driver_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::DatabaseError(format!("Failed to create trip: {}", e)))?;
@@ -434,7 +467,8 @@ mod tests {
             "INSERT INTO users (id, email, username, password, role, full_name, phone_number, verified) VALUES
              ('leader', 'leader@example.test', 'leader', 'fixture', 'admin', 'Fixture Leader', '', true),
              ('guard', 'guard@example.test', 'guard', 'fixture', 'guard', 'Fixture Guard', '', true),
-             ('other-guard', 'other@example.test', 'other', 'fixture', 'guard', 'Other Guard', '', true)",
+             ('other-guard', 'other@example.test', 'other', 'fixture', 'guard', 'Other Guard', '', true),
+             ('third-guard', 'third@example.test', 'third', 'fixture', 'guard', 'Third Guard', '', true)",
         )
         .execute(&pool).await.unwrap();
         sqlx::query(
@@ -454,6 +488,24 @@ mod tests {
             "firearms_required": 0, "guard_id": "guard", "vehicle_id": "vehicle",
             "date": "2030-01-02", "start_time": "08:00", "end_time": "09:00"
         });
+        let no_driver = assign_mission(
+            State(Arc::new(pool.clone())),
+            headers.clone(),
+            Json(serde_json::from_value(request.clone()).unwrap()),
+        )
+        .await;
+        assert!(
+            matches!(no_driver, Err(AppError::BadRequest(message)) if message.contains("assigned driver"))
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM shifts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        sqlx::query("INSERT INTO driver_assignments (id, car_id, guard_id) VALUES ('driver', 'vehicle', 'other-guard')")
+            .execute(&pool).await.unwrap();
         let (status, Json(assigned)) = assign_mission(
             State(Arc::new(pool.clone())),
             headers.clone(),
@@ -523,6 +575,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(details["guard_count"], 1);
+        assert_eq!(details["trip"]["driver_id"], "other-guard");
         assert_eq!(details["guards"][0]["id"], "guard");
         assert_eq!(details["firearm_count"], 1);
         assert_eq!(details["firearms"][0]["id"], "linked-record");
@@ -530,6 +583,8 @@ mod tests {
         request["date"] = json!("2030-01-03");
         request["start_time"] = json!("07:00");
         request["destination"] = json!("Existing Client Site");
+        request["guard_ids"] = json!(["guard", "other-guard", "third-guard"]);
+        request["guards_required"] = json!(3);
         let (_, Json(legacy)) = assign_mission(
             State(Arc::new(pool.clone())),
             headers.clone(),
@@ -544,6 +599,13 @@ mod tests {
         assert_eq!(
             legacy["mission_details"]["start_time"],
             "2030-01-02T23:00:00Z"
+        );
+        assert_eq!(
+            legacy["allocated_resources"]["guards"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
         );
 
         let sites: Vec<String> = sqlx::query_scalar(

@@ -140,6 +140,7 @@ pub struct GuardPerformanceReportRow {
     pub evaluation_count: i64,
     pub merit_score: f64,
     pub replacement_frequency: i64,
+    pub shifts_replaced: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -551,9 +552,27 @@ pub async fn get_guard_performance_report(
                 shift_id,
                 guard_id,
                 BOOL_OR(check_in_time IS NOT NULL) AS checked_in,
-                BOOL_OR(check_out_time IS NOT NULL OR status = 'checked_out') AS checked_out
+                BOOL_OR(check_out_time IS NOT NULL OR status IN ('checked_out', 'completed')) AS checked_out
             FROM attendance
             GROUP BY shift_id, guard_id
+        ), punctuality_by_shift AS (
+            SELECT shift_id, guard_id,
+                MIN(scheduled_start_time) AS scheduled_start_time,
+                BOOL_OR(status IN ('early', 'on_time') OR
+                    (status = 'present' AND is_on_time AND actual_check_in_time IS NOT NULL)) AS on_time,
+                BOOL_OR(status = 'late') AS late,
+                BOOL_OR(status IN ('absent', 'no_show')) AS absent
+            FROM punctuality_records
+            GROUP BY shift_id, guard_id
+        ), report_shifts AS (
+            SELECT s.id, s.guard_id, s.start_time, s.status
+            FROM shifts s
+            WHERE s.status NOT IN ('cancelled', 'canceled')
+            UNION ALL
+            SELECT s.id, p.guard_id, p.scheduled_start_time, 'absent'
+            FROM punctuality_by_shift p
+            JOIN shifts s ON s.id = p.shift_id AND s.guard_id <> p.guard_id
+            WHERE p.absent AND s.status NOT IN ('cancelled', 'canceled')
         ), shift_metrics AS (
             SELECT
                 s.guard_id,
@@ -563,31 +582,22 @@ pub async fn get_guard_performance_report(
                     WHERE COALESCE(abs.checked_out, false) OR s.status = 'completed'
                 )::BIGINT AS completed_shifts,
                 COUNT(*) FILTER (
-                    WHERE EXISTS (
-                        SELECT 1 FROM punctuality_records no_show
-                        WHERE no_show.shift_id = s.id
-                          AND no_show.guard_id = s.guard_id
-                          AND no_show.status = 'no_show'
-                    ) OR (
-                        NOT COALESCE(abs.checked_in, false)
-                        AND s.end_time < sentinel_now()
-                    )
-                )::BIGINT AS no_shows
-            FROM shifts s
+                    WHERE NOT COALESCE(abs.checked_in, false)
+                      AND (COALESCE(p.absent, false) OR s.status IN ('no_show', 'absent'))
+                )::BIGINT AS no_shows,
+                COUNT(*) FILTER (WHERE p.late)::BIGINT AS late_check_ins,
+                COUNT(*) FILTER (WHERE p.on_time AND NOT p.late)::BIGINT AS on_time_check_ins,
+                COUNT(*) FILTER (
+                    WHERE p.on_time OR p.late OR (NOT COALESCE(abs.checked_in, false)
+                        AND (p.absent OR s.status IN ('no_show', 'absent')))
+                )::BIGINT AS tracked_punctuality
+            FROM report_shifts s
             LEFT JOIN attendance_by_shift abs ON abs.shift_id = s.id AND abs.guard_id = s.guard_id
+            LEFT JOIN punctuality_by_shift p ON p.shift_id = s.id AND p.guard_id = s.guard_id
             WHERE ($1::TIMESTAMPTZ IS NULL OR s.start_time >= $1)
               AND ($2::TIMESTAMPTZ IS NULL OR s.start_time < $2)
+              AND (s.start_time <= CURRENT_TIMESTAMP OR COALESCE(abs.checked_in, false))
             GROUP BY s.guard_id
-        ), punctuality_metrics AS (
-            SELECT
-                guard_id,
-                COUNT(*) FILTER (WHERE status IN ('early', 'on_time'))::BIGINT AS on_time_check_ins,
-                COUNT(*) FILTER (WHERE status = 'late')::BIGINT AS late_check_ins,
-                COUNT(*) FILTER (WHERE status IN ('early', 'on_time', 'late', 'no_show'))::BIGINT AS tracked_punctuality
-            FROM punctuality_records
-            WHERE ($1::TIMESTAMPTZ IS NULL OR scheduled_start_time >= $1)
-              AND ($2::TIMESTAMPTZ IS NULL OR scheduled_start_time < $2)
-            GROUP BY guard_id
         ), incident_metrics AS (
             SELECT
                 reported_by AS guard_id,
@@ -605,19 +615,22 @@ pub async fn get_guard_performance_report(
             WHERE ($1::TIMESTAMPTZ IS NULL OR created_at >= $1)
               AND ($2::TIMESTAMPTZ IS NULL OR created_at < $2)
             GROUP BY guard_id
+        ), accepted_replacements AS (
+            SELECT absent_guard_id, recommended_guard_id
+            FROM smart_guard_replacements
+            WHERE recommendation_status = 'accepted'
+              AND ($1::TIMESTAMPTZ IS NULL OR updated_at >= $1)
+              AND ($2::TIMESTAMPTZ IS NULL OR updated_at < $2)
         ), replacement_events AS (
-            SELECT requester_id AS guard_id, status, created_at
-            FROM guard_shift_swaps
+            SELECT recommended_guard_id AS guard_id, TRUE AS covered FROM accepted_replacements
             UNION ALL
-            SELECT target_id AS guard_id, status, created_at
-            FROM guard_shift_swaps
+            SELECT absent_guard_id AS guard_id, FALSE AS covered FROM accepted_replacements
         ), replacement_metrics AS (
             SELECT
                 guard_id,
-                COUNT(*) FILTER (WHERE status = 'accepted')::BIGINT AS replacement_frequency
+                COUNT(*) FILTER (WHERE covered)::BIGINT AS replacement_frequency,
+                COUNT(*) FILTER (WHERE NOT covered)::BIGINT AS shifts_replaced
             FROM replacement_events
-            WHERE ($1::TIMESTAMPTZ IS NULL OR created_at >= $1)
-              AND ($2::TIMESTAMPTZ IS NULL OR created_at < $2)
             GROUP BY guard_id
         )
         SELECT
@@ -633,7 +646,7 @@ pub async fn get_guard_performance_report(
                 END::NUMERIC,
                 2
             )::DOUBLE PRECISION AS attendance_rate,
-            COALESCE(pm.late_check_ins, 0)::BIGINT AS late_check_ins,
+            COALESCE(sm.late_check_ins, 0)::BIGINT AS late_check_ins,
             COALESCE(sm.completed_shifts, 0)::BIGINT AS completed_shifts,
             COALESCE(sm.no_shows, 0)::BIGINT AS no_shows,
             COALESCE(im.incident_reports_submitted, 0)::BIGINT AS incident_reports_submitted,
@@ -648,18 +661,18 @@ pub async fn get_guard_performance_report(
                     END * 0.30
                 ) + (
                     CASE
-                        WHEN COALESCE(pm.tracked_punctuality, 0) > 0
-                        THEN (COALESCE(pm.on_time_check_ins, 0)::DOUBLE PRECISION / pm.tracked_punctuality::DOUBLE PRECISION) * 100.0
+                        WHEN COALESCE(sm.tracked_punctuality, 0) > 0
+                        THEN (COALESCE(sm.on_time_check_ins, 0)::DOUBLE PRECISION / sm.tracked_punctuality::DOUBLE PRECISION) * 100.0
                         ELSE 0.0
                     END * 0.35
                 ) + (
                     (COALESCE(em.average_client_rating, 0) / 5.0) * 100.0 * 0.35
                 )
             )::NUMERIC, 2)::DOUBLE PRECISION AS merit_score,
-            COALESCE(rm.replacement_frequency, 0)::BIGINT AS replacement_frequency
+            COALESCE(rm.replacement_frequency, 0)::BIGINT AS replacement_frequency,
+            COALESCE(rm.shifts_replaced, 0)::BIGINT AS shifts_replaced
         FROM guard_base gb
         LEFT JOIN shift_metrics sm ON sm.guard_id = gb.id
-        LEFT JOIN punctuality_metrics pm ON pm.guard_id = gb.id
         LEFT JOIN incident_metrics im ON im.guard_id = gb.id
         LEFT JOIN evaluation_metrics em ON em.guard_id = gb.id
         LEFT JOIN replacement_metrics rm ON rm.guard_id = gb.id
