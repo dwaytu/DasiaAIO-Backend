@@ -39,6 +39,7 @@ struct FirearmInventoryRow {
     updated_at: DateTime<Utc>,
     active_custody: bool,
     custody_review: bool,
+    returned_to_headquarters: bool,
     custody_review_approved_at: Option<DateTime<Utc>>,
     mdr_batch_id: Option<String>,
     mdr_row_ref: Option<String>,
@@ -182,6 +183,7 @@ pub async fn get_all_firearms(
                   EXISTS (SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active') AS active_custody,
                   (LOWER(BTRIM(f.status)) IN ('allocated', 'deployed') AND NOT EXISTS (
                     SELECT 1 FROM firearm_allocations fa WHERE fa.firearm_id = f.id AND LOWER(BTRIM(fa.status)) = 'active')) AS custody_review,
+                  (LOWER(BTRIM(f.status)) = 'maintenance' AND COALESCE(f.vault_status = 'returned_ghq', false)) AS returned_to_headquarters,
                   approval.approved_at AS custody_review_approved_at,
                   f.mdr_batch_id,
                   source.mdr_row_ref,
