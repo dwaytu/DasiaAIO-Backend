@@ -875,11 +875,21 @@ pub struct PunctualityRecord {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeritScoreBasis {
+    AttendancePunctuality,
+    WeightedMerit,
+    Saved,
+    NotScored,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeritScoreResponse {
     pub guard_id: String,
     pub guard_name: Option<String>,
     pub overall_score: f64,
+    pub score_basis: MeritScoreBasis,
     pub rank: Option<String>,
     pub attendance_score: f64,
     pub punctuality_score: f64,
@@ -905,6 +915,7 @@ pub struct RankedGuardResponse {
     pub guard_id: String,
     pub guard_name: Option<String>,
     pub overall_score: f64,
+    pub score_basis: MeritScoreBasis,
     pub merit_rank: Option<String>,
     pub on_time_percentage: f64,
     pub client_rating: f64,

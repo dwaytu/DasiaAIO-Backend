@@ -12,11 +12,23 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         CalculateMeritScoreRequest, ClientEvaluation, CreateClientEvaluationRequest,
-        GuardMeritScore, MeritScoreResponse, MeritStats, RankedGuardResponse,
+        GuardMeritScore, MeritScoreBasis, MeritScoreResponse, MeritStats, RankedGuardResponse,
     },
     services::guard_performance_history,
     utils,
 };
+
+const ATTENDANCE_SCORE_BATCH: &str = "capstone-live-october-2026";
+
+fn saved_score_basis(rank: Option<&str>, from_attendance_batch: bool) -> MeritScoreBasis {
+    match rank {
+        Some("Excellent" | "Good" | "For review") if from_attendance_batch => {
+            MeritScoreBasis::AttendancePunctuality
+        }
+        Some("Gold" | "Silver" | "Bronze" | "Standard") => MeritScoreBasis::WeightedMerit,
+        _ => MeritScoreBasis::Saved,
+    }
+}
 
 fn validate_evaluation_rating(rating: f64) -> AppResult<()> {
     if !rating.is_finite() || !(1.0..=5.0).contains(&rating) {
@@ -214,6 +226,7 @@ pub async fn calculate_merit_score(
             guard_id: guard_id.clone(),
             guard_name,
             overall_score: overall_score.min(100.0).max(0.0),
+            score_basis: MeritScoreBasis::WeightedMerit,
             rank: Some(rank.to_string()),
             attendance_score: attendance_score.min(100.0).max(0.0),
             punctuality_score: punctuality_score.min(100.0).max(0.0),
@@ -266,6 +279,24 @@ pub async fn get_guard_merit_score(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
+    let score_basis = match &merit_score {
+        Some(score) => {
+            let from_attendance_batch = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM capstone_seed_records
+                 WHERE batch_id = $1 AND table_name = 'guard_merit_scores' AND record_id = $2)",
+            )
+            .bind(ATTENDANCE_SCORE_BATCH)
+            .bind(&score.id)
+            .fetch_one(db.as_ref())
+            .await
+            .map_err(|e| {
+                AppError::DatabaseError(format!("Failed to read merit score source: {e}"))
+            })?;
+            saved_score_basis(score.rank.as_deref(), from_attendance_batch)
+        }
+        None => MeritScoreBasis::NotScored,
+    };
+
     let (average_rating, evaluation_count) =
         guard_evaluation_summary(db.as_ref(), &guard_id).await?;
     let average_rating = average_rating.unwrap_or(0.0);
@@ -284,6 +315,7 @@ pub async fn get_guard_merit_score(
             guard_id,
             guard_name: Some(guard_name),
             overall_score: merit_score.overall_score,
+            score_basis,
             rank: merit_score.rank,
             attendance_score: merit_score.attendance_score,
             punctuality_score: merit_score.punctuality_score,
@@ -294,6 +326,7 @@ pub async fn get_guard_merit_score(
             guard_id,
             guard_name: Some(guard_name),
             overall_score: 0.0,
+            score_basis,
             rank: Some("Not evaluated".to_string()),
             attendance_score: 0.0,
             punctuality_score: 0.0,
@@ -357,13 +390,16 @@ pub async fn get_ranked_guards(
 ) -> AppResult<Json<serde_json::Value>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
 
-    let guards = sqlx::query_as::<_, (String, String, f64, Option<String>, i32, i32, f64, i64)>(
+    let guards = sqlx::query_as::<_, (String, String, f64, Option<String>, i32, i32, f64, i64, bool, bool)>(
         "SELECT u.id, COALESCE(u.full_name, u.username),
                 COALESCE(gms.overall_score, 0)::FLOAT8, gms.rank,
                 COALESCE(gms.on_time_count, 0),
                 COALESCE(gms.on_time_count, 0) + COALESCE(gms.late_count, 0) + COALESCE(gms.no_show_count, 0),
                 COALESCE(reviews.average_rating, 0) * 20.0,
-                COALESCE(reviews.evaluation_count, 0)
+                COALESCE(reviews.evaluation_count, 0),
+                gms.id IS NOT NULL,
+                EXISTS (SELECT 1 FROM capstone_seed_records
+                  WHERE batch_id = $1 AND table_name = 'guard_merit_scores' AND record_id = gms.id)
          FROM users u
          LEFT JOIN guard_merit_scores gms ON gms.guard_id = u.id
          LEFT JOIN (
@@ -376,6 +412,7 @@ pub async fn get_ranked_guards(
            AND COALESCE(u.approval_status, 'approved') = 'approved'
          ORDER BY COALESCE(gms.overall_score, 0) DESC, COALESCE(u.full_name, u.username)"
     )
+    .bind(ATTENDANCE_SCORE_BATCH)
     .fetch_all(db.as_ref())
     .await
     .map_err(|e| AppError::DatabaseError(format!("Failed to query guards: {}", e)))?;
@@ -386,7 +423,18 @@ pub async fn get_ranked_guards(
         .map(
             |(
                 idx,
-                (guard_id, guard_name, score, rank, on_time, total, rating, evaluation_count),
+                (
+                    guard_id,
+                    guard_name,
+                    score,
+                    rank,
+                    on_time,
+                    total,
+                    rating,
+                    evaluation_count,
+                    has_score,
+                    from_attendance_batch,
+                ),
             )| {
                 let on_time_pct = if total > 0 {
                     (on_time as f64 / total as f64) * 100.0
@@ -399,6 +447,11 @@ pub async fn get_ranked_guards(
                     guard_id,
                     guard_name: Some(guard_name),
                     overall_score: score,
+                    score_basis: if has_score {
+                        saved_score_basis(rank.as_deref(), from_attendance_batch)
+                    } else {
+                        MeritScoreBasis::NotScored
+                    },
                     merit_rank: rank.or_else(|| Some("Not evaluated".to_string())),
                     on_time_percentage: on_time_pct,
                     client_rating: rating,
@@ -621,15 +674,29 @@ mod tests {
         sqlx::query(
             "INSERT INTO users (id, email, username, password, role, full_name, phone_number, verified) VALUES
              ('reviewed', 'reviewed@example.test', 'reviewed', 'fixture', 'guard', 'Guard A', '', true),
-             ('unreviewed', 'unreviewed@example.test', 'unreviewed', 'fixture', 'guard', 'Guard B', '', true)",
+             ('unreviewed', 'unreviewed@example.test', 'unreviewed', 'fixture', 'guard', 'Guard B', '', true),
+             ('unscored', 'unscored@example.test', 'unscored', 'fixture', 'guard', 'Guard C', '', true)",
         )
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
             "INSERT INTO guard_merit_scores (id, guard_id, overall_score, rank) VALUES
-             ('score-a', 'reviewed', 100.0, 'Excellent'), ('score-b', 'unreviewed', 100.0, 'Excellent')",
+             ('score-a', 'reviewed', 96.5, 'Gold'), ('score-b', 'unreviewed', 100.0, 'Excellent')",
         )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO capstone_seed_batches (batch_id, data_origin, reference_at, status) VALUES ($1, 'test', NOW(), 'complete')")
+            .bind(ATTENDANCE_SCORE_BATCH)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO capstone_seed_records (batch_id, table_name, record_id) VALUES
+             ($1, 'guard_merit_scores', 'score-a'), ($1, 'guard_merit_scores', 'score-b')",
+        )
+        .bind(ATTENDANCE_SCORE_BATCH)
         .execute(&pool)
         .await
         .unwrap();
@@ -652,17 +719,21 @@ mod tests {
             .await
             .unwrap();
         let rankings = result["rankings"].as_array().unwrap();
-        assert_eq!(rankings[0]["evaluationCount"], 2);
-        assert_eq!(rankings[0]["clientRating"], 90.0);
-        assert_eq!(rankings[1]["evaluationCount"], 0);
-        assert_eq!(rankings[1]["overallScore"], 100.0);
+        assert_eq!(rankings[0]["evaluationCount"], 0);
+        assert_eq!(rankings[0]["overallScore"], 100.0);
+        assert_eq!(rankings[0]["scoreBasis"], "attendance_punctuality");
+        assert_eq!(rankings[1]["evaluationCount"], 2);
+        assert_eq!(rankings[1]["clientRating"], 90.0);
+        assert_eq!(rankings[1]["scoreBasis"], "weighted_merit");
+        assert_eq!(rankings[2]["scoreBasis"], "not_scored");
 
         let Json(scorecard) = get_guard_merit_score(State(db), headers, Path("reviewed".into()))
             .await
             .unwrap();
         assert_eq!(scorecard.stats.evaluations, 2);
         assert_eq!(scorecard.stats.average_rating, 4.5);
-        assert_eq!(scorecard.overall_score, 100.0);
+        assert_eq!(scorecard.overall_score, 96.5);
+        assert!(matches!(scorecard.score_basis, MeritScoreBasis::WeightedMerit));
     }
 
     #[sqlx::test(migrations = false)]
