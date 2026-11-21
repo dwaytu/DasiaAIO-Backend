@@ -74,9 +74,17 @@ pub async fn get_all_maintenance(
     .await
     .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
 
+    let returned_to_headquarters_ids = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM firearms WHERE LOWER(BTRIM(status)) = 'maintenance' AND vault_status = 'returned_ghq'",
+    )
+    .fetch_all(db.as_ref())
+    .await
+    .map_err(|e| AppError::DatabaseError(format!("Failed to load headquarters returns: {}", e)))?;
+
     Ok(Json(json!({
         "total": records.len(),
         "maintenances": records,
+        "returnedToHeadquartersIds": returned_to_headquarters_ids,
     })))
 }
 
