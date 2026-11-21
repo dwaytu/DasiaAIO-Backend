@@ -11,5 +11,6 @@ pub mod mdr_resource_service;
 pub mod notification_delivery;
 pub mod operational_requests;
 pub mod replacement_scoring_service;
+pub mod road_matching;
 pub mod shift_alert_service;
 pub mod vehicle_predictive_service;

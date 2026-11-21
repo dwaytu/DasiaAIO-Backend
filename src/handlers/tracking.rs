@@ -394,6 +394,7 @@ pub struct GuardHistoryQuery {
     pub limit: Option<i64>,
     pub from: Option<String>,
     pub to: Option<String>,
+    pub road_match: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1752,10 +1753,14 @@ pub async fn get_guard_history(
         })
         .collect();
 
-    Ok(Json(json!({
+    let mut history = json!({
         "guardId": guard_id,
         "points": points,
-    })))
+    });
+    if params.road_match == Some(true) {
+        history["roadSegments"] = json!(crate::services::road_matching::match_guard_history(&points).await);
+    }
+    Ok(Json(history))
 }
 
 pub async fn get_guard_path(
