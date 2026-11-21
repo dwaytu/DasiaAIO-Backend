@@ -796,28 +796,6 @@ pub struct UpdateGuardAvailabilityRequest {
 
 // Merit Score System Models (Requirement 2)
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-#[serde(rename_all = "camelCase")]
-pub struct GuardMeritScore {
-    pub id: String,
-    pub guard_id: String,
-    pub attendance_score: f64,
-    pub punctuality_score: f64,
-    pub client_rating: f64,
-    pub overall_score: f64,
-    pub rank: Option<String>,
-    pub total_shifts_completed: Option<i32>,
-    pub on_time_count: Option<i32>,
-    pub late_count: Option<i32>,
-    pub no_show_count: Option<i32>,
-    pub average_client_rating: Option<f64>,
-    pub evaluation_count: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_calculated_at: Option<DateTime<Utc>>,
-    pub created_at: Option<DateTime<Utc>>,
-    pub updated_at: Option<DateTime<Utc>>,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CalculateMeritScoreRequest {
@@ -877,9 +855,7 @@ pub struct PunctualityRecord {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MeritScoreBasis {
-    AttendancePunctuality,
     WeightedMerit,
-    Saved,
     NotScored,
 }
 
@@ -888,11 +864,13 @@ pub enum MeritScoreBasis {
 pub struct MeritScoreResponse {
     pub guard_id: String,
     pub guard_name: Option<String>,
-    pub overall_score: f64,
+    pub overall_score: Option<f64>,
     pub score_basis: MeritScoreBasis,
     pub rank: Option<String>,
     pub attendance_score: f64,
     pub punctuality_score: f64,
+    pub has_attendance_records: bool,
+    pub has_punctuality_records: bool,
     pub client_rating: f64,
     pub stats: MeritStats,
 }
@@ -914,10 +892,12 @@ pub struct RankedGuardResponse {
     pub rank: i32,
     pub guard_id: String,
     pub guard_name: Option<String>,
-    pub overall_score: f64,
+    pub overall_score: Option<f64>,
     pub score_basis: MeritScoreBasis,
     pub merit_rank: Option<String>,
+    pub attendance_percentage: Option<f64>,
     pub on_time_percentage: f64,
+    pub has_punctuality_records: bool,
     pub client_rating: f64,
     pub evaluation_count: i64,
 }

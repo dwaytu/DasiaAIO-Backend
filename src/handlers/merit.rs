@@ -12,23 +12,16 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         CalculateMeritScoreRequest, ClientEvaluation, CreateClientEvaluationRequest,
-        GuardMeritScore, MeritScoreBasis, MeritScoreResponse, MeritStats, RankedGuardResponse,
+        MeritScoreBasis, MeritScoreResponse, MeritStats, RankedGuardResponse,
     },
-    services::guard_performance_history,
+    services::{
+        guard_performance_history,
+        merit_scoring::{load_merit_inputs, rank as merit_rank, MeritInputs},
+    },
     utils,
 };
 
-const ATTENDANCE_SCORE_BATCH: &str = "capstone-live-october-2026";
 
-fn saved_score_basis(rank: Option<&str>, from_attendance_batch: bool) -> MeritScoreBasis {
-    match rank {
-        Some("Excellent" | "Good" | "For review") if from_attendance_batch => {
-            MeritScoreBasis::AttendancePunctuality
-        }
-        Some("Gold" | "Silver" | "Bronze" | "Standard") => MeritScoreBasis::WeightedMerit,
-        _ => MeritScoreBasis::Saved,
-    }
-}
 
 fn validate_evaluation_rating(rating: f64) -> AppResult<()> {
     if !rating.is_finite() || !(1.0..=5.0).contains(&rating) {
@@ -39,303 +32,123 @@ fn validate_evaluation_rating(rating: f64) -> AppResult<()> {
     Ok(())
 }
 
-async fn guard_evaluation_summary(db: &PgPool, guard_id: &str) -> AppResult<(Option<f64>, i64)> {
-    sqlx::query_as(
-        "SELECT AVG(rating)::FLOAT8, COUNT(*) FROM client_evaluations WHERE guard_id = $1",
-    )
-    .bind(guard_id)
-    .fetch_one(db)
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to query evaluations: {e}")))
+async fn load_guard_merit(db: &PgPool, guard_id: &str) -> AppResult<MeritInputs> {
+    load_merit_inputs(db, Some(guard_id))
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::NotFound("Guard not found".to_string()))
 }
 
-// Calculate merit score for a guard based on performance metrics
+async fn merit_scorecard(db: &PgPool, inputs: MeritInputs) -> AppResult<MeritScoreResponse> {
+    let overall = inputs.overall();
+    let attendance = inputs.attendance();
+    let punctuality = inputs.punctuality();
+    let (total_shifts, on_time, late, no_shows) =
+        guard_performance_history::activity_counts(db, &inputs.guard_id).await?;
+    Ok(MeritScoreResponse {
+        guard_id: inputs.guard_id,
+        guard_name: Some(inputs.guard_name),
+        overall_score: overall,
+        score_basis: if overall.is_some() {
+            MeritScoreBasis::WeightedMerit
+        } else {
+            MeritScoreBasis::NotScored
+        },
+        rank: Some(overall.map(merit_rank).unwrap_or("Unranked").to_string()),
+        attendance_score: attendance.unwrap_or_default(),
+        punctuality_score: punctuality.unwrap_or_default(),
+        has_attendance_records: attendance.is_some(),
+        has_punctuality_records: punctuality.is_some(),
+        client_rating: inputs.average_rating.unwrap_or_default() * 20.0,
+        stats: MeritStats {
+            total_shifts: total_shifts as i32,
+            on_time_count: on_time as i32,
+            late_count: late as i32,
+            no_show_count: no_shows as i32,
+            evaluations: inputs.evaluation_count as i32,
+            average_rating: inputs.average_rating.unwrap_or_default(),
+        },
+    })
+}
+
+async fn ranked_merit(db: &PgPool) -> AppResult<Vec<(MeritInputs, Option<f64>)>> {
+    let mut ranked: Vec<_> = load_merit_inputs(db, None)
+        .await?
+        .into_iter()
+        .map(|inputs| {
+            let score = inputs.overall();
+            (inputs, score)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.unwrap_or(-1.0).total_cmp(&a.1.unwrap_or(-1.0)));
+    Ok(ranked)
+}
+
 pub async fn calculate_merit_score(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
     Json(payload): Json<CalculateMeritScoreRequest>,
 ) -> AppResult<(StatusCode, Json<MeritScoreResponse>)> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
+    let inputs = load_guard_merit(db.as_ref(), &payload.guard_id).await?;
 
-    let guard_id = &payload.guard_id;
-
-    // 1. Calculate Attendance Score (% of shifts attended)
-    let attendance_result = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(CASE WHEN status = 'completed' THEN 1 END)::int8 as completed 
-         FROM attendance 
-         WHERE guard_id = $1",
-    )
-    .bind(guard_id)
-    .fetch_one(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to query attendance: {}", e)))?;
-
-    let total_shifts =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::int8 FROM shifts WHERE guard_id = $1")
-            .bind(guard_id)
-            .fetch_one(db.as_ref())
-            .await
-            .unwrap_or(0);
-
-    let attendance_score = if total_shifts > 0 {
-        (attendance_result as f64 / total_shifts as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    // 2. Calculate Punctuality Score (% of on-time check-ins)
-    let on_time_count = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT COUNT(*) FROM punctuality_records WHERE guard_id = $1 AND is_on_time = true",
-    )
-    .bind(guard_id)
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(None)
-    .unwrap_or(0) as i32;
-
-    let total_punctuality_records = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT COUNT(*) FROM punctuality_records WHERE guard_id = $1",
-    )
-    .bind(guard_id)
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(None)
-    .unwrap_or(0);
-
-    let punctuality_score = if total_punctuality_records > 0 {
-        (on_time_count as f64 / total_punctuality_records as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    // 3. Calculate the evaluator rating (average of supervisor/admin evaluations)
-    let (avg_rating, eval_count) = guard_evaluation_summary(db.as_ref(), guard_id).await?;
-
-    let client_rating = match avg_rating {
-        Some(avg) => (avg / 5.0) * 100.0, // Convert 0-5 to 0-100
-        None => 0.0,
-    };
-    let eval_count = eval_count as i32;
-
-    // 4. Calculate Overall Score (weighted average)
-    // Attendance: 30%, Punctuality: 35%, Client Rating: 35%
-    let overall_score =
-        (attendance_score * 0.30) + (punctuality_score * 0.35) + (client_rating * 0.35);
-
-    // 5. Determine Rank based on score
-    let rank = match overall_score {
-        score if score >= 90.0 => "Gold",
-        score if score >= 80.0 => "Silver",
-        score if score >= 70.0 => "Bronze",
-        _ => "Standard",
-    };
-
-    // 6. Get late and no-show counts
-    let late_count = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT COUNT(*) FROM punctuality_records WHERE guard_id = $1 AND status = 'late'",
-    )
-    .bind(guard_id)
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(None)
-    .unwrap_or(0) as i32;
-
-    let no_show_count = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT COUNT(*) FROM punctuality_records WHERE guard_id = $1 AND status = 'no_show'",
-    )
-    .bind(guard_id)
-    .fetch_one(db.as_ref())
-    .await
-    .unwrap_or(None)
-    .unwrap_or(0) as i32;
-
-    // 7. Update or create merit score record
-    let merit_score_id = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT id FROM guard_merit_scores WHERE guard_id = $1",
-    )
-    .bind(guard_id)
-    .fetch_optional(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?
-    .flatten();
-
-    if let Some(_id) = merit_score_id {
-        // Update existing record
+    if let (Some(score), Some(attendance), Some(punctuality), Some(rating)) = (
+        inputs.overall(),
+        inputs.attendance(),
+        inputs.punctuality(),
+        inputs.average_rating,
+    ) {
         sqlx::query(
-            "UPDATE guard_merit_scores 
-             SET attendance_score = $2, punctuality_score = $3, client_rating = $4, 
-                 overall_score = $5, rank = $6, total_shifts_completed = $7,
-                 on_time_count = $8, late_count = $9, no_show_count = $10,
-                 average_client_rating = $11, evaluation_count = $12, last_calculated_at = CURRENT_TIMESTAMP
-             WHERE guard_id = $1"
+            r#"INSERT INTO guard_merit_scores (
+                id, guard_id, attendance_score, punctuality_score, client_rating, overall_score,
+                rank, total_shifts_completed, on_time_count, late_count, no_show_count,
+                average_client_rating, evaluation_count, last_calculated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP)
+            ON CONFLICT (guard_id) DO UPDATE SET
+                attendance_score = EXCLUDED.attendance_score,
+                punctuality_score = EXCLUDED.punctuality_score,
+                client_rating = EXCLUDED.client_rating,
+                overall_score = EXCLUDED.overall_score,
+                rank = EXCLUDED.rank,
+                total_shifts_completed = EXCLUDED.total_shifts_completed,
+                on_time_count = EXCLUDED.on_time_count,
+                late_count = EXCLUDED.late_count,
+                no_show_count = EXCLUDED.no_show_count,
+                average_client_rating = EXCLUDED.average_client_rating,
+                evaluation_count = EXCLUDED.evaluation_count,
+                last_calculated_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP"#,
         )
-        .bind(guard_id)
-        .bind(attendance_score)
-        .bind(punctuality_score)
-        .bind(client_rating)
-        .bind(overall_score)
-        .bind(rank)
-        .bind(total_shifts as i32)
-        .bind(on_time_count)
-        .bind(late_count)
-        .bind(no_show_count)
-        .bind(client_rating / 100.0 * 5.0) // Convert back to 0-5
-        .bind(eval_count)
+        .bind(utils::generate_id())
+        .bind(&inputs.guard_id)
+        .bind(attendance)
+        .bind(punctuality)
+        .bind(rating * 20.0)
+        .bind(score)
+        .bind(merit_rank(score))
+        .bind(inputs.completed_shifts as i32)
+        .bind(inputs.on_time as i32)
+        .bind(inputs.late as i32)
+        .bind(inputs.no_shows as i32)
+        .bind(rating)
+        .bind(inputs.evaluation_count as i32)
         .execute(db.as_ref())
         .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to update merit score: {}", e)))?;
-    } else {
-        // Create new record
-        let id = utils::generate_id();
-        sqlx::query(
-            "INSERT INTO guard_merit_scores 
-             (id, guard_id, attendance_score, punctuality_score, client_rating, overall_score, rank, 
-              total_shifts_completed, on_time_count, late_count, no_show_count, average_client_rating, evaluation_count)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)"
-        )
-        .bind(&id)
-        .bind(guard_id)
-        .bind(attendance_score)
-        .bind(punctuality_score)
-        .bind(client_rating)
-        .bind(overall_score)
-        .bind(rank)
-        .bind(total_shifts as i32)
-        .bind(on_time_count)
-        .bind(late_count)
-        .bind(no_show_count)
-        .bind(client_rating / 100.0 * 5.0)
-        .bind(eval_count)
-        .execute(db.as_ref())
-        .await
-        .map_err(|e| AppError::DatabaseError(format!("Failed to create merit score: {}", e)))?;
+        .map_err(|e| AppError::DatabaseError(format!("Failed to save merit score: {e}")))?;
     }
 
-    // Get guard name
-    let guard_name: Option<String> =
-        sqlx::query_scalar("SELECT full_name FROM users WHERE id = $1")
-            .bind(guard_id)
-            .fetch_optional(db.as_ref())
-            .await
-            .ok()
-            .flatten();
-
-    Ok((
-        StatusCode::OK,
-        Json(MeritScoreResponse {
-            guard_id: guard_id.clone(),
-            guard_name,
-            overall_score: overall_score.min(100.0).max(0.0),
-            score_basis: MeritScoreBasis::WeightedMerit,
-            rank: Some(rank.to_string()),
-            attendance_score: attendance_score.min(100.0).max(0.0),
-            punctuality_score: punctuality_score.min(100.0).max(0.0),
-            client_rating: client_rating.min(100.0).max(0.0),
-            stats: MeritStats {
-                total_shifts: total_shifts as i32,
-                on_time_count,
-                late_count,
-                no_show_count,
-                evaluations: eval_count,
-                average_rating: avg_rating.unwrap_or(0.0),
-            },
-        }),
-    ))
+    Ok((StatusCode::OK, Json(merit_scorecard(db.as_ref(), inputs).await?)))
 }
 
-// Get merit score for a specific guard
 pub async fn get_guard_merit_score(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
     Path(guard_id): Path<String>,
 ) -> AppResult<Json<MeritScoreResponse>> {
     let _claims = utils::require_self_or_min_role(&headers, &guard_id, "supervisor")?;
-
-    let guard_name: Option<String> = sqlx::query_scalar(
-        "SELECT COALESCE(full_name, username) FROM users
-         WHERE id = $1
-           AND LOWER(BTRIM(COALESCE(role, ''))) = 'guard'
-           AND COALESCE(status, 'active') = 'active'
-           AND verified = true
-           AND COALESCE(approval_status, 'approved') = 'approved'",
-    )
-    .bind(&guard_id)
-    .fetch_optional(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
-
-    let guard_name = guard_name.ok_or_else(|| AppError::NotFound("Guard not found".to_string()))?;
-
-    let merit_score: Option<GuardMeritScore> = sqlx::query_as(
-        "SELECT id, guard_id, CAST(attendance_score AS FLOAT8), CAST(punctuality_score AS FLOAT8), 
-                CAST(client_rating AS FLOAT8), CAST(overall_score AS FLOAT8), rank, 
-                total_shifts_completed, on_time_count, late_count, no_show_count, 
-                CAST(average_client_rating AS FLOAT8), evaluation_count, last_calculated_at, 
-                created_at, updated_at
-         FROM guard_merit_scores WHERE guard_id = $1",
-    )
-    .bind(&guard_id)
-    .fetch_optional(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Database error: {}", e)))?;
-
-    let score_basis = match &merit_score {
-        Some(score) => {
-            let from_attendance_batch = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM capstone_seed_records
-                 WHERE batch_id = $1 AND table_name = 'guard_merit_scores' AND record_id = $2)",
-            )
-            .bind(ATTENDANCE_SCORE_BATCH)
-            .bind(&score.id)
-            .fetch_one(db.as_ref())
-            .await
-            .map_err(|e| {
-                AppError::DatabaseError(format!("Failed to read merit score source: {e}"))
-            })?;
-            saved_score_basis(score.rank.as_deref(), from_attendance_batch)
-        }
-        None => MeritScoreBasis::NotScored,
-    };
-
-    let (average_rating, evaluation_count) =
-        guard_evaluation_summary(db.as_ref(), &guard_id).await?;
-    let average_rating = average_rating.unwrap_or(0.0);
-    let (total_shifts, on_time, late, no_shows) =
-        guard_performance_history::activity_counts(db.as_ref(), &guard_id).await?;
-    let stats = MeritStats {
-        total_shifts: total_shifts as i32,
-        on_time_count: on_time as i32,
-        late_count: late as i32,
-        no_show_count: no_shows as i32,
-        evaluations: evaluation_count as i32,
-        average_rating,
-    };
-    let response = match merit_score {
-        Some(merit_score) => MeritScoreResponse {
-            guard_id,
-            guard_name: Some(guard_name),
-            overall_score: merit_score.overall_score,
-            score_basis,
-            rank: merit_score.rank,
-            attendance_score: merit_score.attendance_score,
-            punctuality_score: merit_score.punctuality_score,
-            client_rating: average_rating * 20.0,
-            stats,
-        },
-        None => MeritScoreResponse {
-            guard_id,
-            guard_name: Some(guard_name),
-            overall_score: 0.0,
-            score_basis,
-            rank: Some("Not evaluated".to_string()),
-            attendance_score: 0.0,
-            punctuality_score: 0.0,
-            client_rating: average_rating * 20.0,
-            stats,
-        },
-    };
-
-    Ok(Json(response))
+    let inputs = load_guard_merit(db.as_ref(), &guard_id).await?;
+    Ok(Json(merit_scorecard(db.as_ref(), inputs).await?))
 }
 
 #[derive(serde::Deserialize)]
@@ -383,88 +196,35 @@ pub async fn get_guard_performance_history(
     Ok(Json(json!({ "total": total, "page": page, "pageSize": page_size, "items": items })))
 }
 
-// Get all guards ranked by merit score
 pub async fn get_ranked_guards(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
-
-    let guards = sqlx::query_as::<_, (String, String, f64, Option<String>, i32, i32, f64, i64, bool, bool)>(
-        "SELECT u.id, COALESCE(u.full_name, u.username),
-                COALESCE(gms.overall_score, 0)::FLOAT8, gms.rank,
-                COALESCE(gms.on_time_count, 0),
-                COALESCE(gms.on_time_count, 0) + COALESCE(gms.late_count, 0) + COALESCE(gms.no_show_count, 0),
-                COALESCE(reviews.average_rating, 0) * 20.0,
-                COALESCE(reviews.evaluation_count, 0),
-                gms.id IS NOT NULL,
-                EXISTS (SELECT 1 FROM capstone_seed_records
-                  WHERE batch_id = $1 AND table_name = 'guard_merit_scores' AND record_id = gms.id)
-         FROM users u
-         LEFT JOIN guard_merit_scores gms ON gms.guard_id = u.id
-         LEFT JOIN (
-             SELECT guard_id, AVG(rating)::FLOAT8 AS average_rating, COUNT(*) AS evaluation_count
-             FROM client_evaluations GROUP BY guard_id
-         ) reviews ON reviews.guard_id = u.id
-         WHERE LOWER(BTRIM(COALESCE(u.role, ''))) = 'guard'
-           AND COALESCE(u.status, 'active') = 'active'
-           AND u.verified = true
-           AND COALESCE(u.approval_status, 'approved') = 'approved'
-         ORDER BY COALESCE(gms.overall_score, 0) DESC, COALESCE(u.full_name, u.username)"
-    )
-    .bind(ATTENDANCE_SCORE_BATCH)
-    .fetch_all(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to query guards: {}", e)))?;
-
-    let ranked: Vec<RankedGuardResponse> = guards
+    let ranked: Vec<_> = ranked_merit(db.as_ref())
+        .await?
         .into_iter()
         .enumerate()
-        .map(
-            |(
-                idx,
-                (
-                    guard_id,
-                    guard_name,
-                    score,
-                    rank,
-                    on_time,
-                    total,
-                    rating,
-                    evaluation_count,
-                    has_score,
-                    from_attendance_batch,
-                ),
-            )| {
-                let on_time_pct = if total > 0 {
-                    (on_time as f64 / total as f64) * 100.0
-                } else {
-                    0.0
-                };
-
-                RankedGuardResponse {
-                    rank: (idx + 1) as i32,
-                    guard_id,
-                    guard_name: Some(guard_name),
-                    overall_score: score,
-                    score_basis: if has_score {
-                        saved_score_basis(rank.as_deref(), from_attendance_batch)
-                    } else {
-                        MeritScoreBasis::NotScored
-                    },
-                    merit_rank: rank.or_else(|| Some("Not evaluated".to_string())),
-                    on_time_percentage: on_time_pct,
-                    client_rating: rating,
-                    evaluation_count,
-                }
+        .map(|(index, (inputs, overall))| RankedGuardResponse {
+            rank: if overall.is_some() { (index + 1) as i32 } else { 0 },
+            attendance_percentage: inputs.attendance(),
+            on_time_percentage: inputs.punctuality().unwrap_or_default(),
+            has_punctuality_records: inputs.punctuality().is_some(),
+            guard_id: inputs.guard_id,
+            guard_name: Some(inputs.guard_name),
+            overall_score: overall,
+            score_basis: if overall.is_some() {
+                MeritScoreBasis::WeightedMerit
+            } else {
+                MeritScoreBasis::NotScored
             },
-        )
+            merit_rank: Some(overall.map(merit_rank).unwrap_or("Unranked").to_string()),
+            client_rating: inputs.average_rating.unwrap_or_default() * 20.0,
+            evaluation_count: inputs.evaluation_count,
+        })
         .collect();
 
-    Ok(Json(json!({
-        "total": ranked.len(),
-        "rankings": ranked
-    })))
+    Ok(Json(json!({ "total": ranked.len(), "rankings": ranked })))
 }
 
 // Submit a supervisor/admin evaluation for a guard.
@@ -615,37 +375,27 @@ pub async fn get_guard_evaluations(
     })))
 }
 
-// Get top-performing guards for overtime assignment
 pub async fn get_overtime_candidates(
     State(db): State<Arc<PgPool>>,
     headers: HeaderMap,
 ) -> AppResult<Json<serde_json::Value>> {
     let _claims = utils::require_min_role(&headers, "supervisor")?;
-
-    // Filter for Gold and Silver rank guards (top performers)
-    let candidates = sqlx::query_as::<_, (String, String, f64, Option<String>)>(
-        "SELECT gms.guard_id, u.full_name, CAST(gms.overall_score AS FLOAT8), gms.rank
-         FROM guard_merit_scores gms
-         JOIN users u ON gms.guard_id = u.id
-         WHERE u.role IN ('guard') AND gms.rank IN ('Gold', 'Silver')
-         ORDER BY gms.overall_score DESC
-         LIMIT 20",
-    )
-    .fetch_all(db.as_ref())
-    .await
-    .map_err(|e| AppError::DatabaseError(format!("Failed to query candidates: {}", e)))?;
-
-    Ok(Json(json!({
-        "total": candidates.len(),
-        "candidates": candidates.into_iter().map(|(id, name, score, rank)| {
-            json!({
-                "guardId": id,
-                "guardName": name,
+    let candidates: Vec<_> = ranked_merit(db.as_ref())
+        .await?
+        .into_iter()
+        .filter_map(|(guard, score)| {
+            let score = score.filter(|score| *score >= 80.0)?;
+            Some(json!({
+                "guardId": guard.guard_id,
+                "guardName": guard.guard_name,
                 "overallScore": score,
-                "rank": rank
-            })
-        }).collect::<Vec<_>>()
-    })))
+                "rank": merit_rank(score),
+            }))
+        })
+        .take(20)
+        .collect();
+
+    Ok(Json(json!({ "total": candidates.len(), "candidates": candidates })))
 }
 
 #[cfg(test)]
@@ -669,7 +419,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     #[ignore = "requires an isolated PostgreSQL instance"]
-    async fn merit_reads_current_reviews_with_saved_scores(pool: PgPool) {
+    async fn merit_requires_evaluation_and_uses_recorded_attendance(pool: PgPool) {
         crate::db::run_migrations(&pool).await.unwrap();
         sqlx::query(
             "INSERT INTO users (id, email, username, password, role, full_name, phone_number, verified) VALUES
@@ -682,21 +432,34 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO guard_merit_scores (id, guard_id, overall_score, rank) VALUES
-             ('score-a', 'reviewed', 96.5, 'Gold'), ('score-b', 'unreviewed', 100.0, 'Excellent')",
+             ('score-a', 'reviewed', 100.0, 'Excellent'), ('score-b', 'unreviewed', 100.0, 'Excellent')",
         )
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO capstone_seed_batches (batch_id, data_origin, reference_at, status) VALUES ($1, 'test', NOW(), 'complete')")
-            .bind(ATTENDANCE_SCORE_BATCH)
-            .execute(&pool)
-            .await
-            .unwrap();
         sqlx::query(
-            "INSERT INTO capstone_seed_records (batch_id, table_name, record_id) VALUES
-             ($1, 'guard_merit_scores', 'score-a'), ($1, 'guard_merit_scores', 'score-b')",
+            "INSERT INTO shifts (id, guard_id, client_site, start_time, end_time, status) VALUES
+             ('a-done', 'reviewed', 'Fixture', NOW()-INTERVAL '2 days', NOW()-INTERVAL '1 day', 'completed'),
+             ('a-future', 'reviewed', 'Fixture', NOW()+INTERVAL '1 day', NOW()+INTERVAL '2 days', 'scheduled'),
+             ('a-cancel', 'reviewed', 'Fixture', NOW()-INTERVAL '2 days', NOW()-INTERVAL '1 day', 'canceled'),
+             ('b-done', 'unreviewed', 'Fixture', NOW()-INTERVAL '2 days', NOW()-INTERVAL '1 day', 'completed')",
         )
-        .bind(ATTENDANCE_SCORE_BATCH)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO attendance (id, guard_id, shift_id, check_in_time, status) VALUES
+             ('a-attendance', 'reviewed', 'a-done', NOW()-INTERVAL '2 days', 'completed'),
+             ('b-attendance', 'unreviewed', 'b-done', NOW()-INTERVAL '2 days', 'completed')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO punctuality_records (id, guard_id, shift_id, scheduled_start_time, actual_check_in_time, is_on_time, status) VALUES
+             ('a-time', 'reviewed', 'a-done', NOW()-INTERVAL '2 days', NOW()-INTERVAL '2 days', true, 'present'),
+             ('b-time', 'unreviewed', 'b-done', NOW()-INTERVAL '2 days', NOW()-INTERVAL '2 days', true, 'on_time')",
+        )
         .execute(&pool)
         .await
         .unwrap();
@@ -719,21 +482,59 @@ mod tests {
             .await
             .unwrap();
         let rankings = result["rankings"].as_array().unwrap();
-        assert_eq!(rankings[0]["evaluationCount"], 0);
-        assert_eq!(rankings[0]["overallScore"], 100.0);
-        assert_eq!(rankings[0]["scoreBasis"], "attendance_punctuality");
-        assert_eq!(rankings[1]["evaluationCount"], 2);
-        assert_eq!(rankings[1]["clientRating"], 90.0);
-        assert_eq!(rankings[1]["scoreBasis"], "weighted_merit");
+        assert_eq!(rankings[0]["evaluationCount"], 2);
+        assert_eq!(rankings[0]["clientRating"], 90.0);
+        assert_eq!(rankings[0]["overallScore"], 96.5);
+        assert_eq!(rankings[0]["scoreBasis"], "weighted_merit");
+        assert_eq!(rankings[1]["evaluationCount"], 0);
+        assert_eq!(rankings[1]["attendancePercentage"], 100.0);
+        assert_eq!(rankings[1]["onTimePercentage"], 100.0);
+        assert_eq!(rankings[1]["scoreBasis"], "not_scored");
+        assert!(rankings[1]["overallScore"].is_null());
+        assert_eq!(rankings[1]["meritRank"], "Unranked");
+        assert_eq!(rankings[1]["rank"], 0);
         assert_eq!(rankings[2]["scoreBasis"], "not_scored");
+        assert!(rankings[2]["attendancePercentage"].is_null());
+        assert_eq!(rankings[2]["hasPunctualityRecords"], false);
 
-        let Json(scorecard) = get_guard_merit_score(State(db), headers, Path("reviewed".into()))
-            .await
-            .unwrap();
+        let Json(unreviewed) =
+            get_guard_merit_score(State(db.clone()), headers.clone(), Path("unreviewed".into()))
+                .await
+                .unwrap();
+        assert!(matches!(unreviewed.score_basis, MeritScoreBasis::NotScored));
+        assert!(unreviewed.overall_score.is_none());
+        assert_eq!(unreviewed.attendance_score, 100.0);
+
+        let Json(scorecard) =
+            get_guard_merit_score(State(db.clone()), headers.clone(), Path("reviewed".into()))
+                .await
+                .unwrap();
         assert_eq!(scorecard.stats.evaluations, 2);
         assert_eq!(scorecard.stats.average_rating, 4.5);
-        assert_eq!(scorecard.overall_score, 96.5);
+        assert_eq!(scorecard.overall_score, Some(96.5));
         assert!(matches!(scorecard.score_basis, MeritScoreBasis::WeightedMerit));
+
+        for (guard_id, expected_score) in [("reviewed", Some(96.5)), ("unreviewed", None)] {
+            let (status, Json(calculated)) = calculate_merit_score(
+                State(db.clone()),
+                headers.clone(),
+                Json(CalculateMeritScoreRequest { guard_id: guard_id.to_string() }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(calculated.overall_score, expected_score);
+        }
+        let persisted = sqlx::query_as::<_, (String, f64)>(
+            "SELECT guard_id, overall_score FROM guard_merit_scores ORDER BY guard_id",
+        )
+        .fetch_all(db.as_ref())
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted,
+            vec![("reviewed".to_string(), 96.5), ("unreviewed".to_string(), 100.0)],
+        );
     }
 
     #[sqlx::test(migrations = false)]

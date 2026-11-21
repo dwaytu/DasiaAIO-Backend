@@ -7,6 +7,7 @@ pub mod incident_severity_classifier;
 pub mod incident_summary_service;
 pub mod mdr_data_cleansing;
 pub mod mdr_import_service;
+pub mod merit_scoring;
 pub mod mdr_resource_service;
 pub mod notification_delivery;
 pub mod operational_requests;
